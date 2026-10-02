@@ -1,0 +1,4 @@
+# The image needs only src/; everything else stays out of the build.
+*
+!src
+src/**/__pycache__

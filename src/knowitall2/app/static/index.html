@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>KnowItAll2</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="shell">
+    <nav class="sidebar" aria-label="Sections">
+      <a class="brand" href="#/overview">
+        <img src="icon.svg" alt="" width="28" height="28">
+        <span>KnowItAll2</span>
+      </a>
+      <ul class="nav">
+        <li><a href="#/overview" data-view="overview">Overview</a></li>
+        <li><a href="#/knowledge" data-view="knowledge">What it knows</a></li>
+        <li><a href="#/memories" data-view="memories">Memories</a></li>
+        <li><a href="#/questions" data-view="questions">Questions <span class="count" id="question-count" hidden></span></a></li>
+        <li><a href="#/learning" data-view="learning">Learning</a></li>
+        <li><a href="#/activity" data-view="activity">Activity</a></li>
+      </ul>
+      <div class="sidebar-foot">
+        <span class="connection" id="connection"><span class="dot"></span><span class="label">Connecting</span></span>
+        <span class="version" id="version"></span>
+      </div>
+    </nav>
+    <main class="main" id="main" tabindex="-1">
+      <p class="loading">Loading…</p>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

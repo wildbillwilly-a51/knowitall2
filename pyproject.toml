@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowitall2"
+dynamic = ["version"]
+description = "An always-on, agent-agnostic memory for coding agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+knowitall2 = "knowitall2.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "knowitall2.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+knowitall2 = ["app/static/*", "server/static/*"]

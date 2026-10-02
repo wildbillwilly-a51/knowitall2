@@ -1,0 +1,19 @@
+KnowItAll2
+Copyright (c) 2026 Walt Amason. All rights reserved.
+
+KnowItAll2 is source-available, not open source. It is a pre-release.
+
+- You may install and use it free of charge on your own computers,
+  including running a KnowItAll2 server for your own agents.
+- You may not redistribute it, sell it, offer it to others as a service,
+  publish modified versions of it, or build other products from it,
+  without the author's written permission.
+- The terms of the site that hosts this repository may let you view it and
+  make a copy of it there (a fork); that gives you no other rights.
+- It is provided "as is", without warranty of any kind. The author is not
+  liable for any damage arising from its use.
+
+Your memories stay on your own computer, or on a KnowItAll2 server you run
+and choose to connect. When you turn learning on, each learning call sends
+a redacted excerpt of a finished session to your own Claude Code or Codex
+account, as described in docs/testing.md.

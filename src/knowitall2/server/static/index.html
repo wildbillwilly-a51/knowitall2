@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>KnowItAll2 server</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="admin.css">
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <span class="brand"><img src="icon.svg" alt="" width="26" height="26"><span>KnowItAll2 server</span></span>
+      <span class="who" id="who" hidden>
+        <span id="who-name"></span>
+        <button type="button" class="link" id="sign-out">Sign out</button>
+      </span>
+    </div>
+  </header>
+  <main class="main" id="main" tabindex="-1">
+    <p class="loading">Loading…</p>
+  </main>
+  <footer class="foot"><span id="version"></span></footer>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="admin.js"></script>
+</body>
+</html>
