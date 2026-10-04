@@ -41,6 +41,8 @@ ACTIVITY_GROUPS: dict[str, tuple[str, ...]] = {
                 "change", "move"),
 }
 MEMORY_PAGE = 50
+# The largest whole number the database takes; a page number or event number past it is refused.
+SQLITE_INTEGER_MAX = 2 ** 63 - 1
 MEMORY_FILTERS = {
     "status": ("active", "inactive"),
     "kind": KINDS,
@@ -263,7 +265,8 @@ def memory_action(query, body, match) -> dict[str, Any]:
             return {"message": f"Saved your correction as [{result.record.id}]; it replaces [{record_id}].",
                     "id": result.record.id}
         if action == "forget":
-            message = memory.forget(record_id, reason=_text(body, "reason", required=False) or "forgotten in the app")
+            message = memory.forget(record_id, reason=_text(body, "reason", required=False) or "forgotten in the app",
+                                    by_user=True)
         elif action == "restore":
             message = memory.restore(record_id)
         else:
@@ -809,9 +812,12 @@ def _integer(query: dict[str, list[str]], name: str) -> int | None:
     if value is None:
         return None
     try:
-        return int(value)
+        number = int(value)
     except ValueError:
         raise MemoryInputError(f"{name} must be a whole number.") from None
+    if abs(number) > SQLITE_INTEGER_MAX:
+        raise MemoryInputError(f"{name} is too large.")
+    return number
 
 
 ROUTES: list[tuple[str, str, Any]] = [

@@ -126,11 +126,15 @@ function setupView() {
     event.preventDefault();
     try {
       const data = samePassword(form);
-      const answer = await api("POST", "setup", { username: data.username, new_password: data.password });
+      const answer = await api("POST", "setup", {
+        setup_code: data.setup_code, username: data.username, new_password: data.password });
       state.form = answer.form;
       recoveryView(answer.recovery_code, "Your admin account is ready.");
     } catch (error) { fail(box, error); }
   } },
+  field("Setup code", "setup_code", "text", { autocomplete: "off", spellcheck: "false" }),
+  el("p", { class: "hint" }, "The server printed it in its log when it started. With Docker: ",
+    el("code", {}, "docker compose -f deploy/compose.yaml logs knowitall2")),
   field("Username", "username", "text", { autocomplete: "username", maxlength: 64 }),
   field("Password", "password", "password", { autocomplete: "new-password", minlength: 10 }),
   field("Password again", "confirm", "password", { autocomplete: "new-password", minlength: 10 }),
@@ -139,7 +143,7 @@ function setupView() {
   el("button", { class: "button", type: "submit" }, "Create admin account"));
   show(el("section", { class: "card narrow" },
     el("header", {}, el("h1", {}, "Set up your server"),
-      el("p", { class: "lead" }, "You're the first to open this page, so you'll create its admin account. "
+      el("p", { class: "lead" }, "This server has no admin account yet, so you'll create one. "
         + "Only this account can connect agents and look after the server.")),
     form));
 }
@@ -271,7 +275,7 @@ function serverCard(data) {
       el("div", { class: "fact" }, el("span", {}, "Database"), el("strong", {}, size(server.database_bytes))),
       el("div", { class: "fact" }, el("span", {}, "Last daily backup"), el("strong", {}, backup)),
       el("div", { class: "fact" }, el("span", {}, "Version"), el("strong", {}, server.version))),
-    el("p", { class: "hint" }, "The server keeps its last seven daily backups in its data folder. Copy them off "
+    el("p", { class: "hint" }, "The server keeps a backup from each of the last seven days in its data folder. Copy them off "
       + "the server as part of your own backups, or download one now."),
     el("p", {}, el("a", { class: "button quiet", href: "/admin/api/backup", download: "" }, "Download a backup")));
 }

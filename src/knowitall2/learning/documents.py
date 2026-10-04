@@ -6,6 +6,8 @@ its own memory notes per folder. Chats only show pieces of these, cut short.
 This reads them directly, the most useful first, within a budget per
 project, and learns from them the way it learns from a session: the same
 model call, instructions, and checks, with each memory quoting its document.
+A document may be out of date, or written by someone other than the user, so
+what it teaches is kept as unverified and belongs to its project.
 
 Documents already learned are not read again (their content fingerprint is
 remembered), so running it again costs calls only for what changed.
@@ -22,13 +24,15 @@ from typing import Any, Callable
 from ..identity import ProjectIdentity
 from ..secrets import redact
 from .dossier import MAX_DOSSIER_CHARACTERS, Dossier
-from .learner import LearnReport, ReadySession, known_context, publish_with_ids
+from .learner import LearnReport, ReadySession, known_context, publish_with_ids, result_text
 from .state import LearnerState
 from .transcripts import DOCUMENT_SUFFIXES
 
 AGENT = "documents"
 # How much of one project's writing is read: about two or three learning calls.
 PROJECT_BUDGET = 100_000
+# A larger file is a log or data, not notes, and is not read at all.
+MAX_DOCUMENT_BYTES = 1024 * 1024
 _FOLDERS = ("", "docs", "docs/operations", "references", "notes")
 # Read first: what a project is and how it is run. Then everything else, then plans and logs.
 _FIRST = ("current-state", "state", "project-summary", "summary", "handoff", "operations", "runbook", "readme",
@@ -42,23 +46,43 @@ _NON_NAME = re.compile(r"[^A-Za-z0-9]")
 
 
 def project_documents(root: Path) -> list[Path]:
-    """A project's documents, the most useful first."""
+    """A project's documents, the most useful first.
 
+    Links are skipped, and so is anything whose real place is outside the
+    project, such as a folder that is a Windows junction (``is_symlink`` does
+    not see those): it could hold private files from elsewhere.
+    """
+
+    try:
+        real_root = root.resolve()
+    except OSError:
+        return []
     found: dict[str, Path] = {}
     for folder in _FOLDERS:
         base = root / folder if folder else root
+        if folder and not _inside(base, real_root):
+            continue
         try:
             entries = list(base.iterdir())
         except OSError:
             continue
         for path in entries:
             name = path.name.casefold()
-            if not path.is_file() or not name.endswith(DOCUMENT_SUFFIXES):
+            if not name.endswith(DOCUMENT_SUFFIXES) or name in _SKIPPED or name.startswith(_SKIPPED_PREFIXES):
                 continue
-            if name in _SKIPPED or name.startswith(_SKIPPED_PREFIXES):
+            if not _inside(path, real_root) or not path.is_file():
                 continue
             found.setdefault(os.path.normcase(str(path)), path)
     return sorted(found.values(), key=_order)
+
+
+def _inside(path: Path, real_root: Path) -> bool:
+    """Whether a path is the project's own: not a link, and really within the project's folder."""
+
+    try:
+        return not path.is_symlink() and real_root in path.resolve().parents
+    except OSError:
+        return False
 
 
 def memory_notes(root: Path, *, claude_config: Path | None = None) -> list[Path]:
@@ -85,6 +109,8 @@ def build(project: ProjectIdentity, root: Path, files: list[Path], *, budget: in
         if used >= budget:
             break
         try:
+            if path.stat().st_size > MAX_DOCUMENT_BYTES:
+                continue
             text = redact(path.read_text(encoding="utf-8", errors="replace")).strip()
         except OSError:
             continue
@@ -102,10 +128,10 @@ def build(project: ProjectIdentity, root: Path, files: list[Path], *, budget: in
         entry = f"[document {label}]\n{text}\n\n"
         if current is None or len(current.text) + len(entry) > MAX_DOSSIER_CHARACTERS:
             current = Dossier(f"{AGENT}-{project.id}", AGENT, str(root), project, len(dossiers), text=header,
-                              body_start=len(header))
+                              body_start=len(header), from_documents=True)
             dossiers.append(current)
         current.text += entry
-        current.tool_outputs.append(text)
+        current.tool_outputs.append(text)  # never a trusted output: a quote of it makes nothing observed
     return dossiers
 
 
@@ -147,8 +173,7 @@ def learn(memory, state: LearnerState, extractor, dossiers: list[Dossier], *, ma
         for candidate in candidates:
             outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
             report.outcomes[outcome] += 1
-            report.results.append({"outcome": outcome, "ids": record_ids,
-                                   "text": None if outcome == "rejected (secret)" else str(candidate.get("text") or "")})
+            report.results.append({"outcome": outcome, "ids": record_ids, "text": result_text(outcome, candidate)})
         state.mark_seen(dossier.fingerprint)
         if progress:
             progress(f"read {dossier.text[dossier.body_start:].count('[document ')} document part(s) of "

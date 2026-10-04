@@ -22,6 +22,11 @@ DOCUMENT_CHARACTERS = 6_000
 _DOCUMENT_COMMAND = re.compile(
     r"(?:\bGet-Content\b|\bcat\b|\btype\b|\bhead\b|\btail\b|\bsed\s+-n\b|\bless\b|\bmore\b)[^|;&\n]{0,200}?"
     r"\.(?:md|markdown|txt|rst|adoc)\b", re.IGNORECASE)
+_DOCUMENT_SEARCH = re.compile(
+    r"(?:\bgrep\b|\begrep\b|\brg\b|\bSelect-String\b|\bsls\b|\bfindstr\b)[^|;&\n]{0,200}?"
+    r"\.(?:md|markdown|txt|rst|adoc)\b", re.IGNORECASE)
+# Tools whose output is what a command printed: Claude Code's shells, and Codex's (see transcripts).
+_COMMAND_TOOLS = frozenset({"Bash", "PowerShell", "shell"})
 
 
 @dataclass
@@ -34,11 +39,14 @@ class Dossier:
     text: str = ""
     user_texts: list[str] = field(default_factory=list)
     tool_outputs: list[str] = field(default_factory=list)
+    # The tool outputs that show what a command printed (see ``_trusted_output``); only these make a memory observed.
+    trusted_outputs: list[str] = field(default_factory=list)
     body_start: int = 0
     end_offset: int = 0  # log offset just past this dossier's last event, for resuming
     known: list = field(default_factory=list)  # related existing memories shown to the model
     tool_inputs: list[str] = field(default_factory=list)  # commands, paths, and folders its tool calls used
     worked_elsewhere: bool = False  # filed under the project its work was in, not the session folder's
+    from_documents: bool = False  # a project's own documents, not a session: what it teaches stays with that project
 
     @property
     def known_ids(self) -> set[str]:
@@ -79,6 +87,8 @@ def build_dossiers(
             current.user_texts.append(user_text)
         if output:
             current.tool_outputs.append(output)
+            if _trusted_output(event):
+                current.trusted_outputs.append(output)
         if event.kind == "tool":
             current.tool_inputs += [part for part in (event.text, event.cwd) if part]
     if current.text != header:
@@ -158,6 +168,20 @@ def _reads_document(event: Event) -> bool:
     if event.tool == "Read":
         return True  # only documents keep their contents (see transcripts)
     return bool(_DOCUMENT_COMMAND.search(event.text or ""))
+
+
+def _trusted_output(event: Event) -> bool:
+    """Whether a tool call's output shows what a command printed, not what someone wrote.
+
+    A document the agent read (with Read or a shell command), a search of
+    files or documents, an MCP tool's answer, and a helper agent's report hold
+    what a repository's authors or another model wrote, which may be wrong or
+    planted, so a memory resting on them stays unverified.
+    """
+
+    if event.tool not in _COMMAND_TOOLS:
+        return False
+    return not _reads_document(event) and not _DOCUMENT_SEARCH.search(event.text or "")
 
 
 def _excerpt(text: str, limit: int) -> str:

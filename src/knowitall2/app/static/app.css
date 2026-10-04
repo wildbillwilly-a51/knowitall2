@@ -297,6 +297,7 @@ textarea.input { width: 100%; resize: vertical; min-height: 80px; line-height: 1
 .checks li { display: flex; gap: 8px; }
 .checks .ok { color: var(--ok); }
 .checks .bad { color: var(--bad); }
+.checks .warn { color: var(--warn); }
 
 /* Memories */
 

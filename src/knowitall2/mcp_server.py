@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import sys
 import traceback
@@ -23,7 +24,7 @@ from typing import Any, BinaryIO, Callable
 
 from . import __version__, journal, review
 from .memory import KINDS, MAX_RECALL_LIMIT, RECALL_SCOPES, SCOPES, SOURCES, Memory, MemoryInputError
-from .paths import database_path
+from .paths import data_home, database_path
 from .store import Store, StoreError
 
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -135,7 +136,14 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
                 "source": {"type": "string", "enum": list(SOURCES), "description": "Default 'inferred'."},
-                "replaces": {"type": "string", "description": "Id of a memory this one corrects or updates."},
+                "replaces": {
+                    "type": "string",
+                    "description": (
+                        "Id of a memory this one corrects or updates. Weaker evidence never replaces a stronger "
+                        "memory, and only the user's own words replace the user's statements: otherwise both are "
+                        "kept and the user is asked which is right."
+                    ),
+                },
                 "project_path": _PROJECT_PATH,
             },
             "required": ["text"],
@@ -148,7 +156,11 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "forget",
         "title": "Forget",
-        "description": "Retire a memory that is wrong or no longer true, by its id. It stops appearing in results.",
+        "description": (
+            "Retire a memory that is wrong or no longer true, by its id. It stops appearing in results. The user's "
+            "own statements are not retired this way: KnowItAll2 asks the user, with your reason, and if the user "
+            "just asked for it, the reply says how to record their choice with `answer`."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -287,7 +299,9 @@ class McpServer:
             except (ValueError, UnicodeDecodeError):
                 response: Any = _error(None, -32700, "Parse error")
             else:
-                if isinstance(message, list):
+                if message == []:  # JSON-RPC answers an empty batch with one error
+                    response = _error(None, -32600, "Invalid Request")
+                elif isinstance(message, list):
                     response = [item for item in (self.handle(part) for part in message) if item is not None] or None
                 else:
                     response = self.handle(message)
@@ -478,7 +492,9 @@ def _optional_integer(arguments: dict[str, Any], key: str) -> int | None:
         return None
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+    # JSON as Python reads it can hold Infinity and NaN, which no whole number equals.
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value)) or int(value) != value):
         raise MemoryInputError(f"'{key}' must be a whole number.")
     return int(value)
 
@@ -523,9 +539,11 @@ def handle_once(request: dict[str, Any]) -> dict[str, Any]:
         return {"response": server.handle(request.get("message")), "tools": tools_fingerprint()}
     finally:
         if server._memory is not None:
-            from .connected import nudge
+            journal.tidy(server._memory.store)
+            if (data_home() / "server" / "connection.json").is_file():  # as in hooks.main: no network code otherwise
+                from .connected import nudge
 
-            nudge(server._agent, store=server._memory.store)
+                nudge(server._agent, store=server._memory.store)
             server._memory.store.close()
 
 

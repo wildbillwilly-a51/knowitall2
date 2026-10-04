@@ -53,6 +53,9 @@ GOODBYE_GRACE_SECONDS = 8
 WINDOW_ALIVE_SECONDS = 90
 WATCH_INTERVAL_SECONDS = 5
 MAX_BODY_BYTES = 64 * 1024
+# Of a body too large to take, this much is read and dropped before the connection closes, so a caller
+# that sends the whole body before reading the answer still gets its 413.
+DROP_AT_MOST_BYTES = 4 * MAX_BODY_BYTES
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
     "frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'"
@@ -165,11 +168,26 @@ class AppHandler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def do_OPTIONS(self) -> None:
-        # No cross-origin access, ever.
-        self._send_json(HTTPStatus.FORBIDDEN, {"error": "cross-origin requests are not allowed"})
+        self._dispatch("OPTIONS")
 
     def _dispatch(self, method: str) -> None:
+        # For this request only: the handler lasts as long as the connection, which can carry more requests.
+        self._body_read = False
+        length = self._length()
+        if length is None or length > MAX_BODY_BYTES:
+            # This answer is the connection's last: where the body ends is unknown, or more comes than is read.
+            self.close_connection = True
         try:
+            self._answer(method)
+        finally:
+            if not self._body_read:
+                self._drop_body(length)
+
+    def _answer(self, method: str) -> None:
+        try:
+            if method == "OPTIONS":
+                # No cross-origin access, ever.
+                raise RequestError(HTTPStatus.FORBIDDEN, "cross-origin requests are not allowed")
             if self.headers.get("Host") not in self.server.hosts:
                 raise RequestError(HTTPStatus.FORBIDDEN, "unexpected host")
             parts = urlsplit(self.path)
@@ -219,9 +237,14 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            raise RequestError(HTTPStatus.BAD_REQUEST, "bad Content-Length") from None
+            length = -1
+        if length < 0:
+            # Where this request ends, and so where the next one on the connection starts, is unknown.
+            self.close_connection = True
+            raise RequestError(HTTPStatus.BAD_REQUEST, "bad Content-Length")
         if length > MAX_BODY_BYTES:
             raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request too large")
+        self._body_read = True
         return self.rfile.read(length) if length else b""
 
     def _read_json(self) -> dict[str, Any]:
@@ -233,11 +256,44 @@ class AppHandler(BaseHTTPRequestHandler):
         raw = self._read_body()
         try:
             body = json.loads(raw) if raw else {}
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested deeper than the parser goes
             raise RequestError(HTTPStatus.BAD_REQUEST, "the request was not valid JSON") from None
         if not isinstance(body, dict):
             raise RequestError(HTTPStatus.BAD_REQUEST, "the request must be a JSON object")
         return body
+
+    def _length(self) -> int | None:
+        """The length of this request's body (0 without one), or None when it cannot be known."""
+
+        if self.headers.get("Transfer-Encoding"):  # such as chunked, which this server does not read
+            return None
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        return length if length >= 0 else None
+
+    def _drop_body(self, length: int | None) -> None:
+        """Read and drop the body of a request answered without reading it (a refusal, such as a missing key).
+
+        Left on a kept-alive connection, it would be read as the next request.
+        A body larger than the server takes is read only so far, so a caller
+        that sends it all before reading still gets the answer; that
+        connection then closes (``_dispatch``).
+        """
+
+        if length is None:
+            return
+        left = min(length, DROP_AT_MOST_BYTES)
+        try:
+            while left > 0:
+                chunk = self.rfile.read(min(left, 64 * 1024))
+                if not chunk:
+                    self.close_connection = True
+                    return
+                left -= len(chunk)
+        except OSError:
+            self.close_connection = True
 
     def _send_static(self, name: str) -> None:
         # Fixed types: Windows' registry can map .js to text/plain, which a
@@ -257,6 +313,8 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 

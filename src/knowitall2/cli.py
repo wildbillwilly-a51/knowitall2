@@ -48,7 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     remember.add_argument("--subject", action="append", default=[], dest="subjects", help="repeatable")
     remember.add_argument("--tag", action="append", default=[], dest="tags", help="repeatable")
     remember.add_argument("--scope", choices=SCOPES)
-    remember.add_argument("--source", choices=SOURCES, default="user")
+    remember.add_argument("--source", choices=SOURCES, default="inferred",
+                          help="user only for the user's own words (default inferred; agents run this command too)")
     remember.add_argument("--replaces", metavar="ID")
     remember.add_argument("--project-path")
 
@@ -203,10 +204,16 @@ def _add_server_options(parser: argparse.ArgumentParser, *, required_code: bool)
 
 def main(argv: Sequence[str] | None = None) -> int:
     # Printed text can hold any character; where the console code page lacks one, escape it instead of failing.
+    # A pipe or file (an agent reading the output) gets UTF-8: on Windows it would get the ANSI code page, which
+    # has no "山" and writes "é" as a byte UTF-8 readers cannot read. PYTHONIOENCODING, when set, still decides.
+    utf8 = not os.environ.get("PYTHONIOENCODING")
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(errors="backslashreplace")
-        except (AttributeError, ValueError):
+            if utf8 and not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            else:
+                stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
             pass
     arguments = build_parser().parse_args(argv)
     if arguments.command == "version":
@@ -420,7 +427,7 @@ def _run_agent_command(arguments: argparse.Namespace) -> int:
     if arguments.command == "doctor":
         from .doctor import run_checks
 
-        checks = run_checks(agents=arguments.agents or AGENT_NAMES, user_home=arguments.user_home)
+        checks = run_checks(agents=arguments.agents, user_home=arguments.user_home)
         print(describe_checks(checks))
         healthy = all(check.ok for check in checks)
         print("KnowItAll2 is healthy." if healthy else "KnowItAll2 needs attention; see the fixes above.")
@@ -431,6 +438,12 @@ def _run_agent_command(arguments: argparse.Namespace) -> int:
         if not arguments.join_code:
             print("knowitall2: --server needs this agent's --join-code from the server's page (Add an agent)",
                   file=sys.stderr)
+            return 1
+        # A join code works once: spend it only when setup can finish afterwards.
+        try:
+            adapter.preflight()
+        except (AgentError, OSError) as exc:
+            print(f"knowitall2: {exc}", file=sys.stderr)
             return 1
         # Connect first: if the server or the code does not work, nothing is changed.
         ok, shared = _connect_agent(arguments)
@@ -508,6 +521,9 @@ def _connect_agent(arguments: argparse.Namespace) -> tuple[bool, list[str]]:
     if first:
         if report.get("uploaded"):
             lines.append(f"sent this computer's memory to the server ({report['uploaded']} items)")
+        if report.get("refused"):
+            lines.append(f"the server refused {report['refused']} items of this computer's memory; the reasons are in: "
+                         "knowitall2 activity --problems")
         if report.get("backup"):
             lines.append(f"set this computer's memories aside; the backup is {report['backup']}")
         lines.append(f"received {report.get('received', 0)} items of the shared memory; this computer now keeps "

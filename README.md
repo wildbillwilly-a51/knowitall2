@@ -37,7 +37,8 @@ KnowItAll2 keeps working when the server is down.
     of the search a memory covers (rare words count more), with partial
     matches marked as such;
   - `remember`: save one durable fact, procedure, decision, lesson, or rule;
-  - `forget`: retire a memory that is wrong or no longer true;
+  - `forget`: retire a memory that is wrong or no longer true (for something
+    the user stated, KnowItAll2 asks the user instead);
   - `questions` and `answer`: the rare questions only the user can settle,
     in plain words, and the user's choices;
   - `settle`: an agent's report on an optional KnowItAll2 request, a quick
@@ -57,9 +58,11 @@ KnowItAll2 keeps working when the server is down.
     kept, what agents can do, how-tos, rules, decisions, lessons), a status
     (ready to use, partly known, only mentioned), what is missing, "Tell
     KnowItAll2", and "Ask an agent to find these out": one agent, started
-    right away in the system's project folder, reads files only and keeps
-    an answer only if its quote is in the file it names; what it cannot
-    find waits for the agents that work with the system later.
+    right away in the system's project folder, reads files only (itself, so
+    nothing is redacted first, and also while learning is off) and keeps an
+    answer, as unverified, only if its quote is in the file it names and
+    says what the answer says; what it cannot find waits for the agents
+    that work with the system later.
   - Memories: each one as a plain one-line summary, with the exact wording on
     request; search, filters by system, confirm, correct, forget, restore.
   - Questions: only what is still unclear or is the user's to decide, in
@@ -84,7 +87,10 @@ KnowItAll2 keeps working when the server is down.
   problems. `knowitall2 activity` shows it (`--problems` for failures); entries
   are kept for 90 days, redacted like everything else.
 - `knowitall2 setup codex|claude-code`, `doctor`, and `uninstall`. These change
-  only settings that KnowItAll2 owns and restore the rest exactly on removal.
+  only settings that KnowItAll2 owns and keep the rest of each file, with its
+  line endings and indentation. Uninstalling removes what setup added; it can
+  leave an empty settings section behind, or change the blank lines at the end
+  of a file.
 - Project identity from Git, so moved and cloned copies share their memories.
 - Secret screening: KnowItAll2 stores where a credential is kept, never the
   credential itself.
@@ -114,7 +120,8 @@ KnowItAll2 keeps working when the server is down.
 - `knowitall2 learn --documents [PROJECT]` learns from what projects keep in
   writing: state files, summaries, handoffs, and Claude Code's own notes, the
   most useful first, about two or three calls a project; unchanged
-  documents are not read again. `--estimate` shows the calls first.
+  documents are not read again. `--estimate` shows the calls first. What a
+  document says is kept as unverified and belongs to its project.
 - `knowitall2 import <file>` brings in memories from another system, in the
   JSON Lines format described in [`docs/import-format.md`](docs/import-format.md);
   `--dry-run` shows each line's outcome first.

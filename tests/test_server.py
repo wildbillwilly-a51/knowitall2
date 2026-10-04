@@ -19,8 +19,8 @@ from knowitall2 import cli, sync
 from knowitall2.memory import Memory
 from knowitall2.remote import RemoteClient, RemoteError
 from knowitall2.server import accounts, backups, exchange, open_store
-from knowitall2.server.web import JOIN_FAILURES_PER_ADDRESS, KnowItAll2Server
-from knowitall2.store import Store
+from knowitall2.server.web import JOIN_FAILURES_PER_ADDRESS, JOIN_WINDOW_SECONDS, KnowItAll2Server, Throttle
+from knowitall2.store import SYNCED_TABLES, Store
 
 NOW = "2026-10-01T12:00:00Z"
 # Split so repository secret scanners do not flag this file.
@@ -210,6 +210,28 @@ class ExchangeTests(TemporaryFolder):
         self.assertEqual(answer["result"], "rejected")
         self.assertIn("secret", answer["reason"])
 
+    def test_a_memory_kept_from_before_the_screening_caught_it_can_still_be_retired(self) -> None:
+        record_id = self.remember(self.a, "The build server is build-1.")
+        self.send(self.a, "c-a")
+        # Saved before the screening knew this shape of secret, so both copies hold it.
+        for store in (self.a, self.server):
+            store.connection.execute("UPDATE records SET text = ? WHERE id = ?",
+                                     (f"The deploy token is {FAKE_TOKEN}", record_id))
+        Memory(self.a, agent="codex", clock=Clock("2026-10-01T13:00:00Z")).forget(record_id, reason="holds a secret")
+        self.assertEqual([answer["result"] for answer in self.send(self.a, "c-a")], ["applied"])
+        row = sync.read_row(self.server.connection, sync.table_for("records"), record_id)
+        self.assertEqual((row["status"], row["retired_reason"]), ("retired", "holds a secret"))
+
+    def test_a_known_memory_cannot_be_changed_to_hold_a_secret(self) -> None:
+        record_id = self.remember(self.a, "The build server is build-1.")
+        self.send(self.a, "c-a")
+        Memory(self.a, agent="codex", clock=Clock("2026-10-01T13:00:00Z")).forget(record_id, reason="moved")
+        [operation] = sync.pending_operations(self.a)
+        operation["row"]["text"] = f"The deploy token is {FAKE_TOKEN}"
+        answer = self.send(self.a, "c-a", [operation])[0]
+        self.assertEqual(answer["result"], "rejected")
+        self.assertEqual(answer["row"]["text"], "The build server is build-1.")
+
     def test_the_newer_version_wins_when_two_agents_change_one_memory(self) -> None:
         record_id = self.remember(self.a, "The build server is build-1.")
         self.send(self.a, "c-a")
@@ -225,6 +247,47 @@ class ExchangeTests(TemporaryFolder):
         self.assertEqual(row["retired_reason"], "gone")
         outcome = self.server.connection.execute("SELECT outcome FROM server_conflicts").fetchall()
         self.assertEqual([tuple(item) for item in outcome], [("existing",)])
+
+    def test_a_stamp_from_a_clock_far_ahead_does_not_win_every_later_disagreement(self) -> None:
+        record_id = self.remember(self.a, "The build server is build-1.")
+        self.send(self.a, "c-a")
+        base = sync.changes_since(self.server, 0)
+        sync.apply_pulled(self.b, base["changes"], cursor=base["next"])
+        Memory(self.a, agent="codex", clock=Clock("9999-12-31T23:59:59Z")).forget(record_id, reason="far ahead")
+        self.assertEqual(self.send(self.a, "c-a")[0]["result"], "applied")
+        later = "2026-10-01T13:00:00Z"
+        Memory(self.b, agent="codex", clock=Clock(later)).forget(record_id, reason="a real later edit")
+        operation = sync.pending_operations(self.b)[0]
+        operation["base"] = base["next"]
+        self.assertEqual(self.send(self.b, "c-b", [operation], now=later)[0]["result"], "applied")
+        row = sync.read_row(self.server.connection, sync.table_for("records"), record_id)
+        self.assertEqual(row["retired_reason"], "a real later edit")
+        outcome = self.server.connection.execute("SELECT outcome FROM server_conflicts").fetchall()
+        self.assertEqual([tuple(item) for item in outcome], [("incoming",)])
+
+    def test_a_row_the_server_already_has_is_no_disagreement_and_no_change(self) -> None:
+        record_id = self.remember(self.a, "The build server is build-1.")
+        self.send(self.a, "c-a")
+        latest = sync.latest_change(self.server)
+        found = sync.changes_since(self.server, 0)
+        sync.apply_pulled(self.b, found["changes"], cursor=found["next"])
+        with self.b.transaction():  # as when a computer sends its whole memory again on reconnecting
+            self.b.connection.execute("DELETE FROM sync_seen")
+            sync.note_all(self.b, "records")
+        [operation] = sync.pending_operations(self.b)
+        self.assertNotIn("base", operation)
+        answer = self.send(self.b, "c-b", [operation])[0]
+        self.assertEqual((answer["result"], answer["seq"]), ("applied", latest))
+        self.assertEqual(self.server.connection.execute("SELECT COUNT(*) FROM server_conflicts").fetchone()[0], 0)
+        self.assertEqual(sync.latest_change(self.server), latest)
+        self.assertEqual(sync.read_row(self.server.connection, sync.table_for("records"), record_id)["status"],
+                         "active")
+
+    def test_an_applied_change_says_its_change_number_on_the_server(self) -> None:
+        self.remember(self.a, "The build server is build-1.")
+        self.remember(self.a, "The test server is test-1.")
+        answers = self.send(self.a, "c-a")
+        self.assertEqual([(answer["result"], answer["seq"]) for answer in answers], [("applied", 1), ("applied", 2)])
 
     def test_an_agents_own_earlier_change_is_no_disagreement(self) -> None:
         record_id = self.remember(self.a, "The build server is build-1.")
@@ -275,7 +338,11 @@ class ExchangeTests(TemporaryFolder):
     def test_a_whole_computer_can_start_an_empty_server(self) -> None:
         for number in range(3):
             self.remember(self.a, f"Service number {number} listens on port 80{number}.")
-        operations = list(sync.full_copy_operations(self.a))
+        with self.a.transaction():
+            self.a.connection.execute("DELETE FROM changes")
+            for name in SYNCED_TABLES:  # as when a computer that kept its memory alone connects
+                sync.note_all(self.a, name)
+        operations = sync.pending_operations(self.a)
         answers = exchange.apply_operations(self.server, "c-a", operations, now=NOW)
         self.assertEqual({answer["result"] for answer in answers}, {"applied"})
         self.assertEqual(exchange.summary(self.server)["memories"], 3)
@@ -316,6 +383,26 @@ class ExchangeTests(TemporaryFolder):
         finally:
             copy.close()
 
+    def test_a_full_copy_leaves_out_the_uses_and_their_totals_alike(self) -> None:
+        record_id = self.remember(self.a, "The build server is build-1.")
+        self.send(self.a, "c-a")
+        for at in ("2025-01-01T00:00:00Z", NOW):
+            self.server.log_usage(at=at, operation="recall", agent="codex", project_id=None, query="build",
+                                  record_ids=[record_id])
+        self.assertEqual(self.server.roll_up_usage(before="2025-10-01T00:00:00Z"), 1)
+        exchange.make_copy(self.root / "server.db", self.root / "copy.db")
+        copy = Store.open(self.root / "copy.db")
+        try:
+            # The uses are the server's bookkeeping, newer ones as rows and older ones as totals: neither comes.
+            counts = [copy.connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+                      for name in ("usage", "usage_totals")]
+            self.assertEqual(counts, [0, 0])
+            self.assertEqual(copy.record_details(record_id)["uses"], {})
+            # Each memory's own "used N times" comes with it.
+            self.assertEqual(copy.record_details(record_id)["recall_count"], 2)
+        finally:
+            copy.close()
+
     def test_tidying_keeps_only_each_rows_newest_change(self) -> None:
         record_id = self.remember(self.a, "The build server is build-1.")
         self.send(self.a, "c-a")
@@ -345,6 +432,20 @@ class BackupTests(TemporaryFolder):
             self.assertEqual(check.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         finally:
             check.close()
+
+    def test_a_burst_of_backups_does_not_push_out_the_daily_ones(self) -> None:
+        open_store(self.root / "server.db").close()
+        folder = self.root / "backups"
+        start = datetime(2026, 10, 1, 3, 0, tzinfo=timezone.utc)
+        for day in range(7):
+            backups.make(self.root / "server.db", folder, now=start + timedelta(days=day))
+        burst = start + timedelta(days=6, hours=2)
+        for hour in range(8):  # such as a runaway computer sending changes for hours
+            backups.make(self.root / "server.db", folder, now=burst + timedelta(hours=hour))
+        kept = [backups.made_at(path) for path in backups.backups(folder)]
+        self.assertEqual(kept[:3], [burst + timedelta(hours=hour) for hour in (7, 6, 5)])
+        self.assertEqual(kept[3:], [start + timedelta(days=day) for day in range(5, -1, -1)])
+        self.assertEqual(backups.made_at(backups.latest(folder)), burst + timedelta(hours=7))
 
 
 class WebTests(TemporaryFolder):
@@ -487,15 +588,59 @@ class WebTests(TemporaryFolder):
     def test_one_guesser_does_not_lock_out_everyone_else(self) -> None:
         guard = self.server.join_guard
         for number in range(40):
-            guard.failed(f"10.0.0.{number % 8}")
-        self.assertFalse(guard.allowed("10.0.0.1"))
-        self.assertTrue(guard.allowed("10.0.0.99"))
+            if guard.begin(f"10.0.0.{number % 8}"):
+                guard.end(f"10.0.0.{number % 8}", failed=True)
+        self.assertFalse(guard.begin("10.0.0.1"))
+        self.assertTrue(guard.begin("10.0.0.99"))
 
     def test_housekeeping_makes_the_daily_backup(self) -> None:
         self.server.housekeeping()
         self.assertEqual(len(backups.backups(self.home / "backups")), 1)
         self.server.housekeeping()
         self.assertEqual(len(backups.backups(self.home / "backups")), 1)
+
+    def test_housekeeping_folds_uses_older_than_a_year_into_totals(self) -> None:
+        store = self.server.open()
+        try:
+            for at in ("2025-01-01T00:00:00Z", "2026-09-30T00:00:00Z"):
+                store.log_usage(at=at, operation="recall", agent="codex", project_id=None, query="router",
+                                record_ids=["k-1"])
+        finally:
+            store.close()
+        self.server.housekeeping(now=datetime(2026, 10, 3, tzinfo=timezone.utc))
+        store = self.server.open()
+        try:
+            self.assertEqual(1, store.connection.execute("SELECT COUNT(*) FROM usage").fetchone()[0])
+            self.assertEqual([("k-1", "recall", 1)],
+                             [tuple(row) for row in store.connection.execute("SELECT * FROM usage_totals")])
+        finally:
+            store.close()
+
+
+class ThrottleTests(unittest.TestCase):
+    def test_tries_still_running_count_against_the_limit(self) -> None:
+        moment = [1000.0]
+        guard = Throttle(clock=lambda: moment[0])
+        for _ in range(JOIN_FAILURES_PER_ADDRESS):
+            self.assertTrue(guard.begin("10.0.0.1"))
+        self.assertFalse(guard.begin("10.0.0.1"))  # none has finished, yet a sixth at once is refused
+        self.assertTrue(guard.begin("10.0.0.2"))
+        guard.end("10.0.0.1", failed=False)
+        self.assertTrue(guard.begin("10.0.0.1"))  # a try that worked gives its place back
+        for _ in range(JOIN_FAILURES_PER_ADDRESS):
+            guard.end("10.0.0.1", failed=True)
+        self.assertFalse(guard.begin("10.0.0.1"))
+        moment[0] += JOIN_WINDOW_SECONDS + 1
+        self.assertTrue(guard.begin("10.0.0.1"))
+
+    def test_an_ipv6_caller_counts_as_its_whole_64_bit_network(self) -> None:
+        guard = Throttle()
+        for number in range(1, JOIN_FAILURES_PER_ADDRESS + 1):
+            self.assertTrue(guard.begin(f"2001:db8::{number}"))
+            guard.end(f"2001:db8::{number}", failed=True)
+        self.assertFalse(guard.begin("2001:db8::ffff:1"))
+        self.assertTrue(guard.begin("2001:db8:0:1::1"))
+        self.assertTrue(guard.begin("10.0.0.1"))
 
 
 class TrustedProxyTests(TemporaryFolder):

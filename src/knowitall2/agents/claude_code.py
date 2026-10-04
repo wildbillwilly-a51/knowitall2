@@ -30,6 +30,7 @@ from .base import (
     Check,
     JsonFile,
     ServerLaunch,
+    cli_command,
     ensure_skill_installable,
     install_skill,
     json_object,
@@ -37,7 +38,7 @@ from .base import (
     remove_skill,
     render_hook_launcher,
     skill_check,
-    write_text_atomic,
+    write_hook_launcher,
 )
 
 _WRITE_ATTEMPTS = 3
@@ -70,16 +71,23 @@ class ClaudeCodeAdapter(AgentAdapter):
         return self.config_path.is_file() or self.config_dir.is_dir()
 
     def restart_hint(self) -> str:
-        return "Quit and reopen Claude Code, then run `knowitall2 doctor` to confirm it kept the registration."
+        return f"Quit and reopen Claude Code, then run `{cli_command('doctor')}` to confirm it kept the registration."
 
-    def setup(self, launch: ServerLaunch) -> list[str]:
+    def preflight(self) -> None:
         if not self.config_path.is_file():
             raise AgentError(
                 f"{self.config_path} was not found. Open Claude Code once so it creates its settings, "
                 "then run setup again."
             )
         ensure_skill_installable(self.skills_dir)
-        self._settings.load()  # fail before any change if settings.json is unreadable
+        _foreign_server_check(_object(self._config.load()[1], "mcpServers", self.config_path), self.config_path)
+        settings = self._settings.load()[1]
+        for event in HOOK_EVENTS:
+            _event_groups(settings, event, self.settings_path)
+        instructions.ensure_editable(self.instructions_path)
+
+    def setup(self, launch: ServerLaunch) -> list[str]:
+        self.preflight()
         changes = [change for change in (self._register_server(launch), self._install_hook(launch)) if change]
         skill_change = install_skill(self.skills_dir)
         if skill_change:
@@ -90,6 +98,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         return changes
 
     def uninstall(self) -> list[str]:
+        instructions.ensure_editable(self.instructions_path)  # fail before any change, as setup does
         changes = [change for change in (self._unregister_server(), self._remove_hook()) if change]
         skill_change = remove_skill(self.skills_dir)
         if skill_change:
@@ -103,7 +112,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         if not self.installed():
             return [Check("Claude Code", True, f"not installed ({self.config_path} not found); skipped")]
         return [self._server_check(launch), self._hook_check(launch), skill_check(self, self.skills_dir),
-                instructions.check(self.display_name, self.instructions_path, "Run: knowitall2 setup claude-code")]
+                instructions.check(self.display_name, self.instructions_path, f"Run: {self.setup_command()}")]
 
     # MCP server registration ------------------------------------------------
 
@@ -112,12 +121,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         for _ in range(_WRITE_ATTEMPTS):
             text, data = self._config.load()
             servers = _object(data, "mcpServers", self.config_path)
-            existing = servers.get(SERVER_NAME)
-            if existing is not None and not _is_knowitall2_server(existing):
-                raise AgentError(
-                    f"{self.config_path} already has an MCP server named {SERVER_NAME} that KnowItAll2 did not "
-                    "create. Remove it, then run setup again."
-                )
+            existing = _foreign_server_check(servers, self.config_path)
             if existing == entry:
                 return None
             data.setdefault("mcpServers", servers)[SERVER_NAME] = entry
@@ -148,26 +152,29 @@ class ClaudeCodeAdapter(AgentAdapter):
         except AgentError as exc:
             return Check("Claude Code settings", False, str(exc), "Fix or restore that file, then run setup again.")
         if entry is None:
-            return Check(name, False, "KnowItAll2 is not registered", "Close Claude Code, then run: knowitall2 setup claude-code")
+            return Check(name, False, "KnowItAll2 is not registered", f"Close Claude Code, then run: {self.setup_command()}")
         if not _is_knowitall2_server(entry):
             return Check(name, False, f"an MCP server named {SERVER_NAME} exists but is not KnowItAll2's",
-                         "Remove that entry, then run: knowitall2 setup claude-code")
+                         f"Remove that entry, then run: {self.setup_command()}")
         if not launch_matches(entry, launch):
             return Check(name, False, "registered with a different Python or options than this installation",
-                         "Run: knowitall2 setup claude-code")
+                         f"Run: {self.setup_command()}")
         if not Path(str(entry.get("command"))).is_file():
             return Check(name, False, f"the registered Python is missing: {entry.get('command')}",
-                         "Run: knowitall2 setup claude-code")
+                         f"Run: {self.setup_command()}")
         return Check(name, True, f"registered in {self.config_path}")
 
     # Hooks ----------------------------------------------------------------
 
+    def refresh_hook_launcher(self, launch: ServerLaunch) -> str | None:
+        launcher = hook_launcher_path()
+        if write_hook_launcher(launcher, launch, "claude-code", create=False):
+            return f"refreshed the KnowItAll2 session hook launcher at {launcher}"
+        return None
+
     def _install_hook(self, launch: ServerLaunch) -> str | None:
         launcher = hook_launcher_path()
-        launcher_text = render_launcher(launch)
-        launcher_changed = not launcher.is_file() or launcher.read_text(encoding="utf-8") != launcher_text
-        if launcher_changed:
-            write_text_atomic(launcher, launcher_text)
+        launcher_changed = write_hook_launcher(launcher, launch, "claude-code")
         for _ in range(_WRITE_ATTEMPTS):
             text, data = self._settings.load()
             if all(_find_hooks(_event_groups(data, event, self.settings_path)) == [hook_entry(launch, event)]
@@ -224,10 +231,10 @@ class ClaudeCodeAdapter(AgentAdapter):
                 what = _EVENT_WORDS[event]
                 detail = f"the {what} hook is not installed" if not found[event] else (
                     f"the {what} hook is installed with different options than this installation")
-                return Check(name, False, detail, "Run: knowitall2 setup claude-code")
+                return Check(name, False, detail, f"Run: {self.setup_command()}")
         if not launcher.is_file() or launcher.read_text(encoding="utf-8") != render_launcher(launch):
             return Check(name, False, f"the hook launcher is missing or outdated: {launcher}",
-                         "Run: knowitall2 setup claude-code")
+                         f"Run: {self.setup_command()}")
         return Check(name, True, f"installed in {self.settings_path}")
 
 
@@ -289,6 +296,18 @@ def _drop_our_hooks(groups: list[Any]) -> None:
             group["hooks"] = [hook for hook in group["hooks"] if not _is_our_hook(hook)]
             if not group["hooks"]:
                 groups.remove(group)
+
+
+def _foreign_server_check(servers: dict[str, Any], path: Path) -> object:
+    """KnowItAll2's existing entry (or None); refuses an entry of that name that KnowItAll2 did not create."""
+
+    existing = servers.get(SERVER_NAME)
+    if existing is not None and not _is_knowitall2_server(existing):
+        raise AgentError(
+            f"{path} already has an MCP server named {SERVER_NAME} that KnowItAll2 did not "
+            "create. Remove it, then run setup again."
+        )
+    return existing
 
 
 def _is_knowitall2_server(entry: object) -> bool:

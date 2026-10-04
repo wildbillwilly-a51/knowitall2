@@ -135,7 +135,8 @@ class StatsCommandTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"KNOWITALL2_HOME": str(Path(temporary) / "data")}):
                 output = io.StringIO()
                 with redirect_stdout(output):
-                    main(["remember", "The homelab router runs OpenWrt.", "--project-path", str(project)])
+                    main(["remember", "The homelab router runs OpenWrt.", "--source", "user",
+                          "--project-path", str(project)])
                     main(["recall", "openwrt", "--project-path", str(project)])
                     main(["recall", "kubernetes", "--project-path", str(project)])
                     output.truncate(0)

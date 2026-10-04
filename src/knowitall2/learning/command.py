@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import journal
-from ..connected import maintenance_turn, share_quietly
+from ..connected import maintenance_turn, renew_maintenance_turn, share_quietly
 from ..memory import Memory
 from ..paths import database_path
 from ..store import Store, StoreError
@@ -33,8 +33,8 @@ from .cataloguer import plan as catalog_plan
 from .learner import LEARNER_AGENT, LearnReport, learn
 from .maintenance import MAINTENANCE_AGENT, EngineReviewer, MaintenanceReport, maintain
 from .state import (
-    CLAUDE_MODEL, FORMER_CLAUDE_MODELS, LearnerSettings, LearnerState, LockBusy, RunLock, day_ago, load_settings,
-    save_settings,
+    CLAUDE_MODEL, FORMER_CLAUDE_MODELS, LearnerSettings, LearnerState, LockBusy, RunLock, day_ago, learner_lock,
+    load_settings, save_settings,
 )
 from .transcripts import claude_code_logs, codex_logs, is_codex_log, read_session, session_folder, session_logs
 
@@ -158,7 +158,8 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
                         run=run,
                     )
                     print(upkeep.describe(dry_run=False))
-                    if not upkeep.blocked:
+                    # Maintenance can take long: hold the turn again for the catalogue, or leave it for later.
+                    if not upkeep.blocked and renew_maintenance_turn():
                         moments.set_now({"since": moments.now_iso(), "doing": "filing memories under systems"})
                         filing = run_catalog(
                             memory=Memory(store, agent=CATALOG_AGENT), engine=extractor, state=state, run=run,
@@ -388,7 +389,7 @@ def run_catalog_command(arguments: argparse.Namespace) -> int:
                 print("Another computer sharing this memory is tidying it up, or the server cannot be reached; "
                       "try again later.")
                 return 0
-            with RunLock():
+            with learner_lock():
                 state = LearnerState()
                 store = Store.open(database_path())
                 try:
@@ -437,7 +438,7 @@ def run_maintain(arguments: argparse.Namespace) -> int:
     try:
         if arguments.dry_run:
             return _maintain_once(None, None, settings, dry_run=True)
-        with RunLock():
+        with learner_lock():
             return _maintain_once(EngineReviewer(engine), LearnerState(), settings, dry_run=False)
     except LockBusy:
         print("A learning run is in progress; it reviews memories when it finishes.")
@@ -628,11 +629,11 @@ def _start_from_now(agent: str) -> int:
     """
 
     logs = codex_logs() if agent == "codex" else claude_code_logs()
-    state = LearnerState()
     moment = datetime.now(timezone.utc).isoformat()
     marked = 0
     try:
-        with RunLock():
+        with learner_lock():
+            state = LearnerState()  # read under the lock, so a run that just saved is not undone
             for log in logs:
                 try:
                     boundary = _line_boundary(log)
@@ -723,7 +724,7 @@ def _documents(arguments: argparse.Namespace, settings: LearnerSettings) -> int:
             return 1
         limit = arguments.max_calls or WORK_CALLS_PER_RUN
         total = 0
-        with RunLock():
+        with learner_lock():
             state = LearnerState()
             for project, folder, dossiers, new in plans:
                 if not new:

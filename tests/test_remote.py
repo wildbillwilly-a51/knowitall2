@@ -11,10 +11,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+from _support import SystemProxy
+
 from knowitall2 import connected, doctor
 from knowitall2.app import api
 from knowitall2.paths import database_path
-from knowitall2.remote import RemoteClient, RemoteError
+from knowitall2.remote import RemoteClient, RemoteError, bypasses_proxy
 from knowitall2.store import Store
 
 BAD_GATEWAY = b"<html><head><title>502 Bad Gateway</title></head><body>Bad Gateway</body></html>"
@@ -65,8 +67,8 @@ class BehindAProxy(unittest.TestCase):
             with self.subTest(status=status):
                 self.answer(status, "text/html", BAD_GATEWAY)
                 error = self.failure()
-                self.assertEqual(str(error), f"cannot reach the KnowItAll2 server at {self.address}: "
-                                             f"its proxy says it is not answering ({status})")
+                self.assertEqual(str(error), f"cannot reach the KnowItAll2 server at {self.address}: a proxy "
+                                             f"between here and the server says it is not answering ({status})")
                 self.assertEqual(error.status, status)
 
     def test_the_servers_own_error_is_still_its_own_words(self) -> None:
@@ -87,7 +89,8 @@ class BehindAProxy(unittest.TestCase):
             healthy, lines = connected.describe_status()
             self.assertFalse(healthy)
             self.assertIn("The server cannot be reached right now (cannot reach the KnowItAll2 server at "
-                          f"{self.address}: its proxy says it is not answering (502))", " ".join(lines))
+                          f"{self.address}: a proxy between here and the server says it is not answering (502))",
+                          " ".join(lines))
             self.assertNotIn("server said", " ".join(lines))
 
             check = doctor._sharing_check()
@@ -100,13 +103,32 @@ class BehindAProxy(unittest.TestCase):
             finally:
                 store.close()
             self.assertEqual(report.status, 502)
-            self.assertIn("its proxy says it is not answering (502)", report.describe())
+            self.assertIn("a proxy between here and the server says it is not answering (502)", report.describe())
             self.assertEqual(connected.read_status()["problem_status"], 502)
 
             health = {"level": "ok", "headline": "Everything is working", "items": []}
             api._add_sharing_health(health, api._sharing())
             self.assertEqual(health["items"][0]["level"], "attention")
             self.assertIn("could not be reached at the last try", health["items"][0]["text"])
+
+
+class SystemProxyTests(BehindAProxy):
+    """A system proxy is for the internet: a server on this computer or its own network is reached directly."""
+
+    def test_a_server_here_is_reached_without_the_system_proxy(self) -> None:
+        self.answer(200, "application/json", json.dumps({"ok": True}).encode())
+        with SystemProxy() as proxy:
+            self.assertEqual({"ok": True}, RemoteClient(self.address, key="secret-key").hello())
+        self.assertEqual([], proxy.seen)
+
+    def test_which_servers_skip_the_system_proxy(self) -> None:
+        for host in ("127.0.0.1", "localhost", "::1", "10.1.2.3", "172.20.0.5", "192.168.1.20", "100.101.102.103",
+                     "169.254.10.1", "fe80::1", "fd12::5", "nas", "nas.local", "knowitall2.localhost"):
+            with self.subTest(host=host):
+                self.assertTrue(bypasses_proxy(host))
+        for host in ("knowitall2.example.com", "8.8.8.8", "100.128.0.1", "2001:4860::8888"):
+            with self.subTest(host=host):
+                self.assertFalse(bypasses_proxy(host))
 
 
 if __name__ == "__main__":

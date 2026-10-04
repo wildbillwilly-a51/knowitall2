@@ -1,5 +1,7 @@
 import io
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -31,10 +33,25 @@ class CliTests(unittest.TestCase):
             code = main(list(arguments))
         return code, output.getvalue(), errors.getvalue()
 
+    def test_output_to_a_pipe_is_utf8(self) -> None:
+        # An agent reads the command line's output through a pipe, as UTF-8; on Windows a pipe got the ANSI code
+        # page, so "é" arrived as a byte UTF-8 has no letter for and "山田" as "山田".
+        text = "José's café is on the Grand-Rue → 山田 keeps the key."
+        environment = {name: value for name, value in os.environ.items()
+                       if name not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        for arguments in (["remember", text, "--project-path", str(self.project)],
+                          ["recall", "café key", "--project-path", str(self.project)]):
+            done = subprocess.run([sys.executable, "-B", "-m", "knowitall2", *arguments], capture_output=True,
+                                  env=environment, cwd=str(self.project), timeout=60)
+            self.assertEqual(0, done.returncode, done.stderr.decode("utf-8", errors="replace"))
+        self.assertIn(text, done.stdout.decode("utf-8"))
+
     def test_remember_recall_brief_and_stats(self) -> None:
         project = str(self.project)
         code, output, _ = self.run_cli(
-            "remember", "Vaultwarden holds all credentials.", "--kind", "rule", "--project-path", project,
+            "remember", "Vaultwarden holds all credentials.", "--kind", "rule", "--source", "user",
+            "--project-path", project,
         )
         self.assertEqual(0, code)
         self.assertIn("Saved [k-", output)
@@ -74,6 +91,18 @@ class CliTests(unittest.TestCase):
         code, _, errors = self.run_cli("move", record_id, "--project", "gamma")
         self.assertEqual(1, code)
         self.assertIn("no single project named 'gamma'", errors)
+
+    def test_remember_counts_as_the_users_words_only_when_told(self) -> None:
+        # Agents run this command too, so a memory is a guess unless --source says otherwise.
+        project = str(self.project)
+        code, _, _ = self.run_cli("remember", "The NAS is nas01.", "--project-path", project)
+        self.assertEqual(0, code)
+        _, output, _ = self.run_cli("recall", "nas01", "--project-path", project)
+        self.assertIn("unverified via cli", output)
+        code, output, errors = self.run_cli("remember", "Always tag releases.", "--kind", "rule",
+                                            "--project-path", project)
+        self.assertEqual((1, ""), (code, output))
+        self.assertIn("pass --source user", errors)
 
     def test_errors_exit_nonzero_with_a_message(self) -> None:
         code, output, errors = self.run_cli("remember", "password=hunter22")

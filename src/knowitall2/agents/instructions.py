@@ -4,9 +4,10 @@ Agents read their global instructions at the start of every chat, before any
 project file, so this is where KnowItAll2 becomes part of how an agent orients
 itself: read the briefing, and look things up before working them out again.
 
-KnowItAll2 changes only the text between its own markers and the blank line
-before them. The rest of the file, its line endings, and a byte-order mark are
-kept; a file that held only the block is removed with it.
+KnowItAll2 changes only the text between its own markers and the blank lines
+before them, and re-reads the file just before writing it. The rest of the
+file, its line endings, and a byte-order mark are kept; a file that held only
+the block is removed with it.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ knowledge alongside the project's own files, the way you would search before dig
   credential is kept instead.
 - If KnowItAll2 is not available, continue normally."""
 _BOM = "\ufeff"
+_WRITE_ATTEMPTS = 3
 
 
 def render(newline: str = "\n") -> str:
@@ -51,50 +53,61 @@ def state(path: Path) -> str:
     return "current" if text[span[0]:span[1]] == render(newline) else "outdated"
 
 
+def ensure_editable(path: Path) -> None:
+    """Fail before any change if the file cannot be read or KnowItAll2's markers in it are damaged."""
+
+    _span(_read(path), path)
+
+
 def install(path: Path) -> str | None:
     """Add or refresh the block; returns a description of the change, or None when it was current."""
 
-    text = _read(path)
-    bom = _BOM if text.startswith(_BOM) else ""
-    body = text[len(bom):]
-    newline = "\r\n" if "\r\n" in body else "\n"
-    block = render(newline)
-    span = _span(body, path)
-    if span is None:
-        if not body.strip():
-            updated = block + newline
+    for _ in range(_WRITE_ATTEMPTS):
+        text = _read(path)
+        bom = _BOM if text.startswith(_BOM) else ""
+        body = text[len(bom):]
+        newline = "\r\n" if "\r\n" in body else "\n"
+        block = render(newline)
+        span = _span(body, path)
+        if span is None:
+            if not body.strip():
+                updated = block + newline
+            else:
+                separator = "" if body.endswith(newline * 2) else (newline if body.endswith(newline) else newline * 2)
+                updated = body + separator + block + newline
         else:
-            separator = "" if body.endswith(newline * 2) else (newline if body.endswith(newline) else newline * 2)
-            updated = body + separator + block + newline
-    else:
-        if body[span[0]:span[1]] == block:
-            return None
-        updated = body[: span[0]] + block + body[span[1]:]
-    write_text_atomic(path, bom + updated)
-    return f"added KnowItAll2's instructions to {path}" if span is None else f"updated KnowItAll2's instructions in {path}"
+            if body[span[0]:span[1]] == block:
+                return None
+            updated = body[: span[0]] + block + body[span[1]:]
+        if _replace_if_unchanged(path, text, bom + updated):
+            return (f"added KnowItAll2's instructions to {path}" if span is None
+                    else f"updated KnowItAll2's instructions in {path}")
+    raise AgentError(f"{path} kept changing while setup ran; run setup again.")
 
 
 def remove(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    text = _read(path)
-    bom = _BOM if text.startswith(_BOM) else ""
-    body = text[len(bom):]
-    span = _span(body, path)
-    if span is None:
-        return None
-    newline = "\r\n" if "\r\n" in body else "\n"
-    before, after = body[: span[0]], body[span[1]:]
-    if after.startswith(newline):
-        after = after[len(newline):]
-    while before.endswith(newline * 2):
-        before = before[: -len(newline)]
-    updated = before + after
-    if not updated.strip():
-        path.unlink()
-        return f"removed {path}, which held only KnowItAll2's instructions"
-    write_text_atomic(path, bom + updated)
-    return f"removed KnowItAll2's instructions from {path}"
+    for _ in range(_WRITE_ATTEMPTS):
+        if not path.is_file():
+            return None
+        text = _read(path)
+        bom = _BOM if text.startswith(_BOM) else ""
+        body = text[len(bom):]
+        span = _span(body, path)
+        if span is None:
+            return None
+        newline = "\r\n" if "\r\n" in body else "\n"
+        before, after = body[: span[0]], body[span[1]:]
+        if after.startswith(newline):
+            after = after[len(newline):]
+        while before.endswith(newline * 2):
+            before = before[: -len(newline)]
+        updated = before + after
+        if not updated.strip():
+            if _replace_if_unchanged(path, text, None):
+                return f"removed {path}, which held only KnowItAll2's instructions"
+        elif _replace_if_unchanged(path, text, bom + updated):
+            return f"removed KnowItAll2's instructions from {path}"
+    raise AgentError(f"{path} kept changing; run uninstall again.")
 
 
 def check(display_name: str, path: Path, fix: str) -> Check:
@@ -104,7 +117,7 @@ def check(display_name: str, path: Path, fix: str) -> Check:
         return Check(name, True, f"current in {path}")
     if current == "damaged":
         return Check(name, False, f"{path} cannot be read, or KnowItAll2's markers in it are out of order",
-                     f"Fix or remove the lines between {BEGIN} and {END} in {path}, then: {fix.removeprefix('Run: ')}")
+                     f"Fix or remove the lines between {BEGIN} and {END} in {path}, then run: {fix.removeprefix('Run: ')}")
     return Check(name, False, f"KnowItAll2's instructions are {current} in {path}", fix)
 
 
@@ -115,6 +128,22 @@ def _read(path: Path) -> str:
         return path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise AgentError(f"cannot read {path}: {exc}") from exc
+
+
+def _replace_if_unchanged(path: Path, original: str, text: str | None) -> bool:
+    """Write ``text`` (or remove the file, for None) unless the file changed since it was read as ``original``.
+
+    Agents and editors may save the file at any time; reading it again just
+    before writing keeps their change from being overwritten.
+    """
+
+    if _read(path) != original:
+        return False
+    if text is None:
+        path.unlink()
+    else:
+        write_text_atomic(path, text)
+    return True
 
 
 def _span(text: str, path: Path) -> tuple[int, int] | None:

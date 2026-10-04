@@ -64,15 +64,18 @@ def main(argv: Sequence[str] | None = None, *, stdin: str | None = None) -> int:
     if len(arguments) < 2 or arguments[0] not in HOOK_AGENTS or arguments[1] not in HOOK_EVENTS:
         return 0
     global _deferred
-    text = sys.stdin.read() if stdin is None else stdin
+    source = f"{arguments[1]} hook ({arguments[0]})"
     handler = {"session-start": session_start, "stop": stop, "session-end": session_end,
                "prompt-submit": prompt_submit}[arguments[1]]
     _deferred = []
     try:
         try:
+            # Agents send UTF-8, but on Windows text stdin is in the ANSI code page, which
+            # would misread a folder name such as "alphá" and so lose the project.
+            text = sys.stdin.buffer.read().decode("utf-8", "replace") if stdin is None else stdin
             output = handler(text, agent=arguments[0])
         except Exception as exc:
-            journal.problem(f"{arguments[1]} hook ({arguments[0]})", f"{type(exc).__name__}: {exc}")
+            journal.problem(source, f"{type(exc).__name__}: {exc}")
             output = ""
         if output:
             # The output is ASCII-only JSON, so no console encoding can break it.
@@ -80,16 +83,25 @@ def main(argv: Sequence[str] | None = None, *, stdin: str | None = None) -> int:
                 sys.stdout.write(output)
                 sys.stdout.flush()
             except (OSError, ValueError, UnicodeError) as exc:
-                journal.problem(f"{arguments[1]} hook ({arguments[0]})", f"its output could not be written: {exc}")
+                journal.problem(source, f"its output could not be written: {exc}")
                 return 0  # the news was not delivered, so it stays unshown
-        for items, transcript, session_id in _deferred:
-            moments.mark_shown(items, transcript=transcript, session_id=session_id)
+        try:
+            for items, transcript, session_id in _deferred:
+                moments.mark_shown(items, transcript=transcript, session_id=session_id)
+        except Exception as exc:
+            journal.problem(source, f"the news it showed could not be marked as shown: {exc}")
     finally:
         _deferred = None
-        # When connected to a server: fetch what other computers learned, and send what this one saved.
-        from .connected import nudge
+        try:
+            # When connected to a server: fetch what other computers learned, and send what this one saved.
+            # Looked up first (as ``connected.is_connected`` does), so a computer that is not connected never
+            # loads the network code, which costs more than everything else a hook does.
+            if (data_home() / "server" / "connection.json").is_file():
+                from .connected import nudge
 
-        nudge(arguments[0])
+                nudge(arguments[0])
+        except Exception as exc:
+            journal.problem(source, f"a sync could not start: {type(exc).__name__}: {exc}")
     return 0
 
 
@@ -111,6 +123,7 @@ def session_start(
             since = memory.now()
             context = memory.briefing(project_path=cwd or Path.cwd())
             project = memory.project_for(cwd or Path.cwd())
+            journal.tidy(store)
         finally:
             store.close()
     except Exception as exc:
@@ -406,7 +419,7 @@ def maybe_start_learner(
     log = open(marker.parent / "last-run.log", "w", encoding="utf-8")
     try:
         launcher(
-            [sys.executable, "-B", "-m", "knowitall2", "learn", *(["--requests"] if requests else [])],
+            [sys.executable, "-B", "-P", "-m", "knowitall2", "learn", *(["--requests"] if requests else [])],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             cwd=str(data_home()), env=_learner_environment(), close_fds=True, **_detached_options(),
         )

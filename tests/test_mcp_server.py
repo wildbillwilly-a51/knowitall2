@@ -63,6 +63,27 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("via codex", found)
         self.assertIn("Forgot", self.call("forget", id=record_id)["content"][0]["text"])
 
+    def test_agents_ask_the_user_before_changing_the_users_statements(self) -> None:
+        self.initialize("codex-mcp-client")
+        user = Memory(self.store, agent="app", clock=Clock())
+        fridays = user.remember("Never deploy to production on Fridays.", kind="rule", source="user",
+                                detect_project=False).record
+        backups = user.remember("Keep a backup before running database migrations.", kind="rule", source="user",
+                                detect_project=False).record
+        replaced = self.call("remember", text="Deploying on Fridays is fine.", replaces=fridays.id)
+        self.assertFalse(replaced["isError"])
+        self.assertIn("the user will be asked", replaced["content"][0]["text"])
+        forgotten = self.call("forget", id=backups.id, reason="outdated")
+        self.assertFalse(forgotten["isError"])
+        self.assertEqual(["active", "active"], [self.store.get(item.id).status for item in (fridays, backups)])
+        kinds = {question["kind"]: question for question in self.store.open_questions(limit=5)}
+        self.assertEqual({"conflict", "still_true"}, set(kinds))
+        question_id = kinds["still_true"]["id"]
+        self.assertIn(f"answer {question_id} forget", forgotten["content"][0]["text"])
+        # The user's own choice goes through answer.
+        self.assertFalse(self.call("answer", id=question_id, choice="forget")["isError"])
+        self.assertEqual("retired", self.store.get(backups.id).status)
+
     def test_briefing_defaults_to_the_server_folder(self) -> None:
         self.initialize("claude-code")
         self.call("remember", text="We use unittest.", kind="decision")
@@ -75,6 +96,22 @@ class McpServerTests(unittest.TestCase):
         secret = self.call("remember", text="password=hunter22")
         self.assertTrue(secret["isError"])
         self.assertIn("never stores secrets", secret["content"][0]["text"])
+
+    def test_a_limit_that_is_not_a_finite_whole_number_is_a_tool_error(self) -> None:
+        for limit in (float("inf"), float("-inf"), float("nan"), 2.5, "1e999", 10 ** 400):
+            with self.subTest(limit=limit):
+                answer = self.request("tools/call", {"name": "recall", "arguments": {"query": "nas", "limit": limit}})
+                self.assertNotIn("error", answer)
+                self.assertTrue(answer["result"]["isError"])
+        # JSON as an agent could send it: Python reads Infinity, NaN and 1e999 as numbers.
+        lines = [json.dumps({"jsonrpc": "2.0", "id": number, "method": "tools/call",
+                             "params": {"name": "recall", "arguments": {"query": "nas", "limit": "LIMIT"}}}
+                            ).replace('"LIMIT"', value) for number, value in enumerate(("Infinity", "NaN", "1e999"))]
+        output = io.BytesIO()
+        self.server.serve(io.BytesIO(("\n".join(lines) + "\n").encode("utf-8")), output)
+        answers = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([True, True, True], [answer["result"]["isError"] for answer in answers])
+        self.assertIn("'limit' must be a whole number", answers[0]["result"]["content"][0]["text"])
 
     def test_protocol_errors_and_notifications(self) -> None:
         self.assertEqual(-32601, self.request("does/not/exist")["error"]["code"])
@@ -109,6 +146,12 @@ class McpServerTests(unittest.TestCase):
         responses = [json.loads(line) for line in writer.getvalue().decode("utf-8").splitlines()]
         self.assertEqual([1, None, 2], [response.get("id") for response in responses])
         self.assertEqual(-32700, responses[1]["error"]["code"])
+
+    def test_an_empty_batch_gets_one_error(self) -> None:
+        writer = io.BytesIO()
+        self.server.serve(io.BytesIO(b"[]\n[ ]\n"), writer)
+        error = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+        self.assertEqual([error, error], [json.loads(line) for line in writer.getvalue().splitlines()])
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..agents.base import server_launch
+from ..agents.base import cli_command, server_launch
 from ..files import write_text_atomic
 from ..paths import HOME_ENVIRONMENT_VARIABLE, data_home, in_package_storage
 
@@ -34,6 +34,11 @@ ICON = "knowitall2.ico"
 STATE_FILE = "app-shortcuts.json"
 SHORTCUT_NAME = "KnowItAll2"
 DESCRIPTION = "KnowItAll2: what your coding agents know and learn"
+# Windows' ids for the folders the shortcuts go in: the Start menu's programs, and the desktop.
+FOLDERID_PROGRAMS = "A77F5D77-2E2B-44C3-A6A2-ABA601054A51"
+FOLDERID_DESKTOP = "B4BFCC3A-DB2C-424C-B029-7FE99A87C641"
+# PowerShell ends a single-quoted string at any of these, unless it is doubled.
+_SINGLE_QUOTES = ("'", "\u2018", "\u2019", "\u201a", "\u201b")
 # The state of each place: "created", "pending" (the Start menu, waiting for the
 # app's first run outside a package), or "removed" (by the user; never remade).
 PLACES = ("start_menu", "desktop", "menu")
@@ -162,7 +167,7 @@ def describe() -> tuple[bool, str, str | None]:
     """For ``doctor``: whether the shortcut is in place, what it is, and how to fix it."""
 
     state = load_state()
-    fix = "Run: knowitall2 app --shortcut"
+    fix = f"Run: {cli_command('app', '--shortcut')}"
     if not launcher_path().is_file() and any(value == "created" for value in state.values()):
         return False, f"the shortcut's launcher {launcher_path()} is missing", fix
     if sys.platform != "win32":
@@ -176,7 +181,7 @@ def describe() -> tuple[bool, str, str | None]:
             return True, ("on the desktop; the app adds itself to the Start menu the first time it is opened "
                           "from there"), None
         return False, "not in the Start menu yet, and the desktop shortcut is gone", (
-            "Run `knowitall2 app --shortcut` from your own terminal (outside the Claude or Codex app)")
+            f"Run `{cli_command('app', '--shortcut')}` from your own terminal (outside the Claude or Codex app)")
     if any(value == "removed" for value in state.values()):
         return True, "removed at your request", None
     return False, "not installed", fix
@@ -200,8 +205,10 @@ def _windows_shortcuts() -> list[Path]:
 
     if sys.platform != "win32":
         return []
-    folders = _powershell("[Environment]::GetFolderPath('Programs'); [Environment]::GetFolderPath('Desktop')")
-    names = [line.strip() for line in folders.splitlines() if line.strip()]
+    names = [_known_folder(FOLDERID_PROGRAMS), _known_folder(FOLDERID_DESKTOP)]
+    if not all(names):
+        folders = _powershell("[Environment]::GetFolderPath('Programs'); [Environment]::GetFolderPath('Desktop')")
+        names = [line.strip() for line in folders.splitlines() if line.strip()]
     if len(names) != 2:
         names = [str(Path(os.environ.get("APPDATA", Path.home())) / "Microsoft" / "Windows" / "Start Menu" / "Programs"),
                  str(Path.home() / "Desktop")]
@@ -231,10 +238,42 @@ def _place(path: Path) -> str:
     return "created"
 
 
-def _write_lnk(path: Path, *, target: Path, arguments: str, folder: Path, icon: Path) -> None:
-    def quoted(value: object) -> str:
-        return "'" + str(value).replace("'", "''") + "'"
+def _known_folder(folder_id: str) -> str | None:
+    """A Windows known folder, such as the desktop, as Windows itself has it; None when it cannot say."""
 
+    import ctypes
+    import uuid
+
+    try:
+        shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_void_p)]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        ole32.CoTaskMemFree.restype = None
+        folder = ctypes.create_string_buffer(uuid.UUID(folder_id).bytes_le, 16)
+        found = ctypes.c_void_p()
+        result = shell32.SHGetKnownFolderPath(folder, 0, None, ctypes.byref(found))
+        try:
+            if result != 0 or not found.value:
+                return None
+            return ctypes.wstring_at(found.value) or None
+        finally:
+            ole32.CoTaskMemFree(found)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def quoted(value: object) -> str:
+    """``value`` as a PowerShell string, which also ends at a typographic single quote unless it is doubled."""
+
+    text = str(value)
+    for mark in _SINGLE_QUOTES:
+        text = text.replace(mark, mark * 2)
+    return "'" + text + "'"
+
+
+def _write_lnk(path: Path, *, target: Path, arguments: str, folder: Path, icon: Path) -> None:
     script = "\n".join([
         "$shell = New-Object -ComObject WScript.Shell",
         f"$link = $shell.CreateShortcut({quoted(path)})",
@@ -249,8 +288,13 @@ def _write_lnk(path: Path, *, target: Path, arguments: str, folder: Path, icon: 
 
 
 def _powershell(script: str, *, failure: str | None = None) -> str:
-    """Run a short Windows PowerShell script, passed encoded so no path needs quoting on a command line."""
+    """Run a short Windows PowerShell script, passed encoded so no path needs quoting on a command line.
 
+    PowerShell writes what it prints in the console's code page, which has no
+    "é" or "山", so it is told to write UTF-8 first.
+    """
+
+    script = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false\n" + script
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     try:
         completed = subprocess.run(
@@ -281,7 +325,24 @@ def _create_linux(launcher: Path) -> str:
     icon = Path(__file__).resolve().parent / "static" / "icon.svg"
     write_text_atomic(entry, "\n".join([
         "[Desktop Entry]", "Type=Application", f"Name={SHORTCUT_NAME}", f"Comment={DESCRIPTION}",
-        f'Exec="{sys.executable}" "{launcher}"', f"Icon={icon}", "Terminal=false", "Categories=Development;", "",
+        f"Exec={desktop_exec([sys.executable, str(launcher)])}", f"Icon={icon}", "Terminal=false",
+        "Categories=Development;", "",
     ]))
     entry.chmod(0o755)
     return f"added KnowItAll2 to the applications menu ({entry})"
+
+
+def desktop_exec(arguments: list[str]) -> str:
+    """A menu entry's ``Exec=`` value that runs ``arguments`` whatever characters the paths hold.
+
+    The Desktop Entry Specification quotes each argument and puts a backslash
+    before each double quote, backtick, dollar sign and backslash in it; then
+    every backslash is escaped once more (the rule for all values), and a
+    percent sign is written twice.
+    """
+
+    quoted_arguments = []
+    for argument in arguments:
+        inside = "".join("\\" + character if character in '"`$\\' else character for character in argument)
+        quoted_arguments.append('"' + inside.replace("\\", "\\\\").replace("%", "%%") + '"')
+    return " ".join(quoted_arguments)

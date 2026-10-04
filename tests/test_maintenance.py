@@ -12,6 +12,7 @@ from _support import Clock, make_repository
 
 from knowitall2 import review
 from knowitall2.cli import main
+from knowitall2.learning import moments
 from knowitall2.learning.extractor import ClaudeCliExtractor, ExtractionError
 from knowitall2.learning.maintenance import (
     REVIEW_PROMPT,
@@ -22,7 +23,7 @@ from knowitall2.learning.maintenance import (
     plan,
     render_group,
 )
-from knowitall2.learning.state import LearnerState
+from knowitall2.learning.state import LearnerState, RunLock
 from knowitall2.memory import Memory, MemoryInputError
 from knowitall2.store import Store
 
@@ -154,6 +155,29 @@ class GateTests(MaintenanceTestCase):
         self.assertEqual("still_true", question["kind"])
         self.assertIn("Forgot", review.answer(self.memory, question["id"], "forget"))
         self.assertEqual("retired", self.status(stated.id))
+
+    def test_the_users_statements_are_merged_or_replaced_only_when_nearly_identical(self) -> None:
+        tag = self.save("Always tag releases before deploying them.", kind="rule", source="user")
+        tag_again = self.save("Tag every release in Git.", kind="rule", source="user")
+        old_host = self.save("Deploy from the build01 host.", kind="rule", source="user")
+        new_host = self.save("Deploy from the build02 host from now on.", kind="rule", source="user")
+        signed_tags = self.save("Sign every tag, with GPG", kind="rule", source="user")
+        noted = self.save("Sign every tag with GPG.", kind="note", source="user")  # the same words, but a note
+        sign = self.save("Sign every commit with GPG.", kind="rule", source="user")
+        sign_again = self.save("Sign every commit, with GPG", kind="rule", source="user")
+        report = self.run_maintenance(FakeReviewer([[
+            {"kind": "duplicate", "keep_id": tag.id, "ids": [tag_again.id], "reason": "Same rule."},
+            {"kind": "outdated", "keep_id": new_host.id, "ids": [old_host.id], "reason": "Moved."},
+            {"kind": "duplicate", "keep_id": noted.id, "ids": [signed_tags.id], "reason": "Same."},
+            {"kind": "duplicate", "keep_id": sign.id, "ids": [sign_again.id], "reason": "Same rule."},
+        ]]))
+        self.assertEqual({"question": 3, "merged duplicate": 1}, dict(report.changes))
+        for record in (tag, tag_again, old_host, new_host, signed_tags, noted, sign):
+            self.assertEqual("active", self.status(record.id))
+        self.assertEqual("superseded", self.status(sign_again.id))
+        asked = sorted(question["record_ids"] for question in self.store.open_questions(limit=5))
+        self.assertEqual(sorted([[tag_again.id, tag.id], [old_host.id, new_host.id], [signed_tags.id, noted.id]]),
+                         asked)
 
     def test_conflicts_become_questions_with_the_older_memory_first(self) -> None:
         first = self.save("Backups run at 02:00.")
@@ -313,6 +337,54 @@ class CommandTests(unittest.TestCase):
         self.assertIn("Maintenance: 1 group(s) of related memories: review 1.", output)
         self.assertIn("Review calls: 1.", output)
         self.assertEqual(1, len(reviewer.texts))
+
+    def test_a_request_made_while_maintenance_runs_starts_the_learner_when_it_ends(self) -> None:
+        self.run_cli("remember", "The NAS is nas01.", "--source", "inferred")
+        self.run_cli("remember", "The router is rtr01.", "--source", "inferred")
+        with mock.patch("knowitall2.learning.command.find_claude_cli", return_value=Path("claude.exe")), \
+                mock.patch("knowitall2.learning.command.find_codex_cli", return_value=None):
+            self.run_cli("learn", "--enable")
+        test = self
+
+        class CommitMeanwhile(FakeReviewer):
+            def review(self, text):
+                # A turn ends with a commit: its hook finds the lock taken and leaves the request waiting.
+                test.assertTrue(RunLock().busy())
+                moments.request(transcript=str(test.home / "session.jsonl"), session_id="s1", agent="claude-code",
+                                cwd=str(test.home), reason="commit", detail="abc1234")
+                return super().review(text)
+
+        reviewer = CommitMeanwhile([[]])
+        launches = []
+
+        def start(**options) -> bool:
+            launches.append((options, RunLock().busy()))
+            return True
+
+        with mock.patch("knowitall2.learning.command.find_claude_cli", return_value=Path("claude.exe")), \
+                mock.patch("knowitall2.learning.command.EngineReviewer", return_value=reviewer), \
+                mock.patch("knowitall2.hooks.maybe_start_learner", side_effect=start):
+            code, output = self.run_cli("maintain")
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(reviewer.texts))
+        self.assertEqual([({"requests": True}, False)], launches)  # started once the lock was free
+
+    def test_the_catalog_follows_maintenance_only_while_this_computer_keeps_its_turn(self) -> None:
+        from knowitall2.learning.cataloguer import CatalogReport
+
+        self.run_cli("remember", "The NAS is nas01.", "--source", "inferred")
+        with mock.patch("knowitall2.learning.command.find_claude_cli", return_value=Path("claude.exe")), \
+                mock.patch("knowitall2.learning.command.find_codex_cli", return_value=None):
+            self.run_cli("learn", "--enable")
+        for renewed, filed in ((False, 0), (True, 1)):
+            with self.subTest(renewed=renewed), \
+                    mock.patch("knowitall2.learning.command.find_claude_cli", return_value=Path("claude.exe")), \
+                    mock.patch("knowitall2.learning.command.EngineReviewer", return_value=FakeReviewer([[]])), \
+                    mock.patch("knowitall2.learning.command.renew_maintenance_turn", return_value=renewed) as renew, \
+                    mock.patch("knowitall2.learning.command.run_catalog", return_value=CatalogReport()) as catalog:
+                self.assertEqual(0, self.run_cli("learn")[0])
+                renew.assert_called_once_with()
+                self.assertEqual(filed, catalog.call_count)
 
 
 if __name__ == "__main__":

@@ -15,11 +15,13 @@ This module holds what both sides share; the server's side is in ``server``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterable, Sequence
 
+from . import journal
 from .store import APPLYING_KEY, SYNCED_TABLES, TRACK_KEY, Store, SyncedTable
 
 MAX_TEXT = 20_000
@@ -155,21 +157,31 @@ def changes_since(store: Store, since: int, *, limit: int = 500) -> dict[str, An
     return {"changes": items, "next": next_seq, "latest": latest, "more": more}
 
 
+# A memory's use counts change with every recall; a change to them alone is not news from the server.
+_USE_COUNTS = frozenset({"recall_count", "last_used_at"})
+
+
 def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int | None = None) -> int:
     """Apply changes that came from the server to this computer's copy, without noting them as its own.
 
-    Returns how many were applied. Rows arrive newest change last, so a
-    memory may arrive before the project it belongs to; links are checked
-    when the whole batch is in. Columns and tables this version does not
-    know (from a newer server) are left out. Each row's change number is kept
-    (``sync_seen``), so a later change sent from here says what it was
-    based on. ``cursor``, when given, is where the next fetch starts.
+    Returns how many rows here changed (use counts aside). A row with a
+    change made here and not sent yet is left alone: it goes to the server
+    next, and the server settles which version stays. Rows arrive newest
+    change last, so a memory may arrive before the project it belongs to;
+    links are checked when the whole batch is in. Columns and tables this
+    version does not know (from a newer server) are left out, and so is a
+    delete from a table the server never deletes from. Each row's change
+    number is kept (``sync_seen``), so a later change sent from here says
+    what it was based on. ``cursor``, when given, is where the next fetch
+    starts.
     """
 
     connection = store.connection
-    applied = 0
+    changed = 0
     with store.transaction():
         connection.execute("PRAGMA defer_foreign_keys = ON")
+        # Read inside the transaction, so a change saved here a moment ago is never overwritten.
+        mine = pending_keys(store)
         store.set_meta(APPLYING_KEY, "1")
         for item in changes:
             name = item.get("table")
@@ -177,13 +189,26 @@ def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int
             if table is None:
                 continue  # shared by a newer server; this version has nowhere to keep it
             key = check_key(item.get("key"))
+            if (table.name, key) in mine:
+                continue
+            current = read_row(connection, table, key)
             if item.get("op") == "delete":
-                delete_row(connection, table, key)
+                if not table.deletable:
+                    journal.problem("sync", f"the server sent a delete of {table.name} {key}, which it never "
+                                            "makes; the row was kept")
+                    continue
+                if current is not None:
+                    delete_row(connection, table, key)
+                    changed += 1
             else:
                 row = item.get("row")
                 if isinstance(row, dict):
                     row = {name: value for name, value in row.items() if name in table.columns}
-                write_row(connection, table, check_row(table, key, row))
+                row = check_row(table, key, row)
+                write_row(connection, table, row)
+                if current is None or any(current.get(column) != value for column, value in row.items()
+                                          if column not in _USE_COUNTS):
+                    changed += 1
             seq = item.get("seq")
             if isinstance(seq, int) and not isinstance(seq, bool):
                 connection.execute(
@@ -191,11 +216,55 @@ def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int
                     "ON CONFLICT (tbl, key) DO UPDATE SET seq = MAX(sync_seen.seq, excluded.seq)",
                     (table.name, key, seq),
                 )
-            applied += 1
         if cursor is not None:
             store.set_meta(CURSOR_KEY, str(int(cursor)))
         connection.execute("DELETE FROM meta WHERE key = ?", (APPLYING_KEY,))
-    return applied
+    return changed
+
+
+def parent_links(connection: sqlite3.Connection, table: SyncedTable) -> list[tuple[str, SyncedTable, str]]:
+    """The links from a shared table's rows to the shared rows they belong to: (column, parent table, its column)."""
+
+    links = []
+    for row in connection.execute(f"PRAGMA foreign_key_list({table.name})").fetchall():
+        parent = SYNCED_TABLES.get(row[2])
+        if parent is not None:
+            links.append((row[3], parent, row[4] or parent.key))
+    return links
+
+
+def without_parents(store: Store, changes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The fetched changes that must wait: their row belongs to a row neither here nor among ``changes``.
+
+    Such as a memory whose project comes on a later page: saving it now
+    would break the link, and the whole page with it.
+    """
+
+    connection = store.connection
+    links: dict[str, list[tuple[str, SyncedTable, str]]] = {}
+    held: list[dict[str, Any]] = []
+    while True:
+        waiting = {id(item) for item in held}
+        arriving = {(item.get("table"), item.get("key")) for item in changes
+                    if item.get("op") != "delete" and id(item) not in waiting}
+        found = []
+        for item in changes:
+            table = SYNCED_TABLES.get(item.get("table")) if isinstance(item.get("table"), str) else None
+            row = item.get("row")
+            if table is None or item.get("op") == "delete" or not isinstance(row, dict):
+                continue
+            if table.name not in links:
+                links[table.name] = parent_links(connection, table)
+            for column, parent, target in links[table.name]:
+                value = row.get(column)
+                if value is None or (target == parent.key and (parent.name, value) in arriving):
+                    continue
+                if connection.execute(f"SELECT 1 FROM {parent.name} WHERE {target} = ?", (value,)).fetchone() is None:
+                    found.append(item)
+                    break
+        if len(found) == len(held):  # a parent that waits holds back its own rows too, until nothing changes
+            return found
+        held = found
 
 
 def cursor(store: Store) -> int:
@@ -218,12 +287,30 @@ def pending_keys(store: Store) -> set[tuple[str, str]]:
 
 
 def note_all(store: Store, name: str) -> None:
-    """Note every row of one shared table as changed here, so the next sync sends it."""
+    """Note every row of one shared table as changed here, in the order they were made, so the next sync sends it."""
 
     table = table_for(name)
     store.connection.execute(
-        f"INSERT INTO changes (tbl, key, op) SELECT ?, {table.key}, 'upsert' FROM {table.name}", (table.name,),
+        f"INSERT INTO changes (tbl, key, op) SELECT ?, {table.key}, 'upsert' FROM {table.name} ORDER BY rowid",
+        (table.name,),
     )
+
+
+def note_parents(store: Store, table: SyncedTable, row: dict[str, Any]) -> None:
+    """Note the rows a row belongs to (such as a memory's project) as changed here, when they are here and
+    not noted already, so a sync sends them and the row waiting for them on the server can follow."""
+
+    connection = store.connection
+    with store.transaction():
+        for column, parent, target in parent_links(connection, table):
+            value = row.get(column)
+            if value is None or target != parent.key:
+                continue
+            connection.execute(
+                f"INSERT INTO changes (tbl, key, op) SELECT ?, {parent.key}, 'upsert' FROM {parent.name} "
+                f"WHERE {parent.key} = ? AND NOT EXISTS (SELECT 1 FROM changes WHERE tbl = ? AND key = ?)",
+                (parent.name, value, parent.name, value),
+            )
 
 
 def source_id(store: Store) -> str:
@@ -240,27 +327,39 @@ def source_id(store: Store) -> str:
     return found
 
 
-def pending_operations(store: Store, *, limit: int = 500) -> list[dict[str, Any]]:
+def pending_operations(
+    store: Store, *, limit: int = 500, skip: Iterable[tuple[str, str]] = (),
+) -> list[dict[str, Any]]:
     """This computer's changes not yet accepted by the server, each row once, as it is now.
 
     Rows go in the order they first changed, so a project goes before the
-    memories filed under it. ``through`` is the last local change each covers.
+    memories filed under it. ``through`` is the last local change each
+    covers. ``skip`` leaves out rows (table, key), such as those waiting for
+    a project the server does not have yet, so the rows after them can go.
+
+    An operation's id is this database's id, the change number, and a short
+    digest of the row: sending the same operation again changes nothing,
+    while a change number used again with other content (a database put
+    back from an older copy) is a new operation.
     """
 
     connection = store.connection
     prefix = source_id(store)
+    left_out = json.dumps([f"{name}/{key}" for name, key in skip])
     operations = []
     for name, key, through, base in connection.execute(
         "SELECT c.tbl, c.key, MAX(c.seq), s.seq FROM changes c "
         "LEFT JOIN sync_seen s ON s.tbl = c.tbl AND s.key = c.key "
-        "GROUP BY c.tbl, c.key ORDER BY MIN(c.seq) LIMIT ?", (limit,),
+        "WHERE c.tbl || '/' || c.key NOT IN (SELECT value FROM json_each(?)) "
+        "GROUP BY c.tbl, c.key ORDER BY MIN(c.seq) LIMIT ?", (left_out, limit),
     ).fetchall():
         table = SYNCED_TABLES.get(name)
         if table is None:
             continue
         row = read_row(connection, table, key)
+        digest = hashlib.sha256(json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:10]
         operation: dict[str, Any] = {
-            "op_id": f"{prefix}-{through}", "table": name, "key": key, "op": "upsert" if row else "delete",
+            "op_id": f"{prefix}-{through}-{digest}", "table": name, "key": key, "op": "upsert" if row else "delete",
             "through": int(through),
         }
         if base is not None:
@@ -271,8 +370,15 @@ def pending_operations(store: Store, *, limit: int = 500) -> list[dict[str, Any]
     return operations
 
 
-def acknowledge(store: Store, operations: Sequence[dict[str, Any]]) -> None:
-    """Forget the local changes the server accepted (or settled) in these operations."""
+def acknowledge(
+    store: Store, operations: Sequence[dict[str, Any]], *, seen: Sequence[tuple[str, str, int]] = (),
+) -> None:
+    """Forget the local changes the server accepted (or settled) in these operations.
+
+    ``seen`` holds (table, key, change number) for rows the server applied
+    and numbered, kept like a fetched row's (``sync_seen``): the next change
+    sent from here, by any agent's key, is then based on that version.
+    """
 
     with store.transaction():
         for operation in operations:
@@ -280,19 +386,9 @@ def acknowledge(store: Store, operations: Sequence[dict[str, Any]]) -> None:
                 "DELETE FROM changes WHERE tbl = ? AND key = ? AND seq <= ?",
                 (operation["table"], operation["key"], operation["through"]),
             )
-
-
-def full_copy_operations(store: Store) -> Iterator[dict[str, Any]]:
-    """Every shared row as an operation, parents first: how a computer's memory starts or joins a server."""
-
-    connection = store.connection
-    prefix = source_id(store)
-    for table in SYNCED_TABLES.values():
-        order = "seq" if table.name in {"records", "questions"} else table.key
-        for values in connection.execute(
-            f"SELECT {', '.join(table.columns)} FROM {table.name} ORDER BY {order}",
-        ).fetchall():
-            row = dict(zip(table.columns, values))
-            key = str(row[table.key])
-            yield {"op_id": f"{prefix}-copy-{table.name}-{key}"[:200], "table": table.name, "key": key,
-                   "op": "upsert", "row": row}
+        for name, key, seq in seen:
+            store.connection.execute(
+                "INSERT INTO sync_seen (tbl, key, seq) VALUES (?, ?, ?) "
+                "ON CONFLICT (tbl, key) DO UPDATE SET seq = MAX(sync_seen.seq, excluded.seq)",
+                (name, key, seq),
+            )

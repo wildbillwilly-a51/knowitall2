@@ -245,22 +245,31 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
     wanted = {record.id: record for record in batch}
     now = memory.now()
     with memory.store.transaction():
+        # The batch was read before the model call: a memory filed meanwhile (such as by the user) keeps its
+        # note, and one forgotten meanwhile gets none, nor a new system.
+        noted = memory.store.notes_for(list(wanted))
+        open_ids = {record_id for record_id in wanted if record_id not in noted and _active(memory, record_id)}
         for item in payload_items(payload, "notes", FILE_BATCH):
             record = wanted.pop(str(item.get("id") or "").strip().strip("[]"), None)
-            if record is None:
+            if record is None or record.id not in open_ids:
                 continue
             system_id = _system_for(memory, systems, item, report, now)
-            memory.store.set_note(
+            if memory.store.add_note(
                 record.id, headline=_clean(item.get("headline"), HEADLINE_CHARACTERS) or _clean(record.text, 100),
                 system_id=system_id, facet=item.get("facet") if item.get("facet") in catalog.FACETS else "other",
                 written_by=CATALOG_AGENT, now=now,
-            )
-            report.filed += 1
+            ):
+                report.filed += 1
         # A memory the model skipped is filed as general, so it cannot hold the queue.
         for record in wanted.values():
-            memory.store.set_note(record.id, headline=_clean(record.text, 100), system_id=None, facet="other",
+            memory.store.add_note(record.id, headline=_clean(record.text, 100), system_id=None, facet="other",
                                   written_by=CATALOG_AGENT, now=now)
     return 1
+
+
+def _active(memory: Memory, record_id: str) -> bool:
+    record = memory.store.get(record_id)
+    return record is not None and record.status == "active"
 
 
 def _system_for(memory: Memory, systems: list[dict[str, Any]], item: dict[str, Any], report: CatalogReport,
@@ -355,11 +364,11 @@ def _profile_step(memory: Memory, report: CatalogReport, *, peek: bool = False, 
                                            kind=system["kind"], aliases=aliases, now=now)
             described.add(system["id"])
             report.profiled += 1
-        # A system the model skipped keeps its old summary but is not asked about again until it changes.
-        for system_id, (system, fingerprint) in by_id.items():
+        # A system the model skipped keeps its summary and gaps as they are now (the finder may have filled a
+        # gap meanwhile) but is not asked about again until its memories change.
+        for system_id, (_, fingerprint) in by_id.items():
             if system_id not in described:
-                memory.store.set_system_profile(system_id, summary=system["summary"], gaps=system["gaps"],
-                                                profiled=fingerprint, now=now)
+                memory.store.set_system_profiled(system_id, profiled=fingerprint, now=now)
     return 1
 
 
@@ -406,7 +415,7 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
         reason = _clean(item.get("reason"), 240) or None
         decision = item.get("decision")
         if question["kind"] == "conflict" and item.get("certain") is True and decision in keys:
-            outcome = review.settle(memory, question, records, decision, by="KnowItAll2", evidence=reason or "")
+            outcome = review.settle(memory, question, decision, by="KnowItAll2", evidence=reason or "")
             if outcome:
                 report.questions["settled"] += 1
                 continue

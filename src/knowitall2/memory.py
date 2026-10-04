@@ -14,6 +14,7 @@ from typing import Callable, Iterable, Sequence
 
 from . import journal
 from .identity import ProjectIdentity, identify
+from .quotes import quoted_in
 from .secrets import find_secrets, redact
 from .store import RecordRow, Store
 
@@ -50,9 +51,10 @@ MOVED_HEADER = ("KnowItAll2 knows this about project {name}, where this chat is 
 _FACET_ORDER = ("howto", "access", "signin", "where", "decision", "lesson", "can_do", "rule", "about", "other")
 _KIND_FACETS = {"procedure": "howto", "decision": "decision", "lesson": "lesson", "rule": "rule", "fact": "about",
                 "note": "other"}
-# A user rule counts as already in a project's instructions when this share of
-# its words is in one section of the project's AGENTS.md or CLAUDE.md.
-INSTRUCTED_SHARE = 0.7
+# A user rule counts as already in a project's instructions when one section of
+# the project's AGENTS.md or CLAUDE.md contains its own words, in order (letters
+# and digits alone, so wrapping and formatting do not matter): a section that only
+# shares most of its words may say the opposite. Short rules always show.
 _INSTRUCTED_MINIMUM_WORDS = 8
 _INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
 _INSTRUCTION_FILE_LIMIT = 256 * 1024
@@ -68,6 +70,8 @@ TASK_OFFER_HEADER = (
 
 VERIFICATION_FOR_SOURCE = {"user": "user_stated", "observed": "observed", "inferred": "unverified"}
 VERIFICATION_STRENGTH = {"unverified": 0, "observed": 1, "user_stated": 2}
+# Two statements are the same one said again when this share of their distinct words is shared.
+SAME_STATEMENT_SHARE = 0.9
 DEFAULT_HISTORY_LIMIT = 20
 _VERIFICATION_BOOST = (1.0, 1.05, 1.15)
 _STOPWORDS = frozenset(
@@ -103,6 +107,8 @@ class RememberResult:
     status: str
     record: RecordRow
     replaced: RecordRow | None = None
+    # The memory it was meant to replace, kept because its evidence is stronger; a question asks which is right.
+    kept: RecordRow | None = None
 
     def describe(self) -> str:
         if self.status == "already_known":
@@ -110,6 +116,12 @@ class RememberResult:
         text = f"Saved [{self.record.id}] ({self.record.kind}, {_scope_label(self.record, None)})."
         if self.replaced is not None:
             text += f" It replaces [{self.replaced.id}]."
+        if self.kept is not None and self.kept.verification == "user_stated":
+            text += (f" [{self.kept.id}] is the user's own statement, so it was not replaced: both are kept, "
+                     "and the user will be asked which is right.")
+        elif self.kept is not None:
+            text += (f" [{self.kept.id}] is better verified ({self.kept.verification}), so it was not replaced: "
+                     "both are kept until KnowItAll2 finds out which is right.")
         return text
 
 
@@ -127,6 +139,34 @@ def may_supersede(older: str, newer: str) -> bool:
     if older == "user_stated":
         return newer == "user_stated"
     return VERIFICATION_STRENGTH[newer] >= VERIFICATION_STRENGTH[older]
+
+
+def may_replace_unasked(older: RecordRow, *, kind: str, text: str, verification: str) -> bool:
+    """Whether learning or maintenance may replace ``older`` with a memory of this kind, text, and verification.
+
+    Evidence must be at least as strong, and one of the user's own statements
+    gives way only to the same statement said again: a model may misread
+    which of two user statements is current, so otherwise the user is asked.
+    """
+
+    if not may_supersede(older.verification, verification):
+        return False
+    return older.verification != "user_stated" or same_statement(older, kind=kind, text=text)
+
+
+def same_statement(record: RecordRow, *, kind: str, text: str) -> bool:
+    """Whether ``kind`` and ``text`` say what ``record`` says, in nearly the same words.
+
+    The same kind, and the same letters and digits or nearly all the same words.
+    """
+
+    if record.kind != kind:
+        return False
+    first, second = _tokens(record.text), _tokens(text)
+    if "".join(first) == "".join(second):
+        return True
+    words, others = set(first), set(second)
+    return bool(words | others) and len(words & others) / len(words | others) >= SAME_STATEMENT_SHARE
 
 
 class Memory:
@@ -174,7 +214,12 @@ class Memory:
     ) -> RememberResult:
         """Save one memory. ``project`` and ``recorded_at`` let an import keep a
         memory's original project and date; ``detect_project`` off leaves the
-        current folder's project out of it (the app has no workspace)."""
+        current folder's project out of it (the app has no workspace).
+
+        ``replaces`` supersedes that memory only when the new evidence is at
+        least as strong, and the user's own statement only for the user's own
+        words; otherwise both are kept and a question asks which is right.
+        """
 
         _require_choice(kind, KINDS, "kind")
         _require_choice(source, SOURCES, "source")
@@ -206,7 +251,8 @@ class Memory:
             )
         if kind == "rule" and source != "user":
             raise MemoryInputError(
-                "Not saved: rules must come from the user's own words. Save it as a fact or note, "
+                "Not saved: rules must come from the user's own words. If these are the user's own words, "
+                "pass --source user (source 'user' in the remember tool); otherwise save it as a fact or note, "
                 "or ask the user to confirm it as a rule."
             )
         if project is None:
@@ -242,13 +288,15 @@ class Memory:
                 return known
             if recorded_at is not None:
                 now = recorded_at
-            replaced = None
+            replaced = kept = None
             if replaces:
                 replaced = self.store.get(replaces.strip().strip("[]"))
                 if replaced is None:
                     raise MemoryInputError(f"Not saved: there is no memory [{replaces}] to replace.")
                 if replaced.status != "active":
                     raise MemoryInputError(f"Not saved: [{replaced.id}] is already {replaced.status}.")
+                if not may_supersede(replaced.verification, verification):
+                    kept, replaced = replaced, None
             record_id = self._new_id()
             self.store.insert_record(
                 record_id=record_id,
@@ -272,9 +320,13 @@ class Memory:
                 session=session, record_ids=[record_id, replaced.id if replaced else ""],
                 details={"kind": kind, "scope": effective_scope, "source": source},
             )
-        record = self.store.get(record_id)
-        assert record is not None
-        return RememberResult("saved", record, replaced)
+            record = self.store.get(record_id)
+            assert record is not None
+            if kept is not None:
+                from . import review
+
+                review.ask_conflict(self, kept, record)
+        return RememberResult("saved", record, replaced, kept)
 
     def recall(
         self,
@@ -345,11 +397,17 @@ class Memory:
             weights[term] = math.log(1 + total / (documents or 0.5))
         return weights, unknown
 
-    def forget(self, record_id: str, *, reason: str | None = None) -> str:
+    def forget(self, record_id: str, *, reason: str | None = None, by_user: bool = False) -> str:
+        """Retire a memory. Only the user's own request (``by_user``, such as the app's) retires the user's
+        own statement; anyone else's opens a question for the user, with the reason given."""
+
         identifier = (record_id or "").strip().strip("[]")
         if not identifier:
             raise MemoryInputError("forget needs the id of a memory, such as k-1a2b3c4d5e.")
         note = _clean_text(reason or "")[:200] or None
+        stated = self.store.get(identifier)
+        if not by_user and stated is not None and stated.status == "active" and stated.verification == "user_stated":
+            return self._ask_before_forgetting(stated, note)
         if self.store.retire(identifier, reason=note, now=self._clock()):
             record = self.store.get(identifier)
             assert record is not None
@@ -362,6 +420,20 @@ class Memory:
         if record is None:
             raise MemoryInputError(f"There is no memory [{identifier}].")
         raise MemoryInputError(f"[{identifier}] is already {record.status}.")
+
+    def _ask_before_forgetting(self, stated: RecordRow, reason: str | None) -> str:
+        from . import review
+
+        question_id = review.ask_to_forget(self, stated, reason=reason)
+        self.record_event(
+            "forget", stated.text, outcome="asked the user", project_id=stated.project_id, record_ids=[stated.id],
+            details={"reason": reason, "question": question_id} if reason else {"question": question_id},
+        )
+        return (
+            f"[{stated.id}] is the user's own statement, so it was not forgotten: KnowItAll2 asks the user whether "
+            f"it is still true (question [{question_id}]). If the user just asked for this, record their choice: "
+            f"answer {question_id} forget"
+        )
 
     def restore(self, record_id: str) -> str:
         """Bring back a retired or superseded memory, on the user's word.
@@ -432,15 +504,17 @@ class Memory:
         if record.project_id == project.id:
             return f"[{record.id}] is already filed under project {project.name}."
         content_hash = _content_hash(record.text, "project", project.id)
-        duplicate = self.store.find_active_duplicate(content_hash)
-        if duplicate is not None:
-            raise MemoryInputError(
-                f"Project {project.name} already has this memory as [{duplicate.id}]; forget [{record.id}] instead.")
         now = self._clock()
         before = record.project_name or record.project_id
+        # The check and the move are one transaction, so two moves at once leave one copy.
         with self.store.transaction():
+            duplicate = self.store.find_active_duplicate(content_hash)
+            if duplicate is not None:
+                raise MemoryInputError(f"Project {project.name} already has this memory as [{duplicate.id}]; "
+                                       f"forget [{record.id}] instead.")
             self.store.ensure_project(project, now)
-            self.store.move_record(record.id, project_id=project.id, content_hash=content_hash, now=now)
+            if not self.store.move_record(record.id, project_id=project.id, content_hash=content_hash, now=now):
+                raise MemoryInputError(f"[{record.id}] is no longer active; it was not moved.")
             note = self.store.notes_for([record.id]).get(record.id)
             if system_id is not None and note is not None and note["system_id"] != system_id:
                 self.store.set_note(record.id, headline=note["headline"], system_id=system_id, facet=note["facet"],
@@ -954,11 +1028,9 @@ def _without_instructed(
         return rules, []
     kept, instructed = [], []
     for row in rules:
-        words = significant_words(row.text)
         found = None
-        if len(words) >= _INSTRUCTED_MINIMUM_WORDS:
-            found = next((name for name, section in sections if len(words & section) / len(words) >= INSTRUCTED_SHARE),
-                         None)
+        if len(significant_words(row.text)) >= _INSTRUCTED_MINIMUM_WORDS:
+            found = next((name for name, section in sections if quoted_in(row.text, [section])), None)
         if found:
             instructed.append((row, found))
         else:
@@ -966,8 +1038,8 @@ def _without_instructed(
     return kept, instructed
 
 
-def _instruction_sections(project: ProjectIdentity | None) -> list[tuple[str, set[str]]]:
-    """The words of each section of the project's AGENTS.md and CLAUDE.md, by file name."""
+def _instruction_sections(project: ProjectIdentity | None) -> list[tuple[str, str]]:
+    """Each section of the project's AGENTS.md and CLAUDE.md, by file name."""
 
     if project is None or not str(project.root) or str(project.root) == ".":
         return []
@@ -982,7 +1054,7 @@ def _instruction_sections(project: ProjectIdentity | None) -> list[tuple[str, se
             continue
         for part in re.split(r"(?m)^(?=#)", text):
             if part.strip():
-                sections.append((name, significant_words(part)))
+                sections.append((name, part))
     return sections
 
 

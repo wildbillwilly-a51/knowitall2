@@ -79,6 +79,12 @@ class ImportTests(unittest.TestCase):
         self.assertEqual({"already known": 2}, dict(report.outcomes))
         self.assertEqual(2, self.store.stats()["active"])
 
+    def test_a_file_saved_with_a_byte_order_mark_imports_its_first_line(self) -> None:
+        path = self.write({"text": "The NAS is nas01."}, {"text": "The router is rtr01."})
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+        report = import_file(self.memory, path, dry_run=False)
+        self.assertEqual({"imported": 2}, dict(report.outcomes))
+
     def test_conflicts_become_questions(self) -> None:
         path = self.write(
             {"text": "Backups run at 02:00.", "origin": "a", "conflicts_with": ["b"], "created_at": "2026-08-01T00:00:00Z"},

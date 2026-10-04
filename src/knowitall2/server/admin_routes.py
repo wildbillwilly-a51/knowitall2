@@ -8,7 +8,8 @@ this page's own address. Agents' keys are never accepted here, and the
 admin's session is never accepted on the agents' routes.
 
 - ``GET state``: whether setup is needed, and who is signed in.
-- ``POST setup``, ``sign-in``, ``sign-out``, ``recover``.
+- ``POST setup`` (with the setup code the server printed in its log),
+  ``sign-in``, ``sign-out``, ``recover``.
 - ``GET overview``: agents, codes waiting to be used, and the server's health.
 - ``POST agents/add``, ``agents/remove``, ``codes/cancel``.
 - ``POST password``, ``recovery-code``.
@@ -20,10 +21,11 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
 from .. import __version__
@@ -95,11 +97,22 @@ def _run(handler: Any, work: Callable[[Store], tuple[Any, dict[str, str] | None]
     handler._send_json(HTTPStatus.OK, payload, extra)
 
 
-def _guarded(handler: Any) -> str:
-    address = handler.address()
-    if not handler.server.signin_guard.allowed(address):
+@contextmanager
+def _guarded(handler: Any) -> Iterator[None]:
+    """One sign-in or recovery try, holding a place for the caller's address while it runs (``web.Throttle``);
+    a username and password or code that do not match stays counted."""
+
+    address, guard = handler.address(), handler.server.signin_guard
+    if not guard.begin(address):
         raise _error(HTTPStatus.TOO_MANY_REQUESTS, "too many tries that did not work; wait ten minutes")
-    return address
+    failed = False
+    try:
+        yield
+    except admin.AdminError as exc:
+        failed = "do not match" in str(exc)
+        raise
+    finally:
+        guard.end(address, failed=failed)
 
 
 # --- Signing in ---
@@ -122,7 +135,12 @@ def _setup(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> N
 
     def work(store: Store) -> tuple[Any, dict[str, str]]:
         now = handler.server.clock()
+        if admin.admin(store) is None and not admin.setup_code_matches(handler.server.setup_code,
+                                                                       body.get("setup_code")):
+            raise _error(HTTPStatus.FORBIDDEN, "that is not the setup code; the server prints it in its log when "
+                                               "it starts without an admin (docker compose logs)")
         code = admin.create(store, body.get("username"), body.get("new_password"), now=now)
+        handler.server.setup_code = None  # used: it works once
         started = admin.start_session(store, now=now)
         return {"recovery_code": code, "form": started["form"]}, _cookie(handler, started["token"])
 
@@ -131,17 +149,13 @@ def _setup(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> N
 
 def _sign_in(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> None:
     _check_origin(handler)
-    address = _guarded(handler)
 
     def work(store: Store) -> tuple[Any, dict[str, str]]:
-        try:
-            started = admin.sign_in(store, body.get("username"), body.get("password"), now=handler.server.clock())
-        except admin.AdminError:
-            handler.server.signin_guard.failed(address)
-            raise
+        started = admin.sign_in(store, body.get("username"), body.get("password"), now=handler.server.clock())
         return {"form": started["form"]}, _cookie(handler, started["token"])
 
-    _run(handler, work)
+    with _guarded(handler):
+        _run(handler, work)
 
 
 def _sign_out(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> None:
@@ -156,19 +170,14 @@ def _sign_out(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -
 
 def _recover(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> None:
     _check_origin(handler)
-    address = _guarded(handler)
 
     def work(store: Store) -> tuple[Any, dict[str, str]]:
-        try:
-            code, started = admin.recover(store, body.get("username"), body.get("recovery_code"),
-                                          body.get("new_password"), now=handler.server.clock())
-        except admin.AdminError as exc:
-            if "do not match" in str(exc):
-                handler.server.signin_guard.failed(address)
-            raise
+        code, started = admin.recover(store, body.get("username"), body.get("recovery_code"),
+                                      body.get("new_password"), now=handler.server.clock())
         return {"recovery_code": code, "form": started["form"]}, _cookie(handler, started["token"])
 
-    _run(handler, work)
+    with _guarded(handler):
+        _run(handler, work)
 
 
 # --- Running the server ---

@@ -61,6 +61,14 @@ in your home folder, and sets it up for the agents you choose. Afterwards:
   output. Passwords, tokens, and keys are redacted before sending.
   - `knowitall2 learn --dry-run` lists what would be sent.
   - `knowitall2 learn --show <session>` prints it exactly.
+- **"Ask an agent to find these out"** in the app is its own consent: it
+  runs only when you press it, and also while learning is off. It starts one
+  agent on the same engine and account in the system's project folder, and
+  that agent reads the files itself, so nothing it reads is redacted first.
+  It changes nothing and is asked to stay in that folder, but Codex's
+  read-only sandbox lets it read files anywhere on the computer, and Claude
+  Code's file-reading tools may not be limited to the folder either. What it
+  finds is kept as unverified.
 - Learning from your work (after a commit, at a session's end, or when you ask)
   happens right away, with no daily limit. Background learning (sessions
   that went quiet, catching up) uses at most 10 calls per run and 60 per day
@@ -101,27 +109,33 @@ in your home folder, and sets it up for the agents you choose. Afterwards:
    your own computer. In a terminal, `knowitall2 stats` and
    `knowitall2 activity` show the same information.
 
-The `knowitall2` commands need the same `PYTHONPATH` as in the install guide,
-for example:
+There is no `knowitall2` program on your PATH: run each `knowitall2` command
+as one line that sets `PYTHONPATH` and starts Python, as in the install
+guide, for example:
 
 ```bash
-export PYTHONPATH=~/.knowitall2/app/src
-python3 -m knowitall2 stats
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 stats
 ```
 
-On Windows:
+On Windows (PowerShell):
 
 ```powershell
-$env:PYTHONPATH = "$env:USERPROFILE\.knowitall2\app\src"
-python -m knowitall2 stats
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 stats
 ```
+
+`doctor` checks the installation and each agent you set up (add
+`--agent codex` or `--agent claude-code` for one only). Each problem line
+starts with `FAIL` and is followed by a `fix:` line with the command to run.
+Until you trust the Codex hooks with `/hooks`, its Codex hook line is `OK`
+and reminds you to trust them.
 
 ## Reporting problems
 
 Open an issue in the repository you installed from. Include:
 
 - what you did, what you expected, and what happened;
-- the output of `knowitall2 doctor`, and of `knowitall2 activity --problems`;
+- the output of `knowitall2 doctor`, and of `knowitall2 activity --problems`
+  (run as shown above);
 - your operating system, and your Claude Code or Codex version.
 
 Do not paste secrets, or session content you do not want to share.
@@ -142,6 +156,19 @@ Linux, or `python "$env:USERPROFILE\.knowitall2\update.py"` in PowerShell.
 
 ## Uninstalling
 
-Run `knowitall2 uninstall claude-code` and `knowitall2 uninstall codex`.
+Run, on Linux:
+
+```bash
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 uninstall claude-code
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 uninstall codex
+```
+
+On Windows (PowerShell):
+
+```powershell
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 uninstall claude-code
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 uninstall codex
+```
+
 Your memories are kept in `.knowitall2`; delete that folder to remove
 everything.

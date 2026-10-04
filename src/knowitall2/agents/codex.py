@@ -10,7 +10,9 @@
 - The SessionStart, Stop, and UserPromptSubmit hooks are entries in ``hooks.json`` that run a
   small launcher in the KnowItAll2 data home. Codex hands hook commands to the
   session shell (PowerShell or cmd on Windows), so the Windows command avoids
-  quoting: it uses the short form of folders whose names contain spaces.
+  quoting: it uses the short form of folders whose names contain spaces. When
+  a path has a character that one of those shells would misread (such as
+  ``'`` or ``&``), no command works in both, and the hooks are left out.
   Codex runs a hook only after the user has trusted it once with ``/hooks``.
 """
 
@@ -20,6 +22,7 @@ import json
 import os
 import re
 import shlex
+import string
 import sys
 import tomllib
 from pathlib import Path, PurePath, PureWindowsPath
@@ -35,6 +38,7 @@ from .base import (
     Check,
     JsonFile,
     ServerLaunch,
+    cli_command,
     ensure_skill_installable,
     install_skill,
     json_object,
@@ -42,6 +46,7 @@ from .base import (
     remove_skill,
     render_hook_launcher,
     skill_check,
+    write_hook_launcher,
     write_text_atomic,
 )
 
@@ -76,6 +81,7 @@ class CodexAdapter(AgentAdapter):
         self.skills_dir = self.home / "skills"
         self.hooks_path = self.home / "hooks.json"
         self._hooks = JsonFile(self.hooks_path)
+        self._hooks_skipped: str | None = None
 
     def installed(self) -> bool:
         return self.home.is_dir()
@@ -86,52 +92,28 @@ class CodexAdapter(AgentAdapter):
         return override if override.is_file() else self.home / "AGENTS.md"
 
     def restart_hint(self) -> str:
-        return (
-            "Start Codex, open /hooks and trust the KnowItAll2 SessionStart, Stop, and UserPromptSubmit hooks once, "
-            "then run `knowitall2 doctor` to confirm the registration."
-        )
+        doctor = f"then run `{cli_command('doctor')}` to confirm the registration."
+        if self._hooks_skipped:
+            return f"Start a new Codex session to load KnowItAll2, {doctor}"
+        return ("Start Codex, open /hooks and trust the KnowItAll2 SessionStart, Stop, and UserPromptSubmit hooks once, "
+                + doctor)
 
-    def setup(self, launch: ServerLaunch) -> list[str]:
+    def preflight(self) -> None:
         if not self.installed():
             raise AgentError(f"Codex does not appear to be installed: {self.home} does not exist.")
         ensure_skill_installable(self.skills_dir)
-        self._hooks.load()  # fail before any change if hooks.json is unreadable
+        hooks = self._hooks.load()[1]
+        for event in HOOK_EVENTS:
+            _event_groups(hooks, event, self.hooks_path)
         text = self._read_config()
-        _parse(text, self.config_path)
-        span = _block_span(text, self.config_path)
-        newline = "\r\n" if "\r\n" in text else "\n"
-        block = render_block(launch, newline)
-        if span is None:
-            if SERVER_NAME in (_parse(text, self.config_path).get("mcp_servers") or {}):
-                raise AgentError(
-                    f"{self.config_path} already defines mcp_servers.{SERVER_NAME} outside KnowItAll2's managed "
-                    "block. Remove that entry, then run setup again."
-                )
-            if not text or text.endswith(newline * 2):
-                separator = ""
-            elif text.endswith(newline):
-                separator = newline
-            else:
-                separator = newline * 2
-            updated = text + separator + block + newline
-        else:
-            # Codex appends new tables (such as a hook's trust record) at the end of
-            # the file, which can be inside this block; keep them, after the block.
-            foreign = _foreign_lines(text[span[0]:span[1]], newline)
-            kept = newline * 2 + newline.join(foreign) if foreign else ""
-            updated = text[: span[0]] + block + kept + text[span[1]:]
-        changes: list[str] = []
-        if updated != text:
-            parsed = _parse(updated, self.config_path, after_edit=True)
-            if not launch_matches((parsed.get("mcp_servers") or {}).get(SERVER_NAME), launch):
-                raise AgentError("The rendered Codex entry did not read back as expected; nothing was changed.")
-            if _without_ours(parsed) != _without_ours(_parse(text, self.config_path)):
-                raise AgentError("Editing the Codex settings would change more than KnowItAll2's entry; nothing was changed.")
-            write_text_atomic(self.config_path, updated)
-            changes.append(f"registered the knowitall2 MCP server in {self.config_path}")
-        hook_change = self._install_hook(launch)
-        if hook_change:
-            changes.append(hook_change)
+        parsed = _parse(text, self.config_path)
+        if _block_span(text, self.config_path) is None:
+            _foreign_server_check(parsed, self.config_path)
+        instructions.ensure_editable(self.instructions_path)
+
+    def setup(self, launch: ServerLaunch) -> list[str]:
+        self.preflight()
+        changes = [change for change in (self._register_server(launch), self._install_hook(launch)) if change]
         skill_change = install_skill(self.skills_dir)
         if skill_change:
             changes.append(skill_change)
@@ -141,42 +123,88 @@ class CodexAdapter(AgentAdapter):
         return changes
 
     def uninstall(self) -> list[str]:
-        changes: list[str] = []
-        if self.config_path.is_file():
-            text = self._read_config()
-            span = _block_span(text, self.config_path)
-            if span is not None:
-                start, end = span
-                newline = "\r\n" if "\r\n" in text else "\n"
-                foreign = _foreign_lines(text[start:end], newline)
-                if foreign:
-                    updated = text[:start] + newline.join(foreign) + text[end:]
-                else:
-                    if text[end:].startswith(newline):
-                        end += len(newline)
-                    if text[:start].endswith(newline * 2):
-                        start -= len(newline)
-                    updated = text[:start] + text[end:]
-                parsed = _parse(updated, self.config_path, after_edit=True)
-                if _without_ours(parsed) != _without_ours(_parse(text, self.config_path)):
-                    raise AgentError("Removing KnowItAll2 would change other Codex settings; nothing was changed.")
-                if updated.strip():
-                    write_text_atomic(self.config_path, updated)
-                else:
-                    # Only KnowItAll2's block was in the file; Codex treats a
-                    # missing config the same as an empty one.
-                    self.config_path.unlink()
-                changes.append(f"removed the knowitall2 MCP server from {self.config_path}")
-        hook_change = self._remove_hook()
-        if hook_change:
-            changes.append(hook_change)
+        # Codex reads only AGENTS.override.md when there is one, but the block may also be
+        # in AGENTS.md from before that file appeared: remove it from both.
+        instruction_files = [self.home / "AGENTS.override.md", self.home / "AGENTS.md"]
+        for path in instruction_files:
+            instructions.ensure_editable(path)
+        changes = [change for change in (self._unregister_server(), self._remove_hook()) if change]
         skill_change = remove_skill(self.skills_dir)
         if skill_change:
             changes.append(skill_change)
-        instructions_change = instructions.remove(self.instructions_path)
-        if instructions_change:
-            changes.append(instructions_change)
+        for path in instruction_files:
+            instructions_change = instructions.remove(path)
+            if instructions_change:
+                changes.append(instructions_change)
         return changes
+
+    def _register_server(self, launch: ServerLaunch) -> str | None:
+        for _ in range(_WRITE_ATTEMPTS):
+            text = self._read_config()
+            original = _parse(text, self.config_path)
+            span = _block_span(text, self.config_path)
+            newline = "\r\n" if "\r\n" in text else "\n"
+            block = render_block(launch, newline)
+            if span is None:
+                _foreign_server_check(original, self.config_path)
+                if not text or text.endswith(newline * 2):
+                    separator = ""
+                elif text.endswith(newline):
+                    separator = newline
+                else:
+                    separator = newline * 2
+                updated = text + separator + block + newline
+            else:
+                # Codex appends new tables (such as a hook's trust record) at the end of
+                # the file, which can be inside this block; keep them, after the block.
+                foreign = _foreign_lines(text[span[0]:span[1]], newline)
+                kept = newline * 2 + newline.join(foreign) if foreign else ""
+                updated = text[: span[0]] + block + kept + text[span[1]:]
+            if updated == text:
+                return None
+            parsed = _parse(updated, self.config_path, after_edit=True)
+            if not launch_matches((parsed.get("mcp_servers") or {}).get(SERVER_NAME), launch):
+                raise AgentError("The rendered Codex entry did not read back as expected; nothing was changed.")
+            if _without_ours(parsed) != _without_ours(original):
+                raise AgentError("Editing the Codex settings would change more than KnowItAll2's entry; nothing was changed.")
+            # Codex may have saved its settings meanwhile; then start again from what it wrote.
+            if self._read_config() == text:
+                write_text_atomic(self.config_path, updated)
+                return f"registered the knowitall2 MCP server in {self.config_path}"
+        raise AgentError(f"{self.config_path} kept changing while setup ran; close Codex and run setup again.")
+
+    def _unregister_server(self) -> str | None:
+        for _ in range(_WRITE_ATTEMPTS):
+            if not self.config_path.is_file():
+                return None
+            text = self._read_config()
+            span = _block_span(text, self.config_path)
+            if span is None:
+                return None
+            start, end = span
+            newline = "\r\n" if "\r\n" in text else "\n"
+            foreign = _foreign_lines(text[start:end], newline)
+            if foreign:
+                updated = text[:start] + newline.join(foreign) + text[end:]
+            else:
+                if text[end:].startswith(newline):
+                    end += len(newline)
+                if text[:start].endswith(newline * 2):
+                    start -= len(newline)
+                updated = text[:start] + text[end:]
+            parsed = _parse(updated, self.config_path, after_edit=True)
+            if _without_ours(parsed) != _without_ours(_parse(text, self.config_path)):
+                raise AgentError("Removing KnowItAll2 would change other Codex settings; nothing was changed.")
+            if self._read_config() != text:
+                continue
+            if updated.strip():
+                write_text_atomic(self.config_path, updated)
+            else:
+                # Only KnowItAll2's block was in the file; Codex treats a
+                # missing config the same as an empty one.
+                self.config_path.unlink()
+            return f"removed the knowitall2 MCP server from {self.config_path}"
+        raise AgentError(f"{self.config_path} kept changing; close Codex and run uninstall again.")
 
     def checks(self, launch: ServerLaunch) -> list[Check]:
         if not self.installed():
@@ -186,34 +214,44 @@ class CodexAdapter(AgentAdapter):
             parsed = _parse(text, self.config_path)
             span = _block_span(text, self.config_path)
         except AgentError as exc:
-            return [Check("Codex config", False, str(exc), f"Fix {self.config_path}, then run: knowitall2 setup codex")]
+            return [Check("Codex config", False, str(exc), f"Fix {self.config_path}, then run: {self.setup_command()}")]
         entry = (parsed.get("mcp_servers") or {}).get(SERVER_NAME)
         if span is None or entry is None:
-            registration = Check("Codex registration", False, "KnowItAll2 is not registered", "Run: knowitall2 setup codex")
+            registration = Check("Codex registration", False, "KnowItAll2 is not registered", f"Run: {self.setup_command()}")
         elif not launch_matches(entry, launch):
             registration = Check(
                 "Codex registration", False,
                 "registered with a different Python or options than this installation",
-                "Run: knowitall2 setup codex",
+                f"Run: {self.setup_command()}",
             )
         elif not Path(str(entry.get("command"))).is_file():
             registration = Check(
                 "Codex registration", False, f"the registered Python is missing: {entry.get('command')}",
-                "Run: knowitall2 setup codex",
+                f"Run: {self.setup_command()}",
             )
         else:
             registration = Check("Codex registration", True, f"registered in {self.config_path}")
         return [registration, self._hook_check(launch), skill_check(self, self.skills_dir),
-                instructions.check(self.display_name, self.instructions_path, "Run: knowitall2 setup codex")]
+                instructions.check(self.display_name, self.instructions_path, f"Run: {self.setup_command()}")]
 
     # Hooks ----------------------------------------------------------------
 
-    def _install_hook(self, launch: ServerLaunch) -> str | None:
+    def refresh_hook_launcher(self, launch: ServerLaunch) -> str | None:
         launcher = hook_launcher_path()
-        launcher_text = render_hook_launcher(launch, "codex")
-        launcher_changed = not launcher.is_file() or launcher.read_text(encoding="utf-8") != launcher_text
-        if launcher_changed:
-            write_text_atomic(launcher, launcher_text)
+        if write_hook_launcher(launcher, launch, "codex", create=False):
+            return f"refreshed the KnowItAll2 session hook launcher at {launcher}"
+        return None
+
+    def _install_hook(self, launch: ServerLaunch) -> str | None:
+        self._hooks_skipped = hooks_unavailable(launch)
+        if self._hooks_skipped:
+            # A hook command that one of Codex's shells would misread could run something else.
+            removed = self._remove_hook()
+            skipped = (f"did not add the KnowItAll2 session hooks: {self._hooks_skipped}. Codex still reaches "
+                       "KnowItAll2 through its tools, but without the automatic briefing or learning after a commit")
+            return f"{removed}; {skipped}" if removed else skipped
+        launcher = hook_launcher_path()
+        launcher_changed = write_hook_launcher(launcher, launch, "codex")
         for _ in range(_WRITE_ATTEMPTS):
             text, data = self._hooks.load()
             if all(_find_hooks(_event_groups(data, event, self.hooks_path)) == [hook_entry(launch, event)]
@@ -222,9 +260,8 @@ class CodexAdapter(AgentAdapter):
             json_object(data, "hooks", self.hooks_path)
             for event in HOOK_EVENTS:
                 groups = _event_groups(data, event, self.hooks_path)
-                _drop_our_hooks(groups)
-                group: dict[str, Any] = {"matcher": HOOK_MATCHER} if event == "SessionStart" else {}
-                groups.append({**group, "hooks": [hook_entry(launch, event)]})
+                fields = {"matcher": HOOK_MATCHER} if event == "SessionStart" else {}
+                _put_our_hook(groups, hook_entry(launch, event), fields)
                 data.setdefault("hooks", {})[event] = groups
             if self._hooks.write_if_unchanged(text, data):
                 persisted = self._hooks.load()[1]
@@ -266,15 +303,22 @@ class CodexAdapter(AgentAdapter):
             found = {event: _find_hooks(_event_groups(data, event, self.hooks_path)) for event in HOOK_EVENTS}
         except AgentError as exc:
             return Check(name, False, str(exc), "Fix or restore that file, then run setup again.")
+        skipped = hooks_unavailable(launch)
+        if skipped and any(found.values()):
+            return Check(name, False, f"the hooks registered cannot run as intended: {skipped}",
+                         f"Run: {self.setup_command()}")
+        if skipped:
+            return Check(name, True, f"not added: {skipped}. Codex reaches KnowItAll2 through its tools, without the "
+                                     "automatic briefing or learning after a commit")
         launcher = hook_launcher_path()
         for event in HOOK_EVENTS:
             if found[event] != [hook_entry(launch, event)]:
                 what = _EVENT_WORDS[event]
                 detail = f"the {what} hook is not installed" if not found[event] else (
                     f"the {what} hook is installed with different options than this installation")
-                return Check(name, False, detail, "Run: knowitall2 setup codex")
+                return Check(name, False, detail, f"Run: {self.setup_command()}")
         if not launcher.is_file() or launcher.read_text(encoding="utf-8") != render_hook_launcher(launch, "codex"):
-            return Check(name, False, f"the hook launcher is missing or outdated: {launcher}", "Run: knowitall2 setup codex")
+            return Check(name, False, f"the hook launcher is missing or outdated: {launcher}", f"Run: {self.setup_command()}")
         untrusted = [_EVENT_WORDS[event] for event in HOOK_EVENTS if not self._hook_trusted(event)]
         if not untrusted:
             return Check(name, True, f"installed in {self.hooks_path} and trusted in Codex")
@@ -326,7 +370,10 @@ def hook_entry(launch: ServerLaunch, event: str = "SessionStart") -> dict[str, A
     extra = _EVENT_ARGUMENTS[event]
     entry: dict[str, Any] = {"type": "command", "command": shlex.join([launch.command, "-B", str(launcher), *extra])}
     if sys.platform == "win32":
-        entry["commandWindows"] = " ".join([windows_command(launch.command, str(launcher)), *extra])
+        command = windows_command(launch.command, str(launcher))
+        if command is None:
+            raise AgentError(f"No Windows command runs the KnowItAll2 hook: {hooks_unavailable(launch)}.")
+        entry["commandWindows"] = " ".join([command, *extra])
     if event == "SessionStart":
         entry.update({"timeout": HOOK_TIMEOUT_SECONDS, "statusMessage": HOOK_STATUS})
     else:
@@ -335,19 +382,45 @@ def hook_entry(launch: ServerLaunch, event: str = "SessionStart") -> dict[str, A
     return entry
 
 
-def windows_command(python: str, launcher: str | PurePath, *, shorten=None) -> str:
-    """A command PowerShell and cmd both run as intended.
+def windows_command(python: str, launcher: str | PurePath, *, shorten=None) -> str | None:
+    """A command PowerShell and cmd both run as intended, or None when there is none.
 
     Paths are written without quotes, using the short (8.3) form of any folder
     whose name has a space; file names keep their long form. Without short
     names, PowerShell's call operator is used, since Codex prefers PowerShell.
+    Any other character must be plain to both shells: short names keep
+    characters such as ' & $ % ( ), which PowerShell or cmd reads as part of
+    the command, and no quoting works in both.
     """
 
     shorten = shorten or _short_path
+    if not all(_plain(str(path).replace(" ", "")) for path in (python, launcher)):
+        return None
     parts = [_without_spaces(PureWindowsPath(python), shorten), _without_spaces(PureWindowsPath(launcher), shorten)]
     if all(part is not None for part in parts):
-        return f"{parts[0]} -B {parts[1]}"
+        return f"{parts[0]} -B {parts[1]}" if all(_plain(part) for part in parts) else None
     return f"& {_powershell_quote(python)} -B {_powershell_quote(str(launcher))}"
+
+
+def hooks_unavailable(launch: ServerLaunch) -> str | None:
+    """Why the session hooks cannot be registered on this computer, or None when they can."""
+
+    if sys.platform != "win32":
+        return None
+    launcher = str(hook_launcher_path())
+    if windows_command(launch.command, launcher) is not None:
+        return None
+    misread = [path for path in (launch.command, launcher) if not _plain(path.replace(" ", ""))] or [launch.command]
+    return (f"{' and '.join(misread)} {'contains' if len(misread) == 1 else 'contain'} a character (such as ', &, $ "
+            "or %) that PowerShell or cmd would read as part of the command, and no hook command works in both")
+
+
+# What PowerShell and cmd both read as part of a plain word, besides letters and digits outside ASCII.
+_PLAIN = frozenset(string.ascii_letters + string.digits + "._~:\\-")
+
+
+def _plain(text: str) -> bool:
+    return all(character in _PLAIN or (not character.isascii() and character.isalnum()) for character in text)
 
 
 def _without_spaces(path: PureWindowsPath, shorten) -> str | None:
@@ -384,6 +457,37 @@ def _find_hooks(groups: list[Any]) -> list[dict[str, Any]]:
         for group in groups if isinstance(group, dict) and isinstance(group.get("hooks"), list)
         for hook in group["hooks"] if _is_our_hook(hook)
     ]
+
+
+def _put_our_hook(groups: list[Any], hook: dict[str, Any], fields: dict[str, Any]) -> None:
+    """Put KnowItAll2's hook where it already is, or in a new group at the end when there is none.
+
+    Codex keys its trust in each hook by its group's and its own position, so
+    replacing the hook in place keeps the user's hook groups after it where
+    they were, and trusted. A second copy of KnowItAll2's hook is removed.
+    """
+
+    placed = False
+    index = 0
+    while index < len(groups):
+        group = groups[index]
+        hooks = group.get("hooks") if isinstance(group, dict) else None
+        if isinstance(hooks, list) and any(_is_our_hook(item) for item in hooks):
+            if placed:
+                group["hooks"] = [item for item in hooks if not _is_our_hook(item)]
+            elif all(_is_our_hook(item) for item in hooks):
+                group = groups[index] = {**group, **fields, "hooks": [hook]}
+            else:
+                position = next(number for number, item in enumerate(hooks) if _is_our_hook(item))
+                group["hooks"] = [item for item in hooks if not _is_our_hook(item)]
+                group["hooks"].insert(position, hook)
+            placed = True
+            if not group["hooks"]:
+                del groups[index]
+                continue
+        index += 1
+    if not placed:
+        groups.append({**fields, "hooks": [hook]})
 
 
 def _drop_our_hooks(groups: list[Any]) -> None:
@@ -429,6 +533,16 @@ def _foreign_lines(block_text: str, newline: str) -> list[str]:
     while foreign and not foreign[-1].strip():
         foreign.pop()
     return foreign
+
+
+def _foreign_server_check(parsed: dict, path: Path) -> None:
+    """Refuse a knowitall2 server entry outside KnowItAll2's managed block."""
+
+    if SERVER_NAME in (parsed.get("mcp_servers") or {}):
+        raise AgentError(
+            f"{path} already defines mcp_servers.{SERVER_NAME} outside KnowItAll2's managed "
+            "block. Remove that entry, then run setup again."
+        )
 
 
 def _without_ours(parsed: dict) -> dict:

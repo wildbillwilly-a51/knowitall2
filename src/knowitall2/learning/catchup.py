@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .dossier import build_dossiers
-from .state import LearnerState, RunLock
+from .state import LearnerState, learner_lock
 from .transcripts import read_session, session_folder, session_logs
 
 SKIPPED = "baseline"
@@ -43,7 +43,7 @@ def repair_once(store) -> int:
     marker = data_home() / "learner" / REPAIRED_MARKER
     if marker.exists():
         return 0
-    with RunLock():
+    with learner_lock():
         state = LearnerState()
         repaired = repair(store, state)
         state.save()
@@ -104,7 +104,7 @@ def catch_up(folder: str, *, since: str | None = None, max_calls: int | None = N
     """
 
     moment = datetime.now(timezone.utc).isoformat()
-    with RunLock():
+    with learner_lock():
         state = LearnerState()
         marked = calls = 0
         for log in _matching(folder, since=since, state=state):

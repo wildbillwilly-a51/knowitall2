@@ -5,10 +5,13 @@ detached process starts one agent call in the project folder the system is
 worked on in: it may read and search files there and do nothing else (Claude
 Code gets only its file-reading tools; Codex runs in its read-only sandbox),
 on the model learning uses. Each answer names the file it came from
-and quotes it, and is saved only if the quote really is in that file, so a
-guess cannot become a memory. What it cannot find is left to the agents that
-work with the system later, as before. The call counts toward the daily
-total but never waits for the limit: the user asked for it.
+and quotes it, and is saved only if the quote really is in that file and
+says what the answer says, so a guess cannot become a memory. A file may be
+out of date or wrong, so what is saved is unverified. What it cannot find is
+left to the agents that work with the system later, as before. The call
+counts toward the daily total but never waits for the limit: the user asked
+for it, and pressing the button is the consent, even with learning off. The
+agent reads the files itself, so nothing it reads is redacted first.
 """
 
 from __future__ import annotations
@@ -19,16 +22,17 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .. import catalog, journal, review
-from ..files import write_text_atomic
+from ..files import read_text, write_text_atomic
 from ..memory import Memory, MemoryInputError
 from ..paths import data_home
-from ..secrets import contains_secret
+from ..quotes import quoted_in
+from ..secrets import contains_secret, redact
 from ..store import Store
 from .extractor import ExtractionError
-from .learner import _quoted_in
+from .learner import _says_what_was_quoted
 
 FINDER_AGENT = "finder"
 STALE_MINUTES = 20
@@ -65,7 +69,7 @@ For each part you find, give:
 - part: the part's key as listed, such as p1;
 - text: one self-contained sentence that names the system and states the fact, for example "vCenter runs at vcsa01.lab.local on port 443.";
 - file: the path of the file that shows it, relative to the folder;
-- quote: an exact passage copied from that file (one line or a few) that shows it.
+- quote: an exact passage copied from that file (one line or a few) that shows everything the text says.
 
 Only report what a file states; never guess. Never report a password, token, key, or other secret: say where it is kept instead (a vault item, a credential store entry, or an environment variable name), and quote the line that names that place, not the secret. Put the keys of the parts you could not find in not_found. Be quick: a few searches per part."""
 
@@ -81,7 +85,7 @@ def status(system_id: str, *, now: datetime | None = None) -> dict[str, Any] | N
     """The latest search for this system, or None; a search that stopped without a word counts as failed."""
 
     try:
-        state = json.loads(status_path(system_id).read_text(encoding="utf-8"))
+        state = json.loads(read_text(status_path(system_id)))
     except (OSError, ValueError):
         return None
     if not isinstance(state, dict):
@@ -106,7 +110,7 @@ def start(system_id: str, *, launcher: Callable[..., object] = subprocess.Popen)
     log = open(log_folder / "last-find.log", "w", encoding="utf-8")
     try:
         launcher(
-            [sys.executable, "-B", "-m", "knowitall2", "find-out", system_id],
+            [sys.executable, "-B", "-P", "-m", "knowitall2", "find-out", system_id],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             cwd=str(data_home()), env=_learner_environment(), close_fds=True, **_detached_options(),
         )
@@ -168,19 +172,24 @@ def render(system: dict[str, Any], shown: dict[str, Any], items: list[dict[str, 
     return "\n".join(lines)
 
 
-def check(item: dict[str, Any], *, folder: Path,
-          parts: dict[str, dict[str, str]]) -> tuple[dict[str, Any] | None, str | None]:
-    """Deterministic checks of one answer: a real part, no secret, and a quote that is in the named file."""
+def check(item: dict[str, Any], *, folder: Path, parts: dict[str, dict[str, str]],
+          names: Sequence[str] = ()) -> tuple[dict[str, Any] | None, str | None]:
+    """Deterministic checks of one answer: a real part, no secret, and a quote that is in the named file.
+
+    The quote must also say what the answer says: most of the answer's
+    significant words, apart from the system's ``names``, are in it.
+    """
 
     key = str(item.get("part") or "").strip().casefold()
     text = " ".join(str(item.get("text") or "").split())
     quote = str(item.get("quote") or "")
+    # First, so that an answer holding a secret is never kept or shown, whatever else is wrong with it.
+    if contains_secret(" ".join([text, quote])):
+        return None, "secret"
     if key not in parts:
         return None, "not one of the missing parts"
     if not MIN_TEXT <= len(text) <= MAX_TEXT:
         return None, "length"
-    if contains_secret(" ".join([text, quote])):
-        return None, "secret"
     base = folder.resolve()
     path = Path(str(item.get("file") or ""))
     path = (path if path.is_absolute() else base / path).resolve()
@@ -192,8 +201,11 @@ def check(item: dict[str, Any], *, folder: Path,
         content = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None, "the file was not found"
-    if not _quoted_in(quote, [content]):
+    if not quoted_in(quote, [content]):
         return None, "the quote is not in that file"
+    if not _says_what_was_quoted(text, " ".join([quote, *names])):
+        # The answer is free text: without this, a harmless quote could carry anything the model wrote.
+        return None, "the quote does not say that"
     return {"key": key, "facet": parts[key]["facet"], "label": parts[key]["label"], "text": text,
             "file": path.relative_to(base).as_posix()}, None
 
@@ -256,11 +268,12 @@ def _run(store: Store, system_id: str, engine: Any) -> dict[str, Any]:
     for answer in payload.get("found") or []:
         if not isinstance(answer, dict):
             continue
-        checked, reason = check(answer, folder=folder, parts=parts)
+        checked, reason = check(answer, folder=folder, parts=parts, names=[system["name"], *system["aliases"]])
         if checked is None:
             part = parts.get(str(answer.get("part") or "").strip().casefold())
+            # Shown on the page and kept in the status file: redacted, in case it was turned down for another reason.
             turned_down.append({"label": part["label"] if part else "a missing part", "reason": reason,
-                                "text": "" if reason == "secret" else str(answer.get("text") or "")[:MAX_TEXT]})
+                                "text": "" if reason == "secret" else redact(str(answer.get("text") or ""))[:MAX_TEXT]})
             continue
         saved = _save(memory, system, checked)
         if saved is not None:
@@ -270,9 +283,14 @@ def _run(store: Store, system_id: str, engine: Any) -> dict[str, Any]:
     left = [item for item in items if item["key"] not in filled]
     filled_gaps = {item["label"] for item in items if item["key"] in filled and item["gap"]}
     if filled_gaps:
-        # A filled gap leaves the profile now, not only when its summary is next rewritten.
-        store.set_system_gaps(system_id, gaps=[gap for gap in system["gaps"] if " ".join(str(gap).split())
-                                               not in filled_gaps], now=memory.now())
+        # A filled gap leaves the profile now, not only when its summary is next rewritten. The gaps are read
+        # again first: the catalog may have described the system while the agent looked.
+        with store.transaction():
+            current = store.system(system_id)
+            if current is not None:
+                store.set_system_gaps(system_id, gaps=[gap for gap in current["gaps"]
+                                                       if " ".join(str(gap).split()) not in filled_gaps],
+                                      now=memory.now())
     asked = _leave_for_agents(memory, system, left, shown)
     journal.record(
         store, "task", f"An agent looked in {folder.name} for {len(items)} missing parts of {system['name']}: "
@@ -287,15 +305,17 @@ def _run(store: Store, system_id: str, engine: Any) -> dict[str, Any]:
 
 def _save(memory: Memory, system: dict[str, Any], checked: dict[str, Any]) -> str | None:
     try:
+        # A file says so, which may be out of date or wrong: unverified, as a lead for agents to check.
         result = memory.remember(
             checked["text"], kind=catalog.FACET_KINDS.get(checked["facet"], "fact"), subjects=[system["name"]],
-            scope="global", source="observed", detect_project=False,
+            scope="global", source="inferred", detect_project=False,
         )
     except MemoryInputError:
         return None
     now = memory.now()
     with memory.store.transaction():
-        memory.store.set_note(result.record.id, headline=_short(checked["text"]), system_id=system["id"],
+        # A memory already saved keeps the note it has, such as one the user wrote, even while the agent looked.
+        memory.store.add_note(result.record.id, headline=_short(checked["text"]), system_id=system["id"],
                               facet=checked["facet"], written_by=FINDER_AGENT, now=now)
         for task in memory.store.tasks(status="open", kind="find_out", system_id=system["id"]):
             if _asks_for(task, checked["label"]):

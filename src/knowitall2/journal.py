@@ -4,7 +4,8 @@ Events go into the memory database's journal. Problems go into a small file
 beside it, so a failure is recorded even when the database itself cannot be
 opened. Writing either never raises: a journal problem must never break the
 operation it describes. Every text is redacted and capped, like everything
-else KnowItAll2 keeps. Events are kept for ``EVENTS_KEPT_DAYS``.
+else KnowItAll2 keeps. Events are kept for ``EVENTS_KEPT_DAYS``, and ``tidy``
+drops older ones once a day.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .paths import data_home, database_path
-from .secrets import redact
 
 # What the journal records. Agents' use: briefing, recall. Changes by anyone:
 # remember, forget, restore, confirm (the user vouches for a memory), answer
@@ -32,6 +32,11 @@ EVENT_KINDS = (
     "settings", "learning", "candidate", "change", "maintenance", "catalog", "move", "sync",
 )
 EVENTS_KEPT_DAYS = 90
+# Each briefing's and recall's own row (usage) is kept this long; older ones live on as per-memory totals.
+USAGE_KEPT_DAYS = 365
+TIDIED_KEY = "journal.tidied_at"
+# How far this computer has sent its uses to a server (connected.USAGE_CURSOR_KEY), when it is connected.
+_USAGE_SENT_KEY = "sync.usage_cursor"
 SUMMARY_CHARACTERS = 300
 DETAIL_CHARACTERS = 600
 DETAIL_ITEMS = 50
@@ -96,9 +101,43 @@ def prune(store: Any, *, now: datetime | None = None) -> None:
 
     moment = now or datetime.now(timezone.utc)
     try:
-        store.prune_events(before=(moment - timedelta(days=EVENTS_KEPT_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        store.prune_events(before=_stamp(moment - timedelta(days=EVENTS_KEPT_DAYS)))
     except Exception:
         pass
+
+
+def tidy(store: Any, *, now: datetime | None = None) -> None:
+    """Daily housekeeping of a store: drop old events, and fold old uses into each memory's totals; never raises.
+
+    Every briefing and recall adds an event and a use, whether learning is on
+    or not, so this runs where those happen (the session-start hook, the
+    tools, the server's daily housekeeping), at most once a day; until then it
+    costs one lookup. Uses not yet sent to a server are kept until they are.
+    """
+
+    moment = now or datetime.now(timezone.utc)
+    try:
+        if not _tidy_due(store.get_meta(TIDIED_KEY), moment):
+            return
+        with store.transaction():
+            if not _tidy_due(store.get_meta(TIDIED_KEY), moment):
+                return  # another process just did it
+            store.prune_events(before=_stamp(moment - timedelta(days=EVENTS_KEPT_DAYS)))
+            sent = store.get_meta(_USAGE_SENT_KEY)
+            store.roll_up_usage(before=_stamp(moment - timedelta(days=USAGE_KEPT_DAYS)),
+                                sent_up_to=int(sent) if sent is not None else None)
+            store.set_meta(TIDIED_KEY, _stamp(moment))
+    except Exception as exc:
+        problem("journal", f"old events and uses could not be tidied up: {type(exc).__name__}: {exc}")
+
+
+def _tidy_due(last: str | None, moment: datetime) -> bool:
+    # A time ahead of now (a clock put back) does not put it off.
+    return not last or not _stamp(moment - timedelta(days=1)) < last <= _stamp(moment)
+
+
+def _stamp(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def problems_path() -> Path:
@@ -154,6 +193,9 @@ def read_problems(*, since: str | None = None, limit: int = 200) -> list[dict[st
 
 
 def clean_text(value: object, limit: int) -> str:
+    # Loaded when something is written: its patterns take a while, and most hooks write nothing.
+    from .secrets import redact
+
     text = redact(" ".join(str(value or "").split()))
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 

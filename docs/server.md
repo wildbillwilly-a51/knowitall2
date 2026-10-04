@@ -32,10 +32,18 @@ port, change the first number under `ports:` in `deploy/compose.yaml`.
 
 ## 2. Create the admin account
 
-Open `http://<that computer>:4191/` in a browser. The first visitor creates
-the server's admin account, with a username and a password of their choosing.
-Do this right after starting it, before you make the server reachable from
-anywhere but your own network.
+When it starts without an admin account, the server prints a one-time
+**setup code** in its log. Show the log with:
+
+```bash
+docker compose -f deploy/compose.yaml logs knowitall2
+```
+
+Open `http://<that computer>:4191/` in a browser, enter the setup code, and
+choose a username and a password for the server's admin account. Only
+someone who can read the server's log can do this, so nobody else on your
+network gets there first. The code works once; each start without an admin
+prints a new one.
 
 Right after, the page shows a **recovery code** once. Keep it somewhere
 safe, such as your password manager: with it, "Forgot your password?" sets a
@@ -63,19 +71,30 @@ The server's page lists the connected agents and when each last checked in.
 - **Through a reverse proxy** with HTTPS, point the proxy at port 4191 and
   set `KNOWITALL2_TRUSTED_PROXY` in `deploy/compose.yaml` to the proxy's
   address or network (for example `172.18.0.0/16` for a proxy in another
-  container). The server then sees each caller's real address and marks its
-  sign-in cookie secure. Agents use the API under `/api/`, with their own
-  keys; if your proxy adds its own sign-in page in front of the server, let
-  `/api/` through without it, or agents cannot connect. Once agents use the
+  container); name it as narrowly as you can, since the server believes the
+  caller's address that address reports. The server then sees each
+  caller's real address, for its limit on wrong passwords, and marks its
+  sign-in cookie secure. Without the setting, every caller behind the proxy
+  counts as one address, and the server notes that once in
+  `logs/problems.jsonl` in its data volume. Agents use the API under
+  `/api/`, with their own keys; if your proxy adds its own sign-in page in
+  front of the server, let `/api/` through without it, or agents cannot
+  connect. Once agents use the
   proxy's address, let only the proxy reach port 4191 (with your firewall),
-  since the direct address skips the proxy's sign-in page and HTTPS.
+  since the direct address skips the proxy's sign-in page and HTTPS. The
+  server closes a connection after 120 seconds without a request; a proxy
+  that keeps idle connections to it open must close them sooner (Traefik's
+  default is 90 seconds), or a request it sends just as the server closes
+  one can fail.
 - **On the internet**, use HTTPS only. KnowItAll2 notes it when an agent
   connects over plain `http://` to anything but a private address.
 
 ## Backups
 
-The server makes a backup once a day and keeps the last seven in the
-`backups` folder of its data volume. **Download a backup** on the server's
+The server makes a backup once a day, and another soon after a burst of
+changes, in the `backups` folder of its data volume. It keeps the newest
+backup of each of the last seven days and the three newest, so a burst never
+pushes out the daily ones. **Download a backup** on the server's
 page gives you a copy at any time. Copy the backups off the server as part
 of your own backup routine.
 
@@ -99,9 +118,11 @@ uses what both understand.
 
 In `deploy/compose.yaml`, set `KNOWITALL2_RESET_ADMIN` to any new value, such
 as today's date, and restart with the command above. Only the admin account
-is removed: memories and connected agents are kept. Open the page to create
-the admin again, then empty that line. Each value works once, so a value left
-in place does not reset the admin again on the next restart.
+is removed: memories and connected agents are kept. The server prints a new
+setup code in its log (`docker compose -f deploy/compose.yaml logs
+knowitall2`); open the page and create the admin again with it, then empty
+that line. Each value works once, so a value left in place does not reset
+the admin again on the next restart.
 
 ## Stopping or removing the server
 

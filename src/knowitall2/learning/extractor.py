@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .dossier import Dossier
+from .runner import engine_command, is_command_script, run_bounded, through_cmd
 
 MAX_CANDIDATES = 12
 
@@ -119,6 +120,7 @@ class Extractor(Protocol):
         ...
 
 
+# Runs an engine: run_bounded, or a test's stand-in taking the same arguments.
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
@@ -132,13 +134,14 @@ class ClaudeCliExtractor:
 
     ``--safe-mode`` disables Skills, hooks, MCP servers, CLAUDE.md, and plugins;
     ``--tools ""`` removes all tools; ``--no-session-persistence`` keeps the call
-    out of the logs the learner reads.
+    out of the logs the learner reads. The system prompt is an argument, except
+    for a command script that runs through cmd.exe (see ``prompt_arguments``).
     """
 
     name = "claude-cli"
 
     def __init__(
-        self, executable: Path, *, model: str = "sonnet", timeout: float = 300.0, runner: Runner = subprocess.run,
+        self, executable: Path, *, model: str = "sonnet", timeout: float = 300.0, runner: Runner = run_bounded,
         effort: str | None = None,
     ) -> None:
         self.executable = executable
@@ -150,11 +153,13 @@ class ClaudeCliExtractor:
         # Tokens and cost of the latest call, as the engine reported them.
         self.last_usage: dict[str, float] | None = None
 
-    def command(self, *, schema: dict[str, Any] = OUTPUT_SCHEMA, system_prompt: str = SYSTEM_PROMPT) -> list[str]:
+    def command(self, *, schema: dict[str, Any] = OUTPUT_SCHEMA, system_prompt: str = SYSTEM_PROMPT,
+                scratch: Path | None = None) -> list[str]:
+        start = engine_command(self.executable)
         return [
-            str(self.executable), "-p", "--safe-mode", "--tools", "", "--no-session-persistence",
+            *start, "-p", "--safe-mode", "--tools", "", "--no-session-persistence",
             "--output-format", "json", "--json-schema", json.dumps(schema, separators=(",", ":")),
-            "--model", self.model, "--system-prompt", system_prompt, *self._effort(),
+            "--model", self.model, *prompt_arguments(start, system_prompt, scratch), *self._effort(),
         ]
 
     def _effort(self) -> list[str]:
@@ -167,35 +172,36 @@ class ClaudeCliExtractor:
     def run(self, text: str, *, schema: dict[str, Any], system_prompt: str) -> dict[str, Any]:
         """One sealed call: ``text`` on stdin, a JSON object matching ``schema`` back."""
 
-        with tempfile.TemporaryDirectory(prefix="knowitall2-learn-") as workspace:
-            return self._call(self.command(schema=schema, system_prompt=system_prompt), text, cwd=workspace,
-                              timeout=self.timeout)
+        with tempfile.TemporaryDirectory(prefix="knowitall2-learn-", ignore_cleanup_errors=True) as folder:
+            workspace = Path(folder) / "workspace"
+            workspace.mkdir()
+            command = self.command(schema=schema, system_prompt=system_prompt, scratch=Path(folder))
+            return self._call(command, text, cwd=str(workspace), timeout=self.timeout)
 
-    def explore_command(self, *, schema: dict[str, Any], system_prompt: str) -> list[str]:
+    def explore_command(self, *, schema: dict[str, Any], system_prompt: str, scratch: Path | None = None) -> list[str]:
         """Like ``command``, with only the tools that read files, allowed without asking; nothing else can run."""
 
+        start = engine_command(self.executable)
         return [
-            str(self.executable), "-p", "--safe-mode", "--tools", EXPLORE_TOOLS, "--allowedTools", EXPLORE_TOOLS,
+            *start, "-p", "--safe-mode", "--tools", EXPLORE_TOOLS, "--allowedTools", EXPLORE_TOOLS,
             "--permission-mode", "dontAsk", "--no-session-persistence",
             "--output-format", "json", "--json-schema", json.dumps(schema, separators=(",", ":")),
-            "--model", self.model, "--system-prompt", system_prompt, *self._effort(),
+            "--model", self.model, *prompt_arguments(start, system_prompt, scratch), *self._effort(),
         ]
 
     def explore(self, text: str, *, folder: Path, schema: dict[str, Any], system_prompt: str,
                 timeout: float = EXPLORE_TIMEOUT) -> dict[str, Any]:
         """One call that may read and search the files in ``folder``, and change nothing."""
 
-        return self._call(self.explore_command(schema=schema, system_prompt=system_prompt), text, cwd=str(folder),
-                          timeout=timeout)
+        with tempfile.TemporaryDirectory(prefix="knowitall2-find-", ignore_cleanup_errors=True) as scratch:
+            command = self.explore_command(schema=schema, system_prompt=system_prompt, scratch=Path(scratch))
+            return self._call(command, text, cwd=str(folder), timeout=timeout)
 
     def _call(self, command: list[str], text: str, *, cwd: str, timeout: float) -> dict[str, Any]:
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         self.last_usage = None
         try:
-            completed = self._runner(
-                command, input=text.encode("utf-8"), capture_output=True, timeout=timeout, cwd=cwd,
-                creationflags=flags, env=engine_environment(),
-            )
+            completed = self._runner(command, input=text.encode("utf-8"), timeout=timeout, cwd=cwd,
+                                     env=engine_environment())
         except subprocess.TimeoutExpired as exc:
             raise ExtractionError(f"the Claude CLI timed out after {timeout:.0f} seconds") from exc
         except OSError as exc:
@@ -235,7 +241,7 @@ class CodexCliExtractor:
     name = "codex-cli"
 
     def __init__(
-        self, executable: Path, *, model: str | None = None, timeout: float = 300.0, runner: Runner = subprocess.run,
+        self, executable: Path, *, model: str | None = None, timeout: float = 300.0, runner: Runner = run_bounded,
         effort: str = CODEX_EFFORT,
     ) -> None:
         self.executable = executable
@@ -248,7 +254,7 @@ class CodexCliExtractor:
     def command(self, *, workspace: Path, schema_path: Path, answer_path: Path, system_prompt: str,
                 preamble: str = CODEX_PREAMBLE) -> list[str]:
         command = [
-            str(self.executable), "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+            *engine_command(self.executable), "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
             "--skip-git-repo-check", "--sandbox", "read-only", "--disable", "hooks", "--disable", "multi_agent",
             "--color", "never", "-C", str(workspace), "--output-schema", str(schema_path), "-o", str(answer_path),
             "-c", 'approval_policy="never"', "-c", f'model_reasoning_effort="{self.effort}"',
@@ -263,7 +269,7 @@ class CodexCliExtractor:
         return payload_items(payload, "memories", MAX_CANDIDATES)
 
     def run(self, text: str, *, schema: dict[str, Any], system_prompt: str) -> dict[str, Any]:
-        with tempfile.TemporaryDirectory(prefix="knowitall2-learn-") as folder:
+        with tempfile.TemporaryDirectory(prefix="knowitall2-learn-", ignore_cleanup_errors=True) as folder:
             workspace = Path(folder) / "workspace"
             workspace.mkdir()
             return self._call(text, workspace=workspace, scratch=Path(folder), schema=schema,
@@ -273,13 +279,12 @@ class CodexCliExtractor:
                 timeout: float = EXPLORE_TIMEOUT) -> dict[str, Any]:
         """One call in ``folder`` under Codex's read-only sandbox: it may read and search files, and change nothing."""
 
-        with tempfile.TemporaryDirectory(prefix="knowitall2-find-") as scratch:
+        with tempfile.TemporaryDirectory(prefix="knowitall2-find-", ignore_cleanup_errors=True) as scratch:
             return self._call(text, workspace=Path(folder), scratch=Path(scratch), schema=schema,
                               system_prompt=system_prompt, preamble=CODEX_EXPLORE_PREAMBLE, timeout=timeout)
 
     def _call(self, text: str, *, workspace: Path, scratch: Path, schema: dict[str, Any], system_prompt: str,
               preamble: str, timeout: float) -> dict[str, Any]:
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         schema_path = scratch / "schema.json"
         answer_path = scratch / "answer.json"
         schema_path.write_text(json.dumps(strict_schema(schema)), encoding="utf-8")
@@ -287,10 +292,8 @@ class CodexCliExtractor:
                                system_prompt=system_prompt, preamble=preamble)
         self.last_usage = None
         try:
-            completed = self._runner(
-                command, input=text.encode("utf-8"), capture_output=True, timeout=timeout,
-                cwd=str(workspace), creationflags=flags, env=codex_engine_environment(),
-            )
+            completed = self._runner(command, input=text.encode("utf-8"), timeout=timeout, cwd=str(workspace),
+                                     env=codex_engine_environment())
         except subprocess.TimeoutExpired as exc:
             raise ExtractionError(f"the Codex CLI timed out after {timeout:.0f} seconds") from exc
         except OSError as exc:
@@ -309,6 +312,26 @@ class CodexCliExtractor:
         if not isinstance(payload, dict):
             raise ExtractionError("the model's answer was not a JSON object")
         return payload
+
+
+def prompt_arguments(start: list[str], system_prompt: str, scratch: Path | None) -> list[str]:
+    """How the system prompt reaches the Claude Code engine that ``start`` runs.
+
+    The documented ``--system-prompt`` argument arrives whole on every direct
+    launch: a native engine, or npm's script started with node. Only a command
+    script that is not npm's still runs through cmd.exe, which would end the
+    argument at its first newline; it gets the prompt in a file in ``scratch``
+    with ``--system-prompt-file``, an option Claude Code accepts but does not
+    list in its help, so it is used only there.
+    """
+
+    if not through_cmd(start):
+        return ["--system-prompt", system_prompt]
+    if scratch is None:
+        raise ValueError("a command script run through cmd.exe needs a folder for its system prompt")
+    path = scratch / "system-prompt.md"
+    path.write_bytes(system_prompt.encode("utf-8"))
+    return ["--system-prompt-file", str(path)]
 
 
 def claude_usage(stdout: bytes) -> dict[str, float] | None:
@@ -446,26 +469,33 @@ def find_claude_cli() -> Path | None:
     ``<version>\\<hash>\\claude.exe`` on 2026-10-01), so the engine is looked for a
     few folders deep, and one whose download record says it is incomplete is
     passed over.
+
+    A native ``claude.exe`` wins over npm's ``claude.cmd`` wherever each is on
+    PATH; npm's is used only when there is no native one.
     """
 
     on_path = shutil.which("claude")
-    if on_path:
+    if on_path and not is_command_script(Path(on_path)):
         return Path(on_path)
     for candidate in _posix_locations("claude", Path.home() / ".claude" / "local"):
         return candidate
-    # Anthropic's own Windows installer puts it here; processes started before it was added to PATH still find it.
-    official = Path.home() / ".local" / "bin" / "claude.exe"
-    if sys.platform == "win32" and official.is_file():
-        return official
+    if sys.platform == "win32":
+        native = shutil.which("claude.exe")
+        if native:
+            return Path(native)
+        # Anthropic's own Windows installer puts it here; processes started before it was added to PATH still find it.
+        official = Path.home() / ".local" / "bin" / "claude.exe"
+        if official.is_file():
+            return official
     roots: list[Path] = []
     if os.environ.get("APPDATA"):
         roots.append(Path(os.environ["APPDATA"]) / "Claude" / "claude-code")
     if os.environ.get("LOCALAPPDATA"):
         roots.extend(Path(os.environ["LOCALAPPDATA"], "Packages").glob("Claude_*/LocalCache/Roaming/Claude/claude-code"))
     found = [engine for root in roots for engine in _desktop_engines(root)]
-    if not found:
-        return None
-    return Path(os.path.realpath(max(found)[2]))
+    if found:
+        return Path(os.path.realpath(max(found)[2]))
+    return Path(on_path) if on_path else None
 
 
 _ENGINE_DEPTH = 3
@@ -503,22 +533,32 @@ def _complete(engine: Path) -> bool:
     return not isinstance(expected, int) or engine.stat().st_size == expected
 
 
-def find_codex_cli(*, runner: Runner = subprocess.run) -> Path | None:
-    """The newest Codex engine: on PATH, or kept by the Codex desktop app under %LOCALAPPDATA%."""
+def find_codex_cli(*, runner: Runner = run_bounded) -> Path | None:
+    """The newest Codex engine: on PATH, or kept by the Codex desktop app under %LOCALAPPDATA%.
 
-    candidates: list[Path] = []
+    A native ``codex.exe`` wins over npm's ``codex.cmd``, even an older one;
+    npm's is used only when no native one answers.
+    """
+
+    native: list[Path] = []
+    scripts: list[Path] = []
     on_path = shutil.which("codex")
     if on_path:
-        candidates.append(Path(on_path))
-    candidates.extend(_posix_locations("codex"))
+        (scripts if is_command_script(Path(on_path)) else native).append(Path(on_path))
+    if sys.platform == "win32" and shutil.which("codex.exe"):
+        native.append(Path(shutil.which("codex.exe")))
+    native.extend(_posix_locations("codex"))
     if os.environ.get("LOCALAPPDATA"):
-        candidates.extend(sorted(Path(os.environ["LOCALAPPDATA"], "OpenAI", "Codex", "bin").glob("*/codex.exe")))
-    versions = []
-    for candidate in dict.fromkeys(candidates):
-        version = _codex_version(candidate, runner)
-        if version is not None:
-            versions.append((version, candidate))
-    return max(versions)[1] if versions else None
+        native.extend(sorted(Path(os.environ["LOCALAPPDATA"], "OpenAI", "Codex", "bin").glob("*/codex.exe")))
+    for candidates in (native, scripts):
+        versions = []
+        for candidate in dict.fromkeys(candidates):
+            version = _codex_version(candidate, runner)
+            if version is not None:
+                versions.append((version, candidate))
+        if versions:
+            return max(versions)[1]
+    return None
 
 
 def _posix_locations(name: str, *extra: Path) -> list[Path]:
@@ -530,15 +570,12 @@ def _posix_locations(name: str, *extra: Path) -> list[Path]:
     return [folder / name for folder in folders if (folder / name).is_file() and os.access(folder / name, os.X_OK)]
 
 
-def codex_listed_models(executable: Path, *, runner: Runner = subprocess.run) -> list[dict[str, Any]] | None:
+def codex_listed_models(executable: Path, *, runner: Runner = run_bounded) -> list[dict[str, Any]] | None:
     """The models Codex lists for users, from its own catalog; None when the catalog cannot be read."""
 
     try:
-        completed = runner(
-            [str(executable), "debug", "models"], capture_output=True, timeout=60,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            env=codex_engine_environment(),
-        )
+        completed = runner([*engine_command(executable), "debug", "models"], timeout=60,
+                           env=codex_engine_environment())
         catalog = json.loads(completed.stdout.decode("utf-8", errors="replace"))
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
@@ -554,7 +591,7 @@ _CODEX_EVERYDAY_WORDS = ("workhorse", "everyday")
 _CODEX_FAST_WORDS = ("affordable", "fast")
 
 
-def codex_default_model(executable: Path, *, runner: Runner = subprocess.run) -> str | None:
+def codex_default_model(executable: Path, *, runner: Runner = run_bounded) -> str | None:
     """Codex's listed everyday model, read from its own catalog; None for Codex's default.
 
     In a benchmark of six real sessions (2026-09-29), Codex's everyday model at
@@ -572,10 +609,7 @@ def codex_default_model(executable: Path, *, runner: Runner = subprocess.run) ->
 
 def _codex_version(executable: Path, runner: Runner) -> tuple[int, ...] | None:
     try:
-        completed = runner(
-            [str(executable), "--version"], capture_output=True, timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+        completed = runner([*engine_command(executable), "--version"], timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     words = completed.stdout.decode("utf-8", errors="replace").split()

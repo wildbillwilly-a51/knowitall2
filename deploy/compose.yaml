@@ -1,6 +1,9 @@
 # The KnowItAll2 server. From the KnowItAll2 folder, start it with:
 #   docker compose -f deploy/compose.yaml up -d --build
-# then open http://<this computer>:4191/ and create the admin account. See docs/server.md.
+# then open http://<this computer>:4191/ and create the admin account with the one-time setup code the server
+# prints in its log:
+#   docker compose -f deploy/compose.yaml logs knowitall2
+# See docs/server.md.
 name: knowitall2
 
 services:
@@ -11,7 +14,9 @@ services:
     image: knowitall2-server:local
     restart: unless-stopped
     ports:
-      # To use another port on this computer, change the first number only.
+      # To use another port on this computer, change the first number only. Behind a reverse proxy, bind it
+      # to the one address the proxy reaches, such as "10.0.0.5:4191:4191", so the server is not also open,
+      # without the proxy's HTTPS and sign-in, on every network this computer is on.
       - "4191:4191"
     volumes:
       # The memories, the admin account, and the daily backups live here. Recreating the container keeps
@@ -23,7 +28,7 @@ services:
       KNOWITALL2_TRUSTED_PROXY: ""
       # Forgot the admin password and lost the recovery code? Put any new value here, such as today's date,
       # and restart. Only the admin account is removed; memories and agents are kept. Each value works once.
-      # Open the page to set the admin up again, then empty this line.
+      # Set the admin up again on the page with the new setup code from the log, then empty this line.
       KNOWITALL2_RESET_ADMIN: ""
     read_only: true
     tmpfs:

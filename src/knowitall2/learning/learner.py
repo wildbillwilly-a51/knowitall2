@@ -1,26 +1,25 @@
 """Learn durable memories from finished session logs, in the background.
 
-A failure stays with its own session: it is retried on later runs and skipped
-after repeated failures, so one bad log can never block the rest or pause
-learning.
+A failure stays with its own session: it is retried on later runs, and the
+excerpt that keeps failing is skipped after repeated failures in a row, so one
+bad excerpt can never block the rest of its session, other logs, or learning.
 """
 
 from __future__ import annotations
 
-import re
-import unicodedata
 from collections import Counter
-from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
 from .. import journal, review
-from ..memory import KINDS, VERIFICATION_FOR_SOURCE, Memory, MemoryInputError, keywords, may_supersede
+from ..memory import (
+    KINDS, VERIFICATION_FOR_SOURCE, Memory, MemoryInputError, _stem, keywords, may_replace_unasked, significant_words,
+)
+from ..quotes import nearly_quoted_in as _nearly_quoted_in, quoted_in as _quoted_in
 from ..review import UNCONFIRMED_RULE_PREFIX
-from ..secrets import contains_secret
+from ..secrets import contains_secret, redact
 from ..store import RecordRow
 from .dossier import Dossier, build_dossiers, file_by_work
 from .extractor import ExtractionError, Extractor
@@ -30,8 +29,8 @@ from .transcripts import read_session
 MIN_TEXT_CHARACTERS = 20
 # The model is asked for under 500 characters and to split larger knowledge; a little over is still kept.
 MAX_TEXT_CHARACTERS = 1000
-# Letters and digits a quote needs, so a word or two cannot count as evidence.
-MIN_QUOTE_LETTERS = 12
+# A memory in the user's own words: this share of its significant words must be in the quoted words.
+USER_WORDS_SHARE = 0.5
 LEARNER_AGENT = "learner"
 KNOWN_LIMIT = 40
 # The project's newest memories, plus those of it and the global ones that match the excerpt's words.
@@ -60,7 +59,7 @@ class LearnReport:
     skipped: list[str] = field(default_factory=list)
     blocked: str | None = None
     usage: Counter = field(default_factory=Counter)
-    # Each candidate's outcome, with its text (none for one that held a secret) and memory ids.
+    # Each candidate's outcome, with its text (redacted, and none for one that held a secret) and memory ids.
     results: list[dict[str, Any]] = field(default_factory=list)
 
     def describe(self, *, dry_run: bool) -> str:
@@ -79,7 +78,7 @@ class LearnReport:
         if self.failed:
             lines.append("Will retry later: " + ", ".join(self.failed))
         if self.skipped:
-            lines.append(f"Skipped after {MAX_FAILURES} failures: " + ", ".join(self.skipped))
+            lines.append(f"Skipped a part after {MAX_FAILURES} failures in a row: " + ", ".join(self.skipped))
         if self.blocked:
             lines.append(f"Learning stopped, and no session was marked as failed: {self.blocked}")
         return "\n".join(lines)
@@ -143,6 +142,7 @@ def learn(
         budget = min(settings.max_calls_per_run - report.calls, settings.max_calls_per_day - calls_today - report.calls)
         progress: int | None = None
         completed = True
+        current: Dossier | None = None
         try:
             for dossier in dossiers:
                 if any(dossier is item for item in duplicates):
@@ -153,6 +153,7 @@ def learn(
                     completed = False
                     break
                 assert memory is not None
+                current = dossier
                 dossier.known = known_context(memory, dossier)
                 try:
                     candidates = extractor.extract(dossier)
@@ -164,10 +165,8 @@ def learn(
                 for candidate in candidates:
                     outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
                     report.outcomes[outcome] += 1
-                    report.results.append({
-                        "outcome": outcome, "ids": record_ids,
-                        "text": None if outcome == "rejected (secret)" else str(candidate.get("text") or ""),
-                    })
+                    report.results.append({"outcome": outcome, "ids": record_ids,
+                                           "text": result_text(outcome, candidate)})
                 state.mark_seen(dossier.fingerprint)
                 progress = dossier.end_offset
         except ExtractionError as exc:
@@ -180,12 +179,16 @@ def learn(
             journal.problem("learning", f"a learning call failed for session {session.session_id}: {exc}")
             report.calls += 1
             state.record_call(at=moment, session=session.session_id, outcome="failed")
-            entry["failures"] = int(entry.get("failures", 0)) + 1
+            # Only failures in a row count: a run that got further first starts the count again.
+            entry["failures"] = 1 if progress is not None else int(entry.get("failures", 0)) + 1
             entry["last_error"] = str(exc)[:300]
             entry["updated_at"] = moment.isoformat()
             if entry["failures"] >= MAX_FAILURES:
-                entry["status"] = "skipped"
-                entry["offset"] = end
+                # Give up on the excerpt that keeps failing, not on the rest of the session.
+                last = current is None or current is dossiers[-1]
+                entry["offset"] = end if last else current.end_offset
+                entry["failures"] = 0
+                entry["status"] = "skipped" if last else "partial"
                 report.skipped.append(session.session_id)
             else:
                 entry["status"] = "failed"
@@ -202,6 +205,16 @@ def learn(
     if not dry_run:
         state.save()
     return report
+
+
+def result_text(outcome: str, candidate: dict[str, Any]) -> str | None:
+    """A candidate's text for the run's results, which the news shows: none for a secret, and redacted.
+
+    A turned-down candidate was never screened like a memory, so it is
+    redacted too, in case the checks turned it down for another reason.
+    """
+
+    return None if outcome == "rejected (secret)" else redact(str(candidate.get("text") or ""))
 
 
 def known_context(memory: Memory, dossier: Dossier) -> list[RecordRow]:
@@ -233,7 +246,8 @@ def publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, run:
 
     A candidate that updates or contradicts a known memory replaces it only when
     its evidence is at least as strong; the user's own statements give way only
-    to the user's own words. Otherwise both are kept and the user is asked.
+    to the same statement said again in nearly the same words. Otherwise both
+    are kept and the user is asked.
     Every candidate, kept or not, is recorded in the journal with the reason.
     """
 
@@ -279,7 +293,8 @@ def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tup
         return f"rejected ({reason})", []
     older = _changed_memory(memory, checked, dossier)
     replaces = None
-    if older is not None and may_supersede(older.verification, VERIFICATION_FOR_SOURCE[checked["source"]]):
+    if older is not None and may_replace_unasked(older, kind=checked["kind"], text=checked["text"],
+                                                 verification=VERIFICATION_FOR_SOURCE[checked["source"]]):
         replaces, older = older.id, None
     try:
         result = memory.remember(
@@ -325,6 +340,9 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
     scope = candidate.get("scope")
     evidence = " ".join(str(candidate.get("evidence") or "").split())
     subjects = candidate.get("subjects") if isinstance(candidate.get("subjects"), list) else []
+    # First, so that a candidate holding a secret is never kept or shown, whatever else is wrong with it.
+    if contains_secret(" ".join([text, evidence, *(str(item) for item in subjects)])):
+        return None, "secret"
     subjects = [" ".join(str(item).split())[:80] for item in subjects if str(item).strip()][:8]
     if not MIN_TEXT_CHARACTERS <= len(text) <= MAX_TEXT_CHARACTERS:
         return None, "length"
@@ -334,28 +352,33 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
         return None, "scope"
     if scope == "project" and dossier.project is None:
         scope = "global"
-    if contains_secret(" ".join([text, evidence, *subjects])):
-        return None, "secret"
+    if dossier.from_documents and dossier.project is not None:
+        # A project's documents may be wrong or planted: what they teach reaches only that project's agents.
+        scope = "project"
     if not _quoted_in(evidence, [dossier.text]) and not _nearly_quoted_in(evidence, [dossier.text]):
         # Every memory must rest on the session itself: not on the known-memory
         # list, and not on context an engine adds, such as the user's AGENTS.md.
         # A near quote (a few words re-typed) counts, but only an exact one below
-        # makes a memory observed or the user's own words, or makes a rule.
+        # makes a memory observed or the user's own words, or makes a rule; the
+        # user's words must also say what the memory says.
         return None, "evidence not in the session"
     source = "inferred"
     proposed_rule = False
     if kind == "rule":
-        if _quoted_in(evidence, dossier.user_texts):
+        quoted = _quoted_in(evidence, dossier.user_texts)
+        if quoted and _says_what_was_quoted(text, evidence):
             source = "user"
-        elif _nearly_quoted_in(evidence, dossier.user_texts):
-            # The user's words, re-typed: ask the user whether it is their rule.
+        elif quoted or _nearly_quoted_in(evidence, dossier.user_texts):
+            # The user's words, re-typed, or quoted for a rule they do not state: ask the user whether it is theirs.
             kind, text, proposed_rule = "note", UNCONFIRMED_RULE_PREFIX + text, True
         else:
             # An instruction an agent wrote, not the user: a note, never a question the user cannot answer.
             kind = "note"
-    elif _quoted_in(evidence, dossier.tool_outputs):
+    elif _quoted_in(evidence, dossier.trusted_outputs):
+        # What a command printed is often raw data that the memory explains in its own words, so no shared words
+        # are needed. Documents, searches, MCP tools, and helper agents only say what someone wrote: unverified.
         source = "observed"
-    elif _quoted_in(evidence, dossier.user_texts):
+    elif _quoted_in(evidence, dossier.user_texts) and _says_what_was_quoted(text, evidence):
         source = "user"
     relation = candidate.get("relation") if candidate.get("relation") in ("updates", "contradicts") else "new"
     known_id = str(candidate.get("known_id") or "").strip().strip("[]")
@@ -365,103 +388,31 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
     }, None
 
 
-def _quoted_in(quote: str, sources: list[str]) -> bool:
-    """Whether ``quote`` appears in one of ``sources``.
+def _says_what_was_quoted(text: str, quote: str) -> bool:
+    """Whether the quoted words support ``text``: most of its significant words, endings aside, are in them.
 
-    Quotes are compared by their letters and digits alone, because models
-    re-type punctuation: typographic apostrophes become straight ones, and
-    diff markers, comment signs, and escaping disappear. A quote shortened
-    with "..." counts when each piece appears, in order. Paraphrases and
-    quotes stitched together from separate places still do not match.
+    A memory said to be in the user's own words must say what the user said,
+    not rest a document's instruction on a harmless sentence of theirs.
     """
 
-    pieces = [piece for piece in (_letters(part) for part in _ELISION.split(quote)) if piece]
-    if sum(len(piece) for piece in pieces) < MIN_QUOTE_LETTERS:
+    words = {_stem(word) for word in significant_words(text)}
+    if not words:
         return False
-    for source in sources:
-        text = _letters(source)
-        position = 0
-        for piece in pieces:
-            found = text.find(piece, position)
-            if found < 0:
-                break
-            position = found + len(piece)
-        else:
-            return True
-    return False
+    quoted = {_stem(word) for word in significant_words(quote)}
+    found = sum(1 for word in words if any(_same_word(word, other) for other in quoted))
+    return found / len(words) >= USER_WORDS_SHARE
 
 
-_ELISION = re.compile(r"\.{3,}|…|\[\.\.\.\]")
-# A near quote: this share of its words, in order, within one stretch of the source.
-NEAR_QUOTE_SHARE = 0.85
-_NEAR_ANCHORS = 3
-_NEAR_POSITIONS = 60
-_NEAR_SLACK = 3
+_WORD_PREFIX_MINIMUM = 4
 
 
-def _nearly_quoted_in(quote: str, sources: list[str], *, share: float = NEAR_QUOTE_SHARE) -> bool:
-    """Whether ``quote`` appears in one of ``sources`` with a few words re-typed, dropped, or added.
+def _same_word(first: str, second: str) -> bool:
+    """The same word, or one a longer form of the other ("deploy" and "deployment")."""
 
-    Models copy long passages imperfectly: a changed word, a dropped article,
-    a line break read as a space. Each piece of the quote (split at "...")
-    must still match, word by word and in order, within one stretch of the
-    source about as long as itself, so paraphrases and quotes stitched from
-    separate places do not match.
-    """
-
-    pieces = [piece for piece in (_words(part) for part in _ELISION.split(quote)) if piece]
-    if sum(len("".join(piece)) for piece in pieces) < MIN_QUOTE_LETTERS:
-        return False
-    for source in sources:
-        words, positions = _word_index(source)
-        after = 0
-        for piece in pieces:
-            end = _near_piece(piece, words, positions, share, after=after)
-            if end is None:
-                break
-            after = end
-        else:
-            return True
-    return False
-
-
-def _near_piece(piece: tuple[str, ...], words: tuple[str, ...], positions: dict[str, list[int]], share: float, *,
-                after: int = 0) -> int | None:
-    """Where a near match of ``piece`` ends, at or past word ``after``; None when there is none."""
-
-    anchors = sorted({word for word in piece if word in positions}, key=lambda word: len(positions[word]))
-    best = None
-    for anchor in anchors[:_NEAR_ANCHORS]:
-        offset = piece.index(anchor)
-        for position in [item for item in positions[anchor] if item - offset >= after - _NEAR_SLACK][:_NEAR_POSITIONS]:
-            start = max(after, position - offset - _NEAR_SLACK)
-            end = position - offset + len(piece) + _NEAR_SLACK
-            blocks = SequenceMatcher(None, piece, words[start:end], autojunk=False).get_matching_blocks()
-            if sum(block.size for block in blocks) >= share * len(piece):
-                best = end if best is None else min(best, end)
-                break
-    return best
-
-
-@lru_cache(maxsize=256)
-def _words(text: str) -> tuple[str, ...]:
-    return tuple(re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()))
-
-
-@lru_cache(maxsize=16)
-def _word_index(text: str) -> tuple[tuple[str, ...], dict[str, list[int]]]:
-    words = _words(text)
-    positions: dict[str, list[int]] = {}
-    for index, word in enumerate(words):
-        positions.setdefault(word, []).append(index)
-    return words, positions
-
-
-@lru_cache(maxsize=256)
-def _letters(text: str) -> str:
-    """Only the letters and digits of ``text``, compatibility-normalized and casefolded."""
-
-    return "".join(character for character in unicodedata.normalize("NFKC", text).casefold() if character.isalnum())
+    if first == second:
+        return True
+    shorter, longer = sorted((first, second), key=len)
+    return len(shorter) >= _WORD_PREFIX_MINIMUM and longer.startswith(shorter)
 
 
 def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime) -> None:

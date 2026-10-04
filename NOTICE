@@ -16,4 +16,8 @@ KnowItAll2 is source-available, not open source. It is a pre-release.
 Your memories stay on your own computer, or on a KnowItAll2 server you run
 and choose to connect. When you turn learning on, each learning call sends
 a redacted excerpt of a finished session to your own Claude Code or Codex
-account, as described in docs/testing.md.
+account, as described in docs/testing.md. "Ask an agent to find these out"
+in the app is different: it runs only when you press it, even with learning
+off, and sends one agent on that account to read a project's files itself,
+so nothing it reads is redacted first. Codex's read-only sandbox lets that
+agent read files outside the project folder too.

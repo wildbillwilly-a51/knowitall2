@@ -16,14 +16,19 @@ from knowitall2.learning.state import LearnerState
 from knowitall2.memory import Memory
 from knowitall2.store import Store
 
+TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
 
 class FakeEngine:
-    def __init__(self, payload) -> None:
+    def __init__(self, payload, *, during=None) -> None:
         self.payload = payload
         self.calls = []
+        self.during = during  # what changes in the store while the agent looks
 
     def explore(self, text, *, folder, schema, system_prompt):
         self.calls.append((text, folder))
+        if self.during is not None:
+            self.during()
         if isinstance(self.payload, Exception):
             raise self.payload
         return self.payload
@@ -83,11 +88,11 @@ class SearchTests(FinderTestCase):
         self.assertEqual([("How agents reach it", "the quote is not in that file")],
                          [(item["label"], item["reason"]) for item in result["turned_down"]])
         self.assertEqual(["How agents reach it"], result["not_found"])
-        # What was found fills the profile, as seen in action.
+        # What was found fills the profile, unverified: a file says so, which may be wrong or out of date.
         profile = self.profile()
         self.assertEqual(["access"], [item["facet"] for item in profile["missing"]])
         where = next(item for item in profile["facets"] if item["facet"] == "where")["memories"][0]
-        self.assertEqual("observed", where["verification"])
+        self.assertEqual("unverified", where["verification"])
         # What was not found waits for an agent that works with vCenter.
         [task] = self.store.tasks(status="open", kind="find_out", system_id=self.system_id)
         self.assertEqual("access", task["facet"])
@@ -116,6 +121,63 @@ class SearchTests(FinderTestCase):
         self.assertFalse(any("renew the vcenter certificate" in prompt.lower() for prompt in asked))
         howto = next(item for item in self.profile()["facets"] if item["facet"] == "howto")
         self.assertEqual(1, len(howto["memories"]))
+
+    def test_a_turned_down_answer_keeps_nothing_of_a_secret(self) -> None:
+        engine = FakeEngine({"found": [
+            {"part": "p9", "text": f"vCenter automation signs in with {TOKEN}.", "file": "README.md", "quote": TOKEN},
+            {"part": "p1", "text": "vCenter runs at vcsa01.lab.local.", "file": "inventory.yml",
+             "quote": f"host: vcsa01.lab.local {TOKEN}"},
+        ], "not_found": []})
+        result = finder.run(self.system_id, engine=engine, store=self.store)
+        self.assertEqual(["secret", "secret"], [item["reason"] for item in result["turned_down"]])
+        self.assertNotIn(TOKEN, json.dumps(result))
+        self.assertNotIn(TOKEN, finder.status_path(self.system_id).read_text(encoding="utf-8"))
+
+    def test_a_profile_written_while_the_agent_looks_is_kept(self) -> None:
+        self.store.set_system_gaps(self.system_id, gaps=["How to renew the vCenter certificate", "Its license key"],
+                                   now=self.clock())
+        (self.project / "RUNBOOK.md").write_text("Renew the vCenter certificate with certificate-manager.\n",
+                                                 encoding="utf-8")
+
+        def meanwhile():
+            # The catalog describes vCenter again while the agent looks.
+            self.store.set_system_profile(
+                self.system_id, summary="Runs the lab's virtual machines.",
+                gaps=["How to renew the vCenter certificate", "Its license key", "Its backup schedule"],
+                profiled="new", now=self.clock())
+
+        engine = FakeEngine({"found": [{"part": "p4", "text": "The vCenter certificate is renewed with "
+                                        "certificate-manager.", "file": "RUNBOOK.md",
+                                        "quote": "Renew the vCenter certificate with certificate-manager."}],
+                             "not_found": []}, during=meanwhile)
+        result = finder.run(self.system_id, engine=engine, store=self.store)
+        self.assertEqual(["How to renew the vCenter certificate"], [item["label"] for item in result["found"]])
+        system = self.store.system(self.system_id)
+        self.assertEqual(("Runs the lab's virtual machines.", ["Its license key", "Its backup schedule"]),
+                         (system["summary"], system["gaps"]))
+
+    def test_a_note_the_user_wrote_is_kept(self) -> None:
+        system = self.store.system(self.system_id)
+        # The user filed this fact under another part of the profile, before the search and while the agent looks.
+        before = catalog.tell(self.memory, system, "about", "vCenter runs at vcsa01.lab.local on port 443.").record
+
+        def meanwhile():
+            catalog.tell(self.memory, system, "other",
+                         "The vCenter admin sign-in is kept in Vaultwarden, item vcenter-admin.")
+
+        engine = FakeEngine({"found": [
+            {"part": "p1", "text": "vCenter runs at vcsa01.lab.local on port 443.", "file": "inventory.yml",
+             "quote": "host: vcsa01.lab.local"},
+            {"part": "p3", "text": "The vCenter admin sign-in is kept in Vaultwarden, item vcenter-admin.",
+             "file": "README.md", "quote": "kept in Vaultwarden, in the item vcenter-admin"},
+        ], "not_found": []}, during=meanwhile)
+        result = finder.run(self.system_id, engine=engine, store=self.store)
+        self.assertEqual(before.id, result["found"][0]["id"])
+        notes = self.store.notes_for([item["id"] for item in result["found"]])
+        self.assertEqual([("about", "user", "vCenter runs at vcsa01.lab.local on port 443."),
+                          ("other", "user", "The vCenter admin sign-in is kept in Vaultwarden, item vcenter-admin.")],
+                         [(notes[item["id"]]["facet"], notes[item["id"]]["written_by"], notes[item["id"]]["headline"])
+                          for item in result["found"]])
 
     def test_a_second_search_does_not_ask_agents_twice(self) -> None:
         engine = FakeEngine({"found": [], "not_found": ["where", "access", "signin"]})
@@ -160,9 +222,13 @@ class CheckTests(FinderTestCase):
             ({"file": str(outside)}, "the file is outside the project folder"),
             ({"file": "missing.yml"}, "the file was not found"),
             ({"quote": "host: vcsa99.lab.local"}, "the quote is not in that file"),
+            ({"text": "vCenter is backed up nightly to the NAS share."}, "the quote does not say that"),
             ({"part": "where"}, "not one of the missing parts"),
             ({"text": "short"}, "length"),
             ({"text": "The vCenter password is hunter22 for the admin account."}, "secret"),
+            # The secret check comes first, so an answer wrong in other ways too is still turned down as a secret.
+            ({"part": "where", "text": f"vCenter automation signs in with {TOKEN}."}, "secret"),
+            ({"text": "token", "quote": TOKEN}, "secret"),
         ):
             with self.subTest(item=item):
                 self.assertEqual((None, reason), self.check(**item))
@@ -174,7 +240,7 @@ class StartTests(FinderTestCase):
         result = finder.start(self.system_id, launcher=lambda command, **options: launches.append((command, options)))
         self.assertTrue(result["started"])
         [(command, options)] = launches
-        self.assertEqual([sys.executable, "-B", "-m", "knowitall2", "find-out", self.system_id], command)
+        self.assertEqual([sys.executable, "-B", "-P", "-m", "knowitall2", "find-out", self.system_id], command)
         self.assertEqual("looking", finder.status(self.system_id)["status"])
         self.assertFalse(finder.start(self.system_id, launcher=lambda *a, **k: launches.append(a))["started"])
         self.assertEqual(1, len(launches))

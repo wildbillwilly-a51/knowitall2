@@ -21,7 +21,7 @@ State lives in ``server/`` in the data home:
 - ``keys/<agent>.key``: each connected agent's key, readable only by the
   user, never shown or stored anywhere else;
 - ``status.json``: when the server was last reached, and any problem;
-- ``sync.lock``, ``sync.again``, ``last-start``: one sync at a time.
+- ``sync-run.lock``, ``sync.again``, ``last-start``: one sync at a time.
 
 Any connected agent's key can send the computer's changes: they share one
 copy, and each memory says which agent saved it. Removing one agent on the
@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from . import journal, sync
-from .files import write_text_atomic
+from .files import read_text, write_text_atomic
 from .learning.state import LockBusy, RunLock
 from .paths import data_home, database_path
 from .remote import RemoteClient, RemoteError
@@ -55,7 +55,6 @@ from .server import API_VERSION
 from .store import SYNCED_TABLES, Store, StoreError
 
 PULL_EVERY_SECONDS = 60
-SYNC_STALE_SECONDS = 10 * 60
 BATCH = 500
 MAX_PAGES = 100
 ROUNDS = 3
@@ -99,7 +98,7 @@ def load() -> Connection | None:
     """This computer's connection, or None when its memory is kept only here."""
 
     try:
-        settings = json.loads((folder() / "connection.json").read_text(encoding="utf-8"))
+        settings = json.loads(read_text(folder() / "connection.json"))
     except (OSError, ValueError):
         return None
     address = settings.get("address") if isinstance(settings, dict) else None
@@ -108,8 +107,8 @@ def load() -> Connection | None:
     keys = {}
     for path in sorted((folder() / "keys").glob("*.key")):
         try:
-            key = path.read_text(encoding="utf-8").strip()
-        except OSError:
+            key = read_text(path).strip()
+        except (OSError, ValueError):
             continue
         if key:
             keys[path.stem] = key
@@ -195,46 +194,41 @@ class SyncReport:
 
 
 class SyncLock(RunLock):
-    """One sync at a time on this computer."""
+    """One sync at a time on this computer: the learner's kind of lock, on its own file.
+
+    Not ``sync.lock``, which earlier versions created and deleted: during an update, syncs of the two never mix.
+    """
 
     def __init__(self) -> None:
-        super().__init__(folder() / "sync.lock")
-
-    def _stale(self) -> bool:
-        try:
-            return time.time() - self.path.stat().st_mtime > SYNC_STALE_SECONDS
-        except OSError:
-            return True
+        super().__init__(folder() / "sync-run.lock")
 
 
 def pull(store: Store, remote: RemoteClient) -> int:
-    """Fetch and apply what changed on the server, leaving rows with unsent changes here alone."""
+    """Fetch and apply what changed on the server, leaving rows with unsent changes here alone.
+
+    Returns how many rows here changed. Pages go by each row's newest
+    change, so a memory can come a page before its project: it waits for the
+    page its project is on, and the saved cursor stays behind it until then,
+    so a sync cut short fetches it again.
+    """
 
     received = 0
+    since = sync.cursor(store)
+    held: list[dict[str, Any]] = []
     for _ in range(MAX_PAGES):
-        page = remote.changes(sync.cursor(store), limit=BATCH)
-        mine = sync.pending_keys(store)
-        items = [item for item in page.get("changes", []) if (item.get("table"), item.get("key")) not in mine]
-        received += sum(1 for item in items if _differs(store, item))  # not this computer's own, coming back
-        sync.apply_pulled(store, items, cursor=int(page.get("next", 0)))
+        page = remote.changes(since, limit=BATCH)
+        fetched = list(page.get("changes", []))
+        newer = {(item.get("table"), item.get("key")) for item in fetched}
+        items = [item for item in held if (item.get("table"), item.get("key")) not in newer] + fetched
+        held = sync.without_parents(store, items)
+        waiting = {id(item) for item in held}
+        since = int(page.get("next", since))
+        behind = [item["seq"] - 1 for item in held if isinstance(item.get("seq"), int)]
+        received += sync.apply_pulled(store, [item for item in items if id(item) not in waiting],
+                                      cursor=min([since, *behind]))
         if not page.get("more"):
             break
     return received
-
-
-def _differs(store: Store, item: dict[str, Any]) -> bool:
-    """Whether a fetched change would change this computer's copy."""
-
-    table = SYNCED_TABLES.get(item.get("table")) if isinstance(item.get("table"), str) else None
-    if table is None or not isinstance(item.get("key"), str):
-        return False
-    current = sync.read_row(store.connection, table, item["key"])
-    if item.get("op") == "delete":
-        return current is not None
-    row = item.get("row") if isinstance(item.get("row"), dict) else {}
-    quiet = {"recall_count", "last_used_at"}
-    return current is None or any(current.get(name) != value for name, value in row.items()
-                                  if name in table.columns and name not in quiet)
 
 
 def _fit(operations: list[dict[str, Any]], columns: dict[str, list[str]]) -> list[dict[str, Any]]:
@@ -257,18 +251,27 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
     """Send this computer's changes; returns (accepted, refused)."""
 
     sent = refused = 0
-    waiting: set[str] = set()
+    waiting: set[tuple[str, str]] = set()  # rows left for the next sync; the pages go on past them
     for _ in range(MAX_PAGES):
-        operations = [item for item in sync.pending_operations(store, limit=BATCH) if item["op_id"] not in waiting]
-        operations = _fit(operations, columns)
-        if not operations:
+        pending = sync.pending_operations(store, limit=BATCH, skip=waiting)
+        if not pending:
             break
+        if columns:  # a table an older server does not share stays noted for a newer one
+            waiting.update((item["table"], item["key"]) for item in pending if item["table"] not in columns)
+        operations = _fit(pending, columns)
+        if not operations:
+            continue
         answer = remote.push(operations)
-        settled, server_rows = [], []
+        settled, server_rows, seen = [], [], []
+        before = len(waiting)
         for operation, result in zip(operations, answer.get("results", [])):
             outcome = result.get("result")
             if outcome == "rejected" and result.get("retry"):
-                waiting.add(operation["op_id"])  # such as a memory whose project has not arrived yet
+                # Such as a memory whose project the server does not have yet: the project, when it is here,
+                # is noted to go now (it may never have been), and the memory goes at the next sync.
+                waiting.add((operation["table"], operation["key"]))
+                if isinstance(operation.get("row"), dict):
+                    sync.note_parents(store, SYNCED_TABLES[operation["table"]], operation["row"])
                 continue
             settled.append(operation)
             if outcome == "rejected":
@@ -280,11 +283,14 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
             if isinstance(result.get("row"), dict):
                 server_rows.append({"table": operation["table"], "key": operation["key"], "op": "upsert",
                                     "row": result["row"], "seq": result.get("seq")})
-        sync.acknowledge(store, settled)
-        if server_rows:
-            mine = sync.pending_keys(store)
-            sync.apply_pulled(store, [item for item in server_rows if (item["table"], item["key"]) not in mine])
-        if not settled:
+            elif outcome == "applied" and isinstance(result.get("seq"), int) and not isinstance(result["seq"], bool):
+                # The server's number for the version sent (older servers leave it out), so this row's next
+                # change is based on it even when another agent's key sends it.
+                seen.append((operation["table"], operation["key"], result["seq"]))
+        sync.acknowledge(store, settled, seen=seen)
+        if server_rows:  # a row changed here again since it was sent is left alone, as in a pull
+            sync.apply_pulled(store, server_rows)
+        if not settled and len(waiting) == before:  # the server answered none of them
             break
     return sent, refused
 
@@ -325,7 +331,7 @@ def _again() -> bool:
 def write_status(report: SyncReport, *, pending: bool) -> None:
     path = folder() / "status.json"
     try:
-        status = json.loads(path.read_text(encoding="utf-8"))
+        status = json.loads(read_text(path))
         if not isinstance(status, dict):
             status = {}
     except (OSError, ValueError):
@@ -345,7 +351,7 @@ def write_status(report: SyncReport, *, pending: bool) -> None:
 
 def read_status() -> dict[str, Any]:
     try:
-        status = json.loads((folder() / "status.json").read_text(encoding="utf-8"))
+        status = json.loads(read_text(folder() / "status.json"))
     except (OSError, ValueError):
         return {}
     return status if isinstance(status, dict) else {}
@@ -381,6 +387,9 @@ def sync_now(store: Store, *, agent: str | None = None, remote: RemoteClient | N
                                             "have been removed on the server's page")
             except sync.SyncError as exc:
                 report.problem = f"the server sent something this computer could not use: {exc}"
+                journal.problem("sync", report.problem)
+            except sqlite3.Error as exc:
+                report.problem = f"the memory store on this computer failed during the sync: {exc}"
                 journal.problem("sync", report.problem)
     except LockBusy:
         (folder() / "sync.again").touch()
@@ -423,7 +432,7 @@ def nudge(agent: str | None, *, store: Store | None = None, pull: bool = True,
         log = open(folder() / "last-sync.log", "w", encoding="utf-8")
         try:
             launcher(
-                [sys.executable, "-B", "-m", "knowitall2", "sync", "--quiet",
+                [sys.executable, "-B", "-P", "-m", "knowitall2", "sync", "--quiet",
                  *(["--agent", agent] if agent else [])],
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=str(data_home()),
                 env=_learner_environment(), close_fds=True, **_detached_options(),
@@ -473,6 +482,23 @@ def maintenance_turn() -> Iterator[bool]:
                 pass
 
 
+def renew_maintenance_turn() -> bool:
+    """Hold the maintenance lease for another ``LEASE_SECONDS``, between the steps of a long tidy-up.
+
+    True while this computer still holds it (the server grants it again to its
+    holder), or when not connected.
+    """
+
+    connection = load()
+    if connection is None:
+        return True
+    remote = client_for(connection, None)
+    try:
+        return remote is not None and bool(remote.lease(LEASE_NAME, seconds=LEASE_SECONDS).get("granted"))
+    except RemoteError:
+        return False
+
+
 def share_quietly(store: Store, *, agent: str | None = None) -> SyncReport | None:
     """A sync for the learner and other background work: nothing when not connected, never raises."""
 
@@ -482,6 +508,11 @@ def share_quietly(store: Store, *, agent: str | None = None) -> SyncReport | Non
         return sync_now(store, agent=agent)
     except (StoreError, sqlite3.Error, OSError) as exc:
         journal.problem("sync", f"the sync failed: {type(exc).__name__}: {exc}")
+        try:
+            if store.connection.in_transaction:  # the caller goes on with this store; never leave it locked
+                store.connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
         return None
 
 
@@ -495,11 +526,13 @@ def connect(
     """Connect one agent on this computer to a server with its join code.
 
     The first agent connects the computer: changes are noted from now on;
-    this computer's memory is sent first when ``upload`` (the server keeps
-    one copy of anything it already has), or set aside when ``replace`` (a
-    backup of the database is kept beside it); and then the server's memory
-    is fetched. A later agent only gets its own key. Nothing changes here
-    unless the server accepts the join code.
+    this computer's memory is noted as changed, to be sent, when ``upload``
+    (the server keeps one copy of anything it already has), or set aside
+    when ``replace`` (a backup of the database is kept beside it); then a
+    first sync sends what is noted and fetches the server's memory. What it
+    does not finish stays noted, and a later sync carries on. A later agent
+    only gets its own key. Nothing changes here unless the server accepts the
+    join code.
     """
 
     address = normalize_address(address)
@@ -527,22 +560,33 @@ def connect(
     with store.transaction():
         store.connection.execute("DELETE FROM changes")
         store.connection.execute("DELETE FROM sync_seen")
+        # A new id for the operations sent from now on, so the answers the server keeps for an earlier
+        # connection's operations are never taken for this one's.
+        store.connection.execute("DELETE FROM meta WHERE key = ?", (sync.SOURCE_KEY,))
         store.set_meta(sync.CURSOR_KEY, "0")
         last_use = store.connection.execute("SELECT COALESCE(MAX(seq), 0) FROM usage").fetchone()[0]
         store.set_meta(USAGE_CURSOR_KEY, str(last_use))
     if replace and not upload:
         report["backup"] = str(set_aside(store))
     sync.set_tracking(store, True)
-    if not upload:
-        # The projects this computer already had go too, so memories saved here under them can follow.
-        with store.transaction():
-            sync.note_all(store, "projects")
+    # Sent as ordinary changes, parents first. Without ``upload``, the projects this computer already had go
+    # too, so memories saved here under them can follow.
+    with store.transaction():
+        for name in SYNCED_TABLES if upload else ("projects",):
+            sync.note_all(store, name)
     try:
+        sent, refused = push(store, remote, remote.hello().get("columns") or {})
         if upload:
-            report["uploaded"] = upload_all(store, remote)
+            report["uploaded"], report["refused"] = sent, refused
         report["received"] = pull(store, remote)
     except RemoteError as exc:
         report["problem"] = str(exc)
+    except sync.SyncError as exc:
+        report["problem"] = f"the server sent something this computer could not use: {exc}"
+        journal.problem("sync", report["problem"])
+    except sqlite3.Error as exc:
+        report["problem"] = f"the memory store on this computer failed during the first sync: {exc}"
+        journal.problem("sync", report["problem"])
     return report
 
 
@@ -551,9 +595,17 @@ _SET_ASIDE = ("record_notes", "question_stages", "agent_tasks", "reviews", "ques
 
 
 def set_aside(store: Store) -> Path:
-    """Back the database up beside itself, then clear the shared memory here so the server's takes its place."""
+    """Back the database up beside itself, then clear the shared memory here so the server's takes its place.
 
-    path = database_path().with_name("knowitall2.pre-server-backup.db")
+    Each backup has its own name, so connecting this way again never overwrites the memories set aside before.
+    """
+
+    base = f"knowitall2.pre-server-backup-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+    path = database_path().with_name(f"{base}.db")
+    number = 2
+    while path.exists():
+        path = database_path().with_name(f"{base}-{number}.db")
+        number += 1
     target = sqlite3.connect(str(path))
     try:
         store.connection.backup(target)
@@ -620,26 +672,6 @@ def describe_status(*, check: bool = True, timeout: float = 3.0) -> tuple[bool, 
     elif status.get("problem"):
         lines.append(f"The last sync did not work: {status['problem']}")
     return healthy, lines
-
-
-def upload_all(store: Store, remote: RemoteClient) -> int:
-    """Send every shared row of this computer's memory; returns how many the server accepted."""
-
-    accepted = 0
-    batch: list[dict[str, Any]] = []
-
-    def send() -> int:
-        answer = remote.push(batch)
-        return sum(1 for result in answer.get("results", []) if result.get("result") in {"applied", "duplicate"})
-
-    for operation in sync.full_copy_operations(store):
-        batch.append(operation)
-        if len(batch) >= BATCH:
-            accepted += send()
-            batch = []
-    if batch:
-        accepted += send()
-    return accepted
 
 
 def disconnect(store: Store) -> None:

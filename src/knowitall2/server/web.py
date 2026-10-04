@@ -37,7 +37,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from .. import __version__, journal
 from ..journal import utc_now
@@ -48,6 +48,12 @@ from . import API_VERSION, accounts, admin, backups, exchange, open_store
 
 DEFAULT_PORT = 4191
 MAX_BODY_BYTES = 8 * 1024 * 1024
+# Of a body too large to take, this much is read and dropped before the connection closes, so a caller
+# that sends the whole body before reading the answer still gets its 413.
+DROP_AT_MOST_BYTES = 4 * MAX_BODY_BYTES
+# A connection that sends nothing for this long is closed. Longer than a reverse proxy keeps an idle connection
+# (Traefik: 90 s), so the proxy closes first and never sends a request on a connection the server is closing.
+CONNECTION_TIMEOUT_SECONDS = 120
 HOUSEKEEPING_SECONDS = 60 * 60
 # The first backup waits until the server has settled after starting.
 HOUSEKEEPING_DELAY_SECONDS = 2 * 60
@@ -56,7 +62,8 @@ API_HEADER = "X-KnowItAll2-API"
 COMPUTER_HEADER = "X-KnowItAll2-Computer"
 CHANGES_HEADER = "X-KnowItAll2-Changes"
 # Spending join codes, signing in, and recovery codes: at most this many failures per address within the
-# window. There is no cap across addresses, so one guesser cannot lock everyone else out.
+# window, tries still running included. There is no cap across addresses (nor per account: there is one
+# admin), so one guesser cannot lock everyone else out.
 JOIN_FAILURES_PER_ADDRESS = 5
 JOIN_WINDOW_SECONDS = 10 * 60
 # Besides the daily backup, one soon after a burst of changes (such as a computer sending its whole memory),
@@ -95,33 +102,63 @@ def _networks(value: str | None) -> list[ipaddress.IPv4Network | ipaddress.IPv6N
 
 
 class Throttle:
-    """Slows down guessing (join codes, passwords, recovery codes): too many failures and it pauses a while."""
+    """Slows down guessing (join codes, passwords, recovery codes): too many failures and it pauses a while.
+
+    Each try holds a place for its address from :meth:`begin` until :meth:`end`
+    settles it, so tries sent all at once count before any of them has failed
+    and a burst cannot slip past the limit. An IPv6 caller counts as its whole
+    /64 network, which one computer usually has to itself.
+    """
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._failures: dict[str, deque[float]] = {}
+        self._running: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def _trim(self, moments: deque[float], now: float) -> None:
-        while moments and now - moments[0] > JOIN_WINDOW_SECONDS:
-            moments.popleft()
+    @staticmethod
+    def _group(address: str) -> str:
+        try:
+            found = ipaddress.ip_address(address)
+        except ValueError:
+            return address
+        if isinstance(found, ipaddress.IPv6Address):
+            if found.ipv4_mapped is not None:
+                return str(found.ipv4_mapped)
+            return str(ipaddress.ip_network(f"{found}/64", strict=False))
+        return address
 
-    def allowed(self, address: str) -> bool:
+    def begin(self, address: str) -> bool:
+        """Hold a place for one try from ``address``; False when its failures and running tries reach the limit."""
+
+        group = self._group(address)
         with self._lock:
             now = self._clock()
-            mine = self._failures.get(address)
-            if mine is None:
-                return True
-            self._trim(mine, now)
-            if not mine:
-                del self._failures[address]
-                return True
-            return len(mine) < JOIN_FAILURES_PER_ADDRESS
+            mine = self._failures.get(group)
+            if mine is not None:
+                while mine and now - mine[0] > JOIN_WINDOW_SECONDS:
+                    mine.popleft()
+                if not mine:
+                    del self._failures[group]
+            if len(mine or ()) + self._running.get(group, 0) >= JOIN_FAILURES_PER_ADDRESS:
+                return False
+            self._running[group] = self._running.get(group, 0) + 1
+            return True
 
-    def failed(self, address: str) -> None:
+    def end(self, address: str, *, failed: bool) -> None:
+        """Settle a try :meth:`begin` let through: a failure stays counted for the window, anything else does not."""
+
+        group = self._group(address)
         with self._lock:
             now = self._clock()
-            self._failures.setdefault(address, deque()).append(now)
+            left = self._running.get(group, 0) - 1
+            if left > 0:
+                self._running[group] = left
+            else:
+                self._running.pop(group, None)
+            if not failed:
+                return
+            self._failures.setdefault(group, deque()).append(now)
             if len(self._failures) > 10_000:  # forget addresses whose failures have all aged out
                 for key in [key for key, moments in self._failures.items() if now - moments[-1] > JOIN_WINDOW_SECONDS]:
                     del self._failures[key]
@@ -140,6 +177,8 @@ class KnowItAll2Server(ThreadingHTTPServer):
         store = open_store(self.database)  # create or upgrade before the first request
         try:
             self.admin_was_reset = admin.reset_from_setting(store, reset_value, now=clock())
+            # With no admin, setting one up needs this code, which ``run`` prints to the server's log.
+            self.setup_code = admin.new_setup_code() if admin.admin(store) is None else None
         finally:
             store.close()
         # While the reset setting is present, the page reminds the user to delete it.
@@ -151,6 +190,7 @@ class KnowItAll2Server(ThreadingHTTPServer):
         self._proxies = _networks(trusted_proxy)
         self.join_guard = Throttle()
         self.signin_guard = Throttle()
+        self._proxy_noted = False
         self.housekeeping_seconds = housekeeping_seconds
         self.housekeeping_delay = housekeeping_delay
         self._housekeeping_lock = threading.Lock()
@@ -167,6 +207,16 @@ class KnowItAll2Server(ThreadingHTTPServer):
         except ValueError:
             return False
         return any(found in network for network in self._proxies)
+
+    def note_untrusted_proxy(self, address: str) -> None:
+        """Say once, in the problems journal, that a proxy the user has not named forwards callers' addresses."""
+
+        if self._proxy_noted:
+            return
+        self._proxy_noted = True
+        journal.problem("server", f"requests from {address} carry X-Forwarded-For, but KNOWITALL2_TRUSTED_PROXY "
+                                  "does not name that address, so every caller behind it counts as one address for "
+                                  "the sign-in limits; set KNOWITALL2_TRUSTED_PROXY to the proxy's address")
 
     def housekeeping(self, *, now: datetime | None = None) -> None:
         """The daily backup and tidy-up, when due; and a backup soon after a burst of changes."""
@@ -190,6 +240,7 @@ class KnowItAll2Server(ThreadingHTTPServer):
             try:
                 store.set_meta(BACKUP_CHANGES_KEY, str(latest))
                 exchange.tidy(store, now=self.clock())
+                journal.tidy(store, now=now)  # old events, and uses older than a year folded into totals
             finally:
                 store.close()
 
@@ -227,6 +278,8 @@ class ServerHandler(BaseHTTPRequestHandler):
     server_version = "KnowItAll2"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    timeout = CONNECTION_TIMEOUT_SECONDS
+    _head_only = False
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
@@ -239,11 +292,24 @@ class ServerHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         # What a GET would answer, without the body (some uptime monitors only send HEAD).
-        self._head_only = True
-        self._dispatch("GET")
+        self._dispatch("GET", head_only=True)
 
-    def _dispatch(self, method: str) -> None:
+    def _dispatch(self, method: str, *, head_only: bool = False) -> None:
+        # For this request only: the handler lasts as long as the connection, which can carry more requests.
+        self._head_only = head_only
+        self._body_read = False
+        length = self._length()
+        if length is None or length > MAX_BODY_BYTES:
+            # This answer is the connection's last: where the body ends is unknown, or more comes than is read.
+            self.close_connection = True
         parts = urlsplit(self.path)
+        try:
+            self._answer(method, parts)
+        finally:
+            if not self._body_read:
+                self._drop_body(length)
+
+    def _answer(self, method: str, parts: SplitResult) -> None:
         try:
             if method == "GET" and parts.path in STATIC_FILES:
                 path = STATIC_FILES[parts.path]
@@ -260,15 +326,19 @@ class ServerHandler(BaseHTTPRequestHandler):
             self._send_json(exc.status, {"error": str(exc)})
         except (SyncError, accounts.AccountError, admin.AdminError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except admin.Busy as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)}, {"Retry-After": "5"})
         except StoreError as exc:
             journal.problem("server", f"the server's store failed: {exc}")
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": f"the server's store failed: {exc}"})
         except (ConnectionError, TimeoutError):
             self.close_connection = True
         except Exception as exc:
+            # The detail goes only to the journal: it can show the server's paths, and the caller may have no key.
             journal.problem("server", f"{method} {parts.path} failed: {type(exc).__name__}: {exc}",
                             details={"trace": traceback.format_exc(limit=4)})
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"the server could not do that: {exc}"})
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": "the server could not do that; its data folder's logs/problems.jsonl says why"})
 
     # --- Requests ---
 
@@ -279,6 +349,8 @@ class ServerHandler(BaseHTTPRequestHandler):
         forwarded = self.headers.get("X-Forwarded-For")
         if forwarded and self.server.trusts(direct):
             return forwarded.split(",")[-1].strip() or direct
+        if forwarded:
+            self.server.note_untrusted_proxy(direct)
         return direct
 
     def _read_json(self) -> dict[str, Any]:
@@ -287,17 +359,56 @@ class ServerHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            raise RequestError(HTTPStatus.BAD_REQUEST, "bad Content-Length") from None
+            length = -1
+        if length < 0:
+            # Where this request ends, and so where the next one on the connection starts, is unknown.
+            self.close_connection = True
+            raise RequestError(HTTPStatus.BAD_REQUEST, "bad Content-Length")
         if length > MAX_BODY_BYTES:
             raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request too large; send fewer changes at once")
+        self._body_read = True  # from here on, even a read cut short by the timeout is not tried again
         raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw) if raw else {}
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested deeper than the parser goes
             raise RequestError(HTTPStatus.BAD_REQUEST, "the request was not valid JSON") from None
         if not isinstance(body, dict):
             raise RequestError(HTTPStatus.BAD_REQUEST, "the request must be a JSON object")
         return body
+
+    def _length(self) -> int | None:
+        """The length of this request's body (0 without one), or None when it cannot be known."""
+
+        if self.headers.get("Transfer-Encoding"):  # such as chunked, which this server does not read
+            return None
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        return length if length >= 0 else None
+
+    def _drop_body(self, length: int | None) -> None:
+        """Read and drop the body of a request answered without reading it (a refusal, such as an unknown route).
+
+        Left on a kept-alive connection, it would be read as the next request,
+        and behind a proxy that pools connections, break someone else's
+        request. A body larger than the server takes is read only so far, so
+        a caller that sends it all before reading still gets the answer; that
+        connection then closes (``_dispatch``).
+        """
+
+        if length is None:
+            return
+        left = min(length, DROP_AT_MOST_BYTES)
+        try:
+            while left > 0:
+                chunk = self.rfile.read(min(left, 64 * 1024))
+                if not chunk:
+                    self.close_connection = True
+                    return
+                left -= len(chunk)
+        except OSError:  # including the handler's timeout
+            self.close_connection = True
 
     def authenticated(self, store: Store) -> dict[str, Any]:
         header = self.headers.get("Authorization") or ""
@@ -334,8 +445,10 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.send_header(API_HEADER, str(API_VERSION))
         for name, value in (extra or {}).items():
             self.send_header(name, value)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
-        if not getattr(self, "_head_only", False):
+        if not self._head_only:
             self.wfile.write(data)
 
 
@@ -357,24 +470,29 @@ def _health(handler: ServerHandler, query: dict[str, list[str]], body: dict[str,
 
 
 def _join(handler: ServerHandler, query: dict[str, list[str]], body: dict[str, Any]) -> None:
-    address = handler.address()
-    if not handler.server.join_guard.allowed(address):
+    address, guard = handler.address(), handler.server.join_guard
+    if not guard.begin(address):
         raise RequestError(HTTPStatus.TOO_MANY_REQUESTS,
                            "too many join codes did not work; wait ten minutes and try again")
+    failed = False
 
     def work(store: Store) -> dict[str, Any]:
+        nonlocal failed
         try:
             key, connection = accounts.redeem(
                 store, body.get("code"), agent=body.get("agent"), computer=body.get("computer"),
                 version=body.get("version"), now=handler.server.clock(),
             )
         except accounts.AccountError:
-            handler.server.join_guard.failed(address)
+            failed = True
             raise
         return {"key": key, "connection": connection, "version": __version__, "api": API_VERSION,
                 "latest": exchange.summary(store)["latest"]}
 
-    _with_store(handler, work)
+    try:
+        _with_store(handler, work)
+    finally:
+        guard.end(address, failed=failed)
 
 
 def _hello(handler: ServerHandler, query: dict[str, list[str]], body: dict[str, Any]) -> None:
@@ -492,8 +610,11 @@ def run(host: str, port: int) -> int:
         signal.signal(signal.SIGTERM, lambda *_: server.stop())
     print(f"KnowItAll2 server {__version__} on http://{host}:{server.port}/ with data in {home}", flush=True)
     if server.admin_was_reset:
-        print("The admin account was removed because of KNOWITALL2_RESET_ADMIN. Open the page to set it up "
-              "again, then empty that setting in the compose file.", flush=True)
+        print("The admin account was removed because of KNOWITALL2_RESET_ADMIN. Set it up again with the code "
+              "below, then empty that setting in the compose file.", flush=True)
+    if server.setup_code:
+        print("This server has no admin account yet. To create it, open the server's page and enter this "
+              f"one-time setup code: {server.setup_code}", flush=True)
     try:
         server.serve()
     except KeyboardInterrupt:

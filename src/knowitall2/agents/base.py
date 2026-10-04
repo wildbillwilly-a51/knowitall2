@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -43,6 +45,9 @@ class ServerLaunch:
 
 @dataclass(frozen=True)
 class Check:
+    """One line of ``doctor``. A check that is ``ok`` but has a ``fix`` is a note: nothing is broken, but
+    something wants the user's look."""
+
     name: str
     ok: bool
     detail: str
@@ -60,7 +65,33 @@ def server_launch() -> ServerLaunch:
     configured_home = os.environ.get(HOME_ENVIRONMENT_VARIABLE)
     if configured_home:
         env[HOME_ENVIRONMENT_VARIABLE] = str(Path(configured_home).expanduser().resolve())
-    return ServerLaunch(command=console_python(), args=("-B", "-m", "knowitall2", "serve"), env=env)
+    return ServerLaunch(command=console_python(), args=("-B", "-P", "-m", "knowitall2", "serve"), env=env)
+
+
+def cli_command(*arguments: str) -> str:
+    """How a person runs ``knowitall2 <arguments>`` in a terminal on this computer, with this installation.
+
+    A clone has no ``knowitall2`` program on PATH, so this is the Python that
+    agents are set up with, running the module, with the environment it needs
+    on the same line: for PowerShell on Windows, and a POSIX shell elsewhere.
+    """
+
+    launch = server_launch()
+    words = ["-P", "-m", "knowitall2", *arguments]
+    if sys.platform == "win32":
+        settings = "".join(f"$env:{name}={_powershell_literal(value)}; " for name, value in sorted(launch.env.items()))
+        python = launch.command if _PLAIN_PATH.fullmatch(launch.command) else f"& {_powershell_literal(launch.command)}"
+        return settings + " ".join([python, *words])
+    settings = "".join(f"{name}={shlex.quote(value)} " for name, value in sorted(launch.env.items()))
+    return settings + " ".join([shlex.quote(launch.command), *words])
+
+
+_PLAIN_PATH = re.compile(r"[A-Za-z0-9._~:\\/-]+")
+
+
+def _powershell_literal(value: str) -> str:
+    # PowerShell also ends a single-quoted string at a typographic single quote; doubling keeps one.
+    return "'" + re.sub("(['‘’‚‛])", r"\1\1", value) + "'"
 
 
 def console_python() -> str:
@@ -82,6 +113,9 @@ class AgentAdapter:
     def installed(self) -> bool:
         raise NotImplementedError
 
+    def preflight(self) -> None:
+        """Raise :class:`AgentError` if setup could not finish, before setup (or a server connection) changes anything."""
+
     def setup(self, launch: ServerLaunch) -> list[str]:
         raise NotImplementedError
 
@@ -91,12 +125,31 @@ class AgentAdapter:
     def checks(self, launch: ServerLaunch) -> list[Check]:
         raise NotImplementedError
 
+    def refresh_hook_launcher(self, launch: ServerLaunch) -> str | None:
+        """Bring an existing, outdated hook launcher up to date; returns a change description or ``None``.
+
+        Safe while the agent is open: see :func:`write_hook_launcher`.
+        """
+
+        return None
+
     def restart_hint(self) -> str:
         return f"Start a new {self.display_name} session to load KnowItAll2."
 
+    def setup_command(self) -> str:
+        """The command that sets this agent up again, as a person runs it here."""
+
+        return cli_command("setup", self.name)
+
+
+def was_set_up(adapter: AgentAdapter) -> bool:
+    """Whether KnowItAll2 was set up for this agent here: the agent is installed and has the Skill folder."""
+
+    return adapter.installed() and skill_state(adapter.skills_dir) != "missing"
+
 
 class JsonFile:
-    """A JSON settings file edited carefully: validated, and written only if unchanged since read."""
+    """A JSON settings file edited carefully: validated, written only if unchanged since read, and in its own style."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -125,11 +178,39 @@ class JsonFile:
             # missing settings file the same as an empty one.
             self.path.unlink()
             return True
-        rendered = json.dumps(data, indent=2, ensure_ascii=False)
-        if original.endswith("\n") or not original:
-            rendered += "\n"
-        write_text_atomic(self.path, rendered)
+        write_text_atomic(self.path, render_json_like(original, data))
         return True
+
+
+_INDENT = re.compile(r"\n([ \t]+)\S")
+_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
+_JSON_ESCAPE = re.compile(r"\\(u[0-9a-fA-F]{4}|.)", re.DOTALL)
+
+
+def render_json_like(original: str, data: dict[str, Any]) -> str:
+    """``data`` as JSON in the style of ``original``: its line endings, indentation, escaping of
+    non-ASCII text, and final newline. A new or empty file gets a two-space indent."""
+
+    newline = "\r\n" if "\r\n" in original else "\n"
+    indent: int | str | None = 2
+    separators = None
+    found = _INDENT.search(original)
+    if found:
+        indent = found.group(1)
+    elif original.strip() and "\n" not in original.strip() and json.loads(original):
+        # A one-line file stays on one line, with or without spaces after its commas and colons.
+        indent = None
+        separators = (", ", ": ") if " " in _JSON_STRING.sub("", original.strip()) else (",", ":")
+    escaped = any(match.group(1).startswith("u") and int(match.group(1)[1:], 16) > 0x7F
+                  for match in _JSON_ESCAPE.finditer(original))
+    ensure_ascii = escaped and original.isascii()
+    rendered = json.dumps(data, indent=indent, separators=separators, ensure_ascii=ensure_ascii)
+    if newline != "\n":
+        # JSON escapes line breaks inside strings, so every one here is between values.
+        rendered = rendered.replace("\n", newline)
+    if original.endswith("\n") or not original:
+        rendered += newline
+    return rendered
 
 
 def json_object(data: dict[str, Any], key: str, path: Path) -> dict[str, Any]:
@@ -145,7 +226,9 @@ def render_hook_launcher(launch: ServerLaunch, agent: str) -> str:
     """A tiny script, kept in the data home, that runs a KnowItAll2 hook for ``agent``.
 
     The hook event is its argument (``stop``, ``session-end``); without one it
-    is ``session-start``, as registered by earlier versions.
+    is ``session-start``, as registered by earlier versions. It exits 0
+    whatever happens, even when KnowItAll2 cannot be imported or the hook
+    raises, so a hook can never stop or trouble the agent's session.
     """
 
     lines = [
@@ -161,14 +244,35 @@ def render_hook_launcher(launch: ServerLaunch, agent: str) -> str:
     lines += [
         "try:",
         "    from knowitall2.hooks import main",
-        "except Exception:",
-        "    raise SystemExit(0)",
-        f'raise SystemExit(main(["{agent}", sys.argv[1] if len(sys.argv) > 1 else "session-start"]))',
+        "",
+        f'    main(["{agent}", sys.argv[1] if len(sys.argv) > 1 else "session-start"])',
+        "except BaseException:",
+        "    pass  # a hook never fails the agent's session",
+        "raise SystemExit(0)",
         "",
     ]
     return "\n".join(lines)
 
 
+def write_hook_launcher(path: Path, launch: ServerLaunch, agent: str, *, create: bool = True) -> bool:
+    """Write the hook launcher unless it is current (or, without ``create``, missing); True if written.
+
+    The launcher is KnowItAll2's own file in its data home, and the agent's hook
+    command does not change with it, so it can be rewritten while the agent is
+    open and nothing needs trusting again.
+    """
+
+    text = render_hook_launcher(launch, agent)
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except FileNotFoundError:
+        if not create:
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    write_text_atomic(path, text)
+    return True
 
 
 def ensure_skill_installable(skills_dir: Path) -> None:
@@ -236,7 +340,7 @@ def skill_check(adapter: "AgentAdapter", skills_dir: Path) -> Check:
             name, False, f"{skills_dir / SKILL_NAME} exists but was not created by KnowItAll2",
             "Rename or remove that folder, then run setup again.",
         )
-    return Check(name, False, state, f"Run: knowitall2 setup {adapter.name}")
+    return Check(name, False, state, f"Run: {adapter.setup_command()}")
 
 
 def launch_matches(entry: object, launch: ServerLaunch) -> bool:
@@ -288,8 +392,9 @@ def probe_server(launch: ServerLaunch, *, timeout: float = 20.0) -> Check:
 def describe_checks(checks: Sequence[Check]) -> str:
     lines = []
     for check in checks:
-        lines.append(f"{'OK  ' if check.ok else 'FAIL'} {check.name}: {check.detail}")
-        if not check.ok and check.fix:
+        status = "FAIL" if not check.ok else "NOTE" if check.fix else "OK  "
+        lines.append(f"{status} {check.name}: {check.detail}")
+        if check.fix:
             lines.append(f"     fix: {check.fix}")
     return "\n".join(lines)
 

@@ -32,7 +32,7 @@ def run_worker(request: dict[str, Any]) -> dict[str, Any]:
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         done = subprocess.run(
-            [sys.executable, "-B", "-m", "knowitall2", "serve-once"],
+            [sys.executable, "-B", "-P", "-m", "knowitall2", "serve-once"],
             input=json.dumps(request).encode("utf-8"), capture_output=True, timeout=WORKER_TIMEOUT_SECONDS,
             creationflags=flags,
         )
@@ -72,6 +72,10 @@ class Front:
                 message = json.loads(line)
             except (ValueError, UnicodeDecodeError):
                 self._write(writer, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+                continue
+            if message == []:  # JSON-RPC answers an empty batch with one error
+                self._write(writer, {"jsonrpc": "2.0", "id": None,
+                                     "error": {"code": -32600, "message": "Invalid Request"}})
                 continue
             for part in message if isinstance(message, list) else [message]:
                 for reply in self.handle(part):

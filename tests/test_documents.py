@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,6 +45,37 @@ class DocumentsTests(unittest.TestCase):
         names = [path.name for path in documents.project_documents(self.project_root)]
         self.assertEqual(["CURRENT-STATE.md", "codex-handoff.md", "2026-plan.md"], names)
 
+    @unittest.skipUnless(sys.platform == "win32", "directory junctions are a Windows feature")
+    def test_a_folder_joined_to_one_outside_the_project_is_not_read(self) -> None:
+        import _winapi
+
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "handoff.md").write_text("Private notes from another folder.\n", encoding="utf-8")
+        _winapi.CreateJunction(str(outside), str(self.project_root / "notes"))
+        self.assertTrue((self.project_root / "notes" / "handoff.md").is_file())  # a junction is not a symlink
+        names = [path.name for path in documents.project_documents(self.project_root)]
+        self.assertEqual(["CURRENT-STATE.md", "codex-handoff.md", "2026-plan.md"], names)
+
+    def test_a_linked_file_is_not_read(self) -> None:
+        outside = self.root / "credentials.md"
+        outside.write_text("Private notes from another folder.\n", encoding="utf-8")
+        try:
+            (self.project_root / "README.md").symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symbolic links cannot be made here: {exc}")
+        names = [path.name for path in documents.project_documents(self.project_root)]
+        self.assertEqual(["CURRENT-STATE.md", "codex-handoff.md", "2026-plan.md"], names)
+
+    def test_a_document_too_large_to_be_notes_is_not_read(self) -> None:
+        (self.project_root / "docs" / "operations.md").write_text("x" * 200, encoding="utf-8")
+        files = documents.project_documents(self.project_root)
+        self.assertIn("operations.md", [path.name for path in files])
+        with mock.patch.object(documents, "MAX_DOCUMENT_BYTES", 100):
+            [dossier] = documents.build(self.project, self.project_root, files)
+        self.assertNotIn("operations.md", dossier.text)
+        self.assertIn("[document CURRENT-STATE.md]", dossier.text)
+
     def test_claude_codes_own_notes_for_the_folder_are_read(self) -> None:
         folder = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / documents._NON_NAME.sub("-", str(self.project_root))
         (folder / "memory").mkdir(parents=True)
@@ -65,7 +97,9 @@ class DocumentsTests(unittest.TestCase):
         report = documents.learn(self.memory, state, extractor, dossiers, max_calls=5)
         self.assertEqual((1, {"saved": 2}), (report.calls, dict(report.outcomes)))
         rows = {row.text: row for row in self.store.list_active(project_id=self.project.id, scope="all", limit=5)}
-        self.assertEqual("observed", rows["The homelab jump host is jump01, reached as the ops account."].verification)
+        # A document may be wrong or written by someone else: what it says is unverified and stays with its project.
+        jump = rows["The homelab jump host is jump01, reached as the ops account."]
+        self.assertEqual(("unverified", "project", self.project.id), (jump.verification, jump.scope, jump.project_id))
         self.assertEqual("note", rows["Always deploy on Fridays."].kind)  # a document is not the user's own words
         again = documents.learn(self.memory, state, FakeExtractor([]), dossiers, max_calls=5)
         self.assertEqual((0, {"already read": 1}), (again.calls, dict(again.outcomes)))

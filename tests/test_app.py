@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _support import make_repository
+from _support import SystemProxy, make_repository
 
 from knowitall2 import app as app_module
 from knowitall2 import journal
@@ -160,6 +160,13 @@ class LifetimeTests(AppTestCase):
         app_module.instance_path().write_text(json.dumps({"port": self.server.port, "key": "stale"}), encoding="utf-8")
         self.assertIsNone(app_module.running_instance())
 
+    def test_an_open_app_is_found_with_a_system_proxy_which_never_sees_its_key(self) -> None:
+        app_module.instance_path().parent.mkdir(parents=True, exist_ok=True)
+        app_module.instance_path().write_text(json.dumps({"port": self.server.port, "key": KEY}), encoding="utf-8")
+        with SystemProxy() as proxy:
+            self.assertEqual({"port": self.server.port, "key": KEY}, app_module.running_instance())
+        self.assertEqual([], proxy.seen)
+
 
 class ScreenTests(AppTestCase):
     def test_the_overview_reports_health_use_and_learning(self) -> None:
@@ -235,6 +242,16 @@ class MemoryScreenTests(AppTestCase):
         status, data, _ = self.request("GET", path)
         self.assertEqual(200, status, data)
         return [item["id"] for item in data["items"]]
+
+    def test_odd_page_numbers_are_a_plain_refusal_or_an_empty_page(self) -> None:
+        self.assertEqual([], self.ids("/api/memories?offset=1000000"))
+        self.assertEqual(3, len(self.ids("/api/memories?offset=-5")))
+        for path in ("/api/memories?offset=" + "1" + "0" * 30, "/api/memories?offset=1e9", "/api/activity?before="
+                     + "9" * 25, "/api/activity?limit=" + "9" * 25):
+            with self.subTest(path=path):
+                status, data, _ = self.request("GET", path)
+                self.assertEqual(400, status, data)
+                self.assertRegex(data["error"], "must be a whole number|is too large")
 
     def test_memories_are_searched_and_filtered_without_counting_as_use(self) -> None:
         self.assertEqual(3, len(self.ids("/api/memories")))
@@ -488,7 +505,9 @@ class ShortcutTests(unittest.TestCase):
             return ""
 
         self.packaged = packaged
+        known = {shortcut.FOLDERID_PROGRAMS: str(self.folders[0]), shortcut.FOLDERID_DESKTOP: str(self.folders[1])}
         patches = [
+            mock.patch.object(shortcut, "_known_folder", side_effect=known.get),
             mock.patch.object(shortcut, "_powershell", side_effect=powershell),
             mock.patch.object(shortcut, "in_package_storage",
                               side_effect=lambda path: self.packaged and path.parent == self.folders[0]),
@@ -559,6 +578,39 @@ class ShortcutTests(unittest.TestCase):
         self.packaged = False
         shortcut.create()
         self.assertTrue(self.exists(0))
+
+    @unittest.skipUnless(os.name == "nt", "Windows shortcuts")
+    def test_the_folders_come_from_windows_itself_or_else_from_powershell(self) -> None:
+        shortcut = self.windows(packaged=False)
+        self.assertEqual([folder / "KnowItAll2.lnk" for folder in self.folders], shortcut._windows_shortcuts())
+        self.assertFalse(any("GetFolderPath" in script for script in self.scripts))
+        self.folders = (self.root / "Programs José", self.root / "山田" / "Desktop")
+        with mock.patch.object(shortcut, "_known_folder", return_value=None):
+            self.assertEqual([folder / "KnowItAll2.lnk" for folder in self.folders], shortcut._windows_shortcuts())
+
+    def test_powershell_text_quotes_every_kind_of_single_quote(self) -> None:
+        from knowitall2.app import shortcut
+
+        self.assertEqual("'O''Brien'", shortcut.quoted("O'Brien"))
+        self.assertEqual("'O\u2019\u2019Brien \u2018\u2018a\u201a\u201a\u201b\u201b'",
+                         shortcut.quoted("O\u2019Brien \u2018a\u201a\u201b"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell")
+    def test_powershell_round_trips_any_name(self) -> None:
+        # Read-only: PowerShell only echoes the text, and looks up where the desktop is.
+        from knowitall2.app import shortcut
+
+        for name in ("José", "山田", "O\u2019Brien", "C:/Users/O'Brien \u2018x\u2019/山田 José"):
+            with self.subTest(name=name):
+                self.assertEqual(name, shortcut._powershell("Write-Output " + shortcut.quoted(name)).strip())
+        self.assertEqual(shortcut._powershell("[Environment]::GetFolderPath('Desktop')").strip(),
+                         shortcut._known_folder(shortcut.FOLDERID_DESKTOP))
+
+    def test_the_linux_menu_entry_runs_any_path(self) -> None:
+        from knowitall2.app import shortcut
+
+        self.assertEqual(r'"/opt/py 3/python3" "/home/o\\"b/\\$x/\\`y\\`/a\\\\b/100%%/app.pyw"',
+                         shortcut.desktop_exec(["/opt/py 3/python3", '/home/o"b/$x/`y`/a\\b/100%/app.pyw']))
 
     @unittest.skipIf(os.name == "nt", "Linux menu entries")
     def test_a_linux_menu_entry_is_installed_once_and_removed(self) -> None:

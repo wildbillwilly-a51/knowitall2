@@ -93,6 +93,30 @@ def ask_still_true(memory: Memory, stated: RecordRow) -> bool:
     return _ask(memory, "still_true", prompt, [stated.id])
 
 
+def ask_to_forget(memory: Memory, stated: RecordRow, *, reason: str | None) -> str:
+    """An agent asked to forget something the user said; only the user may. Returns the question's id.
+
+    When a "still true?" question about it is already open, the user answers that one.
+    """
+
+    who = f"An agent ({memory.agent})" if memory.agent else "An agent"
+    asked = f'{who} asked to forget it: "{_short(reason, 200)}".' if reason else f"{who} asked to forget it."
+    prompt = f'You said: "{_short(stated.text)}" [{stated.id}]. {asked} Is it still true?'
+    with memory.store.transaction():
+        _ask(memory, "still_true", prompt, [stated.id], reason=asked)
+        question = open_question(memory.store, "still_true", [stated.id])
+    assert question is not None
+    return question["id"]
+
+
+def open_question(store: Store, kind: str, record_ids: Sequence[str]) -> dict[str, Any] | None:
+    """The open question of this kind about exactly these memories, if there is one."""
+
+    wanted = sorted(record_ids)
+    return next((question for question in store.open_questions(limit=500)
+                 if question["kind"] == kind and sorted(question["record_ids"]) == wanted), None)
+
+
 def stage(store: Store, question_id: str) -> str:
     row = store.question_stage(question_id)
     return row["stage"] if row else "review"
@@ -212,22 +236,24 @@ def list_questions(memory: Memory, *, limit: int = LIST_LIMIT, how_to_answer: st
 
 
 def answer(memory: Memory, question_id: str, choice: str) -> str:
-    """Apply the user's choice. The choice is the user's own word, so it carries full authority."""
+    """Apply the user's choice. The choice is the user's own word, so it carries full authority.
 
-    question = memory.store.question((question_id or "").strip().strip("[]"))
-    if question is None:
-        raise MemoryInputError(f"There is no question [{question_id}].")
-    if question["status"] != "open":
-        raise MemoryInputError(f"[{question['id']}] was already answered ({question['answer']}).")
+    The question and its memories are read again once no one else can write,
+    so two answers given at once never both apply.
+    """
+
+    question = _still_open(memory, question_id)
     keys = [option["key"] for option in question["options"]]
     if choice not in keys:
         raise MemoryInputError(f"Unknown choice {choice!r}; use one of: {', '.join(keys)}.")
-    records = [memory.store.get(record_id) for record_id in question["record_ids"]]
-    if any(record is None or record.status != "active" for record in records):
-        memory.store.close_question(question["id"], answer=f"{choice} (memories had already changed)", now=memory.now())
-        _close_tasks(memory, question["id"], "done")
-        return f"[{question['id']}] no longer applies: its memories changed since it was asked. Nothing else was done."
     with memory.store.transaction():
+        question = _still_open(memory, question_id)
+        records = [memory.store.get(record_id) for record_id in question["record_ids"]]
+        if any(record is None or record.status != "active" for record in records):
+            _close(memory, question["id"], f"{choice} (memories had already changed)")
+            _close_tasks(memory, question["id"], "done")
+            return (f"[{question['id']}] no longer applies: its memories changed since it was asked. "
+                    "Nothing else was done.")
         outcome = _apply(memory, question, records, choice)
         _close_tasks(memory, question["id"], "done")
         memory.record_event(
@@ -237,25 +263,35 @@ def answer(memory: Memory, question_id: str, choice: str) -> str:
     return f"Answered [{question['id']}]: {outcome}"
 
 
-def settle(memory: Memory, question: dict[str, Any], records: list[RecordRow], choice: str, *, by: str,
-           evidence: str) -> str | None:
+def settle(memory: Memory, question: dict[str, Any], choice: str, *, by: str, evidence: str) -> str | None:
     """Apply a decision KnowItAll2 or an agent is sure of; None when only the user may make it.
 
     Only conflicts are settled this way, and never by replacing or retiring
-    something the user said. Everything settled can be undone with restore.
+    something the user said. The question and its memories are read again once
+    no one else can write, since what the caller saw may have changed: the user
+    may have answered, or confirmed one of the memories, in the meantime.
+    Everything settled can be undone with restore.
     """
 
     if question["kind"] != "conflict" or choice not in ("use_new", "keep_mine", "keep_both"):
-        return None
-    older, newer = records
-    if choice == "use_new" and older.verification == "user_stated":
-        return None
-    if choice == "keep_mine" and newer.verification == "user_stated":
         return None
     now = memory.now()
     note = " ".join(f"settled by {by}: {evidence}".split())[:200]
     checked = by != "KnowItAll2" and bool(evidence.strip())
     with memory.store.transaction():
+        current = memory.store.question(question["id"])
+        if current is None or current["status"] != "open":
+            return f"[{question['id']}] was already answered; nothing was changed."
+        records = [memory.store.get(record_id) for record_id in current["record_ids"]]
+        if any(record is None or record.status != "active" for record in records):
+            _close(memory, current["id"], "memories had already changed")
+            _close_tasks(memory, current["id"], "done")
+            return f"[{current['id']}] no longer applies: its memories had already changed; nothing was changed."
+        older, newer = records
+        if choice == "use_new" and older.verification == "user_stated":
+            return None
+        if choice == "keep_mine" and newer.verification == "user_stated":
+            return None
         if choice == "use_new":
             if checked and newer.verification == "unverified":
                 memory.store.set_verification(newer.id, "observed", now=now)
@@ -270,13 +306,29 @@ def settle(memory: Memory, question: dict[str, Any], records: list[RecordRow], c
             memory.store.confirm(older.id, verification=older.verification, now=now)
             memory.store.confirm(newer.id, verification=newer.verification, now=now)
             outcome = f"Kept both [{older.id}] and [{newer.id}]; they do not conflict."
-        memory.store.close_question(question["id"], answer=f"{choice} (settled by {by})", now=now)
-        _close_tasks(memory, question["id"], "done")
+        _close(memory, current["id"], f"{choice} (settled by {by})")
+        _close_tasks(memory, current["id"], "done")
         journal.record(
             memory.store, "settle", f"{outcome} {evidence}".strip(), outcome=choice, agent=by,
-            record_ids=question["record_ids"], details={"question": question["id"], "evidence": evidence}, at=now,
+            record_ids=current["record_ids"], details={"question": current["id"], "evidence": evidence}, at=now,
         )
     return outcome
+
+
+def _still_open(memory: Memory, question_id: str) -> dict[str, Any]:
+    question = memory.store.question((question_id or "").strip().strip("[]"))
+    if question is None:
+        raise MemoryInputError(f"There is no question [{question_id}].")
+    if question["status"] != "open":
+        raise MemoryInputError(f"[{question['id']}] was already answered ({question['answer']}).")
+    return question
+
+
+def _close(memory: Memory, question_id: str, answer: str) -> None:
+    """Close an open question; a question someone else answered meanwhile stops the whole change."""
+
+    if not memory.store.close_question(question_id, answer=answer, now=memory.now()):
+        raise MemoryInputError(f"[{question_id}] was already answered.")
 
 
 def start_check(memory: Memory, question: dict[str, Any], records: list[RecordRow], *, plain: str | None,
@@ -353,7 +405,7 @@ def settle_task(memory: Memory, task_id: str, *, choice: str, found: str, certai
         memory.store.update_task(task["id"], status="done", now=memory.now())
         return "Those memories already changed, so nothing was needed. Thanks."
     if certain and found:
-        outcome = settle(memory, question, records, choice, by=who, evidence=found)
+        outcome = settle(memory, question, choice, by=who, evidence=found)
         if outcome:
             return f"Settled: {outcome}"
         escalate(memory, question["id"], finding=f"{who} checked: {found}",
@@ -417,7 +469,8 @@ def _found_out(memory: Memory, task: dict[str, Any], found: str, certain: bool) 
     now = memory.now()
     with memory.store.transaction():
         if system is not None:
-            memory.store.set_note(result.record.id, headline=_short(found, 120), system_id=system["id"],
+            # A memory already known keeps its note, such as one the user wrote.
+            memory.store.add_note(result.record.id, headline=_short(found, 120), system_id=system["id"],
                                   facet=task["facet"] or "other", written_by=memory.agent or "agent", now=now)
         memory.store.update_task(task["id"], status="done", result=result.record.id, now=now)
     return f"Saved [{result.record.id}]. Thanks."
@@ -474,11 +527,11 @@ def _apply(memory: Memory, question: dict, records: list[RecordRow], choice: str
         else:
             memory.store.retire(note.id, reason="the user declined the proposed rule", now=now)
             outcome = f"Forgot [{note.id}]."
-    memory.store.close_question(question["id"], answer=choice, now=now)
+    _close(memory, question["id"], choice)
     return outcome
 
 
-def _ask(memory: Memory, kind: str, prompt: str, record_ids: list[str]) -> bool:
+def _ask(memory: Memory, kind: str, prompt: str, record_ids: list[str], *, reason: str | None = None) -> bool:
     from .learning.state import load_settings
 
     question_id = "q-" + uuid.uuid4().hex[:8]
@@ -489,7 +542,7 @@ def _ask(memory: Memory, kind: str, prompt: str, record_ids: list[str]) -> bool:
     if added:
         # Without learning there is no background review, so the user is asked directly.
         first = "review" if load_settings().enabled else "ask_user"
-        memory.store.set_question_stage(question_id, stage=first, now=memory.now())
+        memory.store.set_question_stage(question_id, stage=first, reason=reason, now=memory.now())
         # Asked on the learner's or maintenance's behalf too, so this is always recorded.
         journal.record(
             memory.store, "question", prompt, outcome="asked", agent=memory.agent, record_ids=record_ids,

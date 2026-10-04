@@ -19,6 +19,7 @@ from pathlib import Path
 from .. import journal
 from ..files import write_text_atomic
 from ..paths import data_home
+from ..remote import direct_opener
 from .server import KEY_HEADER, AppServer
 from .window import open_window
 
@@ -92,7 +93,8 @@ def running_instance() -> dict | None:
         return None
     request = urllib.request.Request(f"http://127.0.0.1:{port}/api/ping", headers={KEY_HEADER: key})
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
+        # Never through a system proxy, which would answer for this computer and see the app's key.
+        with direct_opener().open(request, timeout=2) as response:
             if json.loads(response.read()).get("ok"):
                 return {"port": port, "key": key}
     except (OSError, ValueError, urllib.error.URLError):

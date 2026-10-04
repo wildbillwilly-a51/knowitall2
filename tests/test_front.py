@@ -65,6 +65,15 @@ class FrontTests(unittest.TestCase):
         [listed] = self.front.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
         self.assertEqual(-32603, listed["error"]["code"])
 
+    def test_an_empty_batch_gets_one_error(self) -> None:
+        import io
+
+        output = io.BytesIO()
+        self.front.serve(io.BytesIO(b"[]\n[ ]\n"), output)
+        error = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+        self.assertEqual([error, error], [json.loads(line) for line in output.getvalue().splitlines()])
+        self.assertEqual([], self.worker.requests)
+
     def test_the_front_loads_nothing_but_the_standard_library(self) -> None:
         source = Path(__file__).resolve().parents[1] / "src"
         code = ("import sys; import knowitall2.front; "
@@ -118,6 +127,33 @@ class OpenSessionUpdateTests(unittest.TestCase):
         [listed] = self.send({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
         recall = next(tool for tool in listed["result"]["tools"] if tool["name"] == "recall")
         self.assertTrue(recall["description"].startswith("UPDATED "))
+
+
+class WorkingFolderTests(unittest.TestCase):
+    """Agents start the server in the folder they work in, which may hold anyone's code."""
+
+    def test_a_knowitall2_folder_where_the_agent_works_never_runs(self) -> None:
+        from knowitall2.agents import server_launch
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            marker = root / "ran"
+            (root / "knowitall2").mkdir()
+            (root / "knowitall2" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "knowitall2" / "__main__.py").write_text(f"open({str(marker)!r}, 'w').close()\n",
+                                                             encoding="utf-8")
+            launch = server_launch()
+            messages = [INITIALIZE, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+            done = subprocess.run(
+                [launch.command, *launch.args], input="".join(json.dumps(m) + "\n" for m in messages).encode(),
+                capture_output=True, cwd=folder, timeout=120,
+                env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                     "KNOWITALL2_HOME": str(root / "home")},
+            )
+            replies = [json.loads(line) for line in done.stdout.decode("utf-8").splitlines()]
+            self.assertFalse(marker.exists())
+            self.assertEqual("knowitall2", replies[0]["result"]["serverInfo"]["name"])
+            self.assertIn("recall", [tool["name"] for tool in replies[1]["result"]["tools"]])
 
 
 if __name__ == "__main__":

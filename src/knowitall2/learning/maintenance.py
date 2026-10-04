@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from .. import journal, review
-from ..memory import VERIFICATION_STRENGTH, Memory, may_supersede, significant_words
+from ..memory import VERIFICATION_STRENGTH, Memory, may_replace_unasked, same_statement, significant_words
 from ..store import RecordRow
 from .extractor import ClaudeCliExtractor, CodexCliExtractor, ExtractionError, payload_items
 from .state import MAX_FAILURES, LearnerState
@@ -356,22 +356,27 @@ def apply_finding(
     if kind == "duplicate":
         # The model's choice is the most complete copy. It replaces only copies whose
         # evidence is no stronger: weaker evidence never retires a better-verified
-        # memory, and a terser verified copy never retires a fuller one.
+        # memory, and a terser verified copy never retires a fuller one. One of the
+        # user's statements gives way only to the same statement said again; between
+        # two that differ (a rule and a note, or other words), the user decides.
         keep = current[keep_id]
         for item in ids:
             record = current[item]
-            if VERIFICATION_STRENGTH[record.verification] <= VERIFICATION_STRENGTH[keep.verification]:
+            if VERIFICATION_STRENGTH[record.verification] > VERIFICATION_STRENGTH[keep.verification]:
+                outcomes.append("kept (better verified)")
+            elif record.verification == "user_stated" and not same_statement(record, kind=keep.kind, text=keep.text):
+                outcomes.append(_asked(review.ask_conflict(memory, record, keep)))
+                busy.update((record.id, keep.id))
+            else:
                 memory.store.supersede(
                     record.id, keep.id, now=now, reason=f"{REASON_PREFIX}duplicate of [{keep.id}]{detail}",
                 )
                 outcomes.append(changed("merged duplicate", record, keep, reason))
-            else:
-                outcomes.append("kept (better verified)")
     elif kind == "outdated":
         newer = current[keep_id]
         for item in ids:
             older = current[item]
-            if may_supersede(older.verification, newer.verification):
+            if may_replace_unasked(older, kind=newer.kind, text=newer.text, verification=newer.verification):
                 memory.store.supersede(
                     older.id, newer.id, now=now, reason=f"{REASON_PREFIX}outdated by [{newer.id}]{detail}",
                 )

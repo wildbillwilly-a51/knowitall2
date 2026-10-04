@@ -43,3 +43,59 @@ class Clock:
 
     def __call__(self) -> str:
         return self.value
+
+
+class SystemProxy:
+    """A stand-in for a system proxy that answers every request with 502 and notes what it saw.
+
+    Used as a context manager, it is the proxy in the environment, where
+    urllib looks first (as it would look in the Windows settings).
+    """
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        self.seen: list[tuple[str, dict[str, str]]] = []
+        proxy = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self._answer()
+
+            def do_POST(self) -> None:
+                self._answer()
+
+            def _answer(self) -> None:
+                proxy.seen.append((self.requestline, dict(self.headers.items())))
+                self.send_response(502)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> "SystemProxy":
+        from unittest import mock
+
+        self.thread.start()
+        address = f"http://127.0.0.1:{self.server.server_address[1]}"
+        names = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy")
+        environment = {name: value for name, value in os.environ.items() if name not in names}
+        self._environment = mock.patch.dict(os.environ, {**environment, "HTTP_PROXY": address,
+                                                         "HTTPS_PROXY": address}, clear=True)
+        self._environment.start()
+        # urlopen keeps the proxies it found on its first use: let it look again.
+        self._opener = mock.patch("urllib.request._opener", None)
+        self._opener.start()
+        return self
+
+    def __exit__(self, *details: object) -> None:
+        self._opener.stop()
+        self._environment.stop()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)

@@ -19,6 +19,7 @@ from knowitall2.learning import moments
 from knowitall2.learning.cataloguer import CatalogReport
 from knowitall2.learning.learner import LearnReport
 from knowitall2.learning.state import LearnerSettings, LearnerState, save_settings
+from knowitall2.learning.transcripts import read_session
 from knowitall2.memory import Memory
 from knowitall2.paths import database_path
 from knowitall2.store import Store
@@ -78,6 +79,19 @@ class CommitTests(MomentTestCase):
         with self.log_path.open("a", encoding="utf-8") as stream:
             stream.write(tail[20:])
         self.assertEqual(["9f8e7d6"], moments.commits_since_last_look(self.log_path))
+
+    def test_a_look_cut_short_at_a_long_log_is_not_tried_again(self) -> None:
+        # A hook stopped while it reads a long log (the agent's time limit) would otherwise read it again every turn.
+        self.log().write(self.log_path, idle=False)
+        size = self.log_path.stat().st_size
+        with mock.patch.object(moments, "LOOK_AHEAD_BYTES", 100), \
+                mock.patch("knowitall2.learning.transcripts.read_session", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                moments.commits_since_last_look(self.log_path)
+        with mock.patch("knowitall2.learning.transcripts.read_session",
+                        wraps=read_session) as reading:
+            self.assertEqual([], moments.commits_since_last_look(self.log_path))
+        self.assertEqual(size, reading.call_args.kwargs["start"])
 
     def test_the_first_look_skips_what_was_already_learned(self) -> None:
         self.log().write(self.log_path, idle=False)
@@ -339,6 +353,117 @@ class AskedTests(MomentTestCase):
         self.assertEqual([], self.started)
 
 
+class StatCounter:
+    """Counts file status reads, both ``os.stat`` and directory entries' ``stat()``; can make one file vanish."""
+
+    def __init__(self, vanished: Path | None = None) -> None:
+        self.calls = 0
+        self.vanished = os.path.normcase(str(vanished)) if vanished else None
+        self.real_stat, self.real_scandir = os.stat, os.scandir
+        self.seen: dict[str, int] = {}
+
+    def stat(self, path, *arguments, **options):
+        self.calls += 1
+        name = os.path.normcase(os.fsdecode(path))
+        self.seen[name] = self.seen.get(name, 0) + 1
+        if name == self.vanished and self.seen[name] > 1:
+            raise FileNotFoundError(2, "deleted since it was listed", name)  # listed, then deleted
+        return self.real_stat(path, *arguments, **options)
+
+    def scandir(self, path="."):
+        counter = self
+
+        class Entry:
+            def __init__(self, entry) -> None:
+                self._entry = entry
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+            def __fspath__(self) -> str:
+                return self._entry.path
+
+            def stat(self, **options):
+                counter.calls += 1
+                if os.path.normcase(self._entry.path) == counter.vanished:
+                    raise FileNotFoundError(2, "deleted since it was listed", self._entry.path)
+                return self._entry.stat(**options)
+
+        class Listing:
+            def __init__(self) -> None:
+                self._listing = counter.real_scandir(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *details) -> None:
+                self._listing.close()
+
+            def __iter__(self):
+                return (Entry(entry) for entry in self._listing)
+
+            def close(self) -> None:
+                self._listing.close()
+
+        return Listing()
+
+    def __enter__(self) -> "StatCounter":
+        self._patches = [mock.patch("os.stat", self.stat), mock.patch("os.scandir", self.scandir)]
+        for patch in self._patches:
+            patch.start()
+        return self
+
+    def __exit__(self, *details) -> None:
+        for patch in reversed(self._patches):
+            patch.stop()
+
+
+class SessionLogLookupTests(MomentTestCase):
+    def codex_log(self, day: datetime, name: str, cwd: Path, *, age_days: float = 0) -> Path:
+        log = self.root / "codex" / "sessions" / day.strftime("%Y") / day.strftime("%m") / day.strftime("%d") / name
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(json.dumps({"type": "session_meta", "payload": {"id": name, "cwd": str(cwd)}}) + "\n",
+                       encoding="utf-8")
+        if age_days:
+            moment = datetime.now().timestamp() - age_days * 86400
+            os.utime(log, (moment, moment))
+        return log
+
+    def test_finds_the_current_codex_session_among_thousands_without_reading_them_all(self) -> None:
+        elsewhere = self.root / "elsewhere"
+        for number in range(2000):
+            self.codex_log(datetime(2025, 1, 1 + number % 28), f"rollout-{number:05d}.jsonl", elsewhere,
+                           age_days=30 + number / 1000)
+        current = self.codex_log(datetime.now(), "rollout-current.jsonl", self.project)
+        with StatCounter() as counter:
+            self.assertEqual(current, moments.newest_session_log(self.project, "codex", within_minutes=10))
+        self.assertLess(counter.calls, 50)
+
+    def test_finds_a_codex_session_that_began_days_ago_and_remembers_it(self) -> None:
+        for number in range(50):
+            self.codex_log(datetime(2025, 1, 1 + number % 28), f"rollout-{number:05d}.jsonl", self.root / "elsewhere",
+                           age_days=30)
+        started = self.codex_log(datetime.now() - timedelta(days=4), "rollout-long.jsonl", self.project)
+        self.assertEqual(started, moments.newest_session_log(self.project, "codex", within_minutes=10))
+        with StatCounter() as counter:  # the server's next tool call
+            self.assertEqual(started, moments.newest_session_log(self.project, "codex", within_minutes=10))
+        self.assertLess(counter.calls, 10)
+        # A new session in the same folder takes over.
+        newer = self.codex_log(datetime.now(), "rollout-new.jsonl", self.project)
+        os.utime(started, (datetime.now().timestamp() - 60,) * 2)
+        self.assertEqual(newer, moments.newest_session_log(self.project, "codex", within_minutes=10))
+
+    def test_a_log_deleted_while_looking_is_skipped(self) -> None:
+        self.log(commit=False).write(self.log_path, idle=False)
+        gone = self.root / "claude" / "projects" / "C--work-other" / "gone.jsonl"
+        LogBuilder(self.project).user("Earlier work.").write(gone, idle=False)
+        with StatCounter(vanished=gone):
+            self.assertEqual(self.log_path, moments.newest_session_log(self.project, "claude-code"))
+        codex_gone = self.codex_log(datetime.now(), "rollout-gone.jsonl", self.project)
+        with StatCounter(vanished=codex_gone):
+            self.assertIsNone(moments.newest_session_log(self.project, "codex"))
+
+
 class RequestLearningTests(MomentTestCase):
     def run_requests(self, extractor) -> str:
         output = io.StringIO()
@@ -456,6 +581,22 @@ class HookSpeedTests(unittest.TestCase):
         done = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=60,
                               env={**os.environ, "PYTHONPATH": str(source)})
         self.assertEqual("False", done.stdout.strip(), done.stderr)
+
+    def test_with_learning_off_and_no_server_the_turn_and_session_end_hooks_load_no_network_code(self) -> None:
+        heavy = ("urllib.request", "http.client", "knowitall2.connected", "knowitall2.secrets", "sqlite3")
+        source = Path(__file__).resolve().parents[1] / "src"
+        with tempfile.TemporaryDirectory() as folder:
+            environment = {**os.environ, "PYTHONPATH": str(source), "KNOWITALL2_HOME": str(Path(folder) / "data"),
+                           "CLAUDE_CONFIG_DIR": str(Path(folder) / "claude"), "CODEX_HOME": str(Path(folder) / "codex")}
+            payload = json.dumps({"session_id": SESSION, "cwd": folder,
+                                  "transcript_path": str(Path(folder) / "session.jsonl")})
+            for event in ("stop", "session-end"):
+                code = ("import json, sys; from knowitall2.hooks import main; "
+                        f"code = main(['claude-code', '{event}']); "
+                        f"print(json.dumps([code, [name for name in {heavy!r} if name in sys.modules]]))")
+                done = subprocess.run([sys.executable, "-B", "-c", code], input=payload, capture_output=True,
+                                      text=True, timeout=60, env=environment)
+                self.assertEqual([0, []], json.loads(done.stdout), (event, done.stderr))
 
 
 if __name__ == "__main__":

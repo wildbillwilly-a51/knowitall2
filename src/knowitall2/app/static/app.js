@@ -618,7 +618,7 @@ async function runDoctor(event) {
     target.innerHTML = part(html`
       <p class="mt-10"><strong>${result.ok ? 'Everything checks out.' : 'Some checks failed.'}</strong></p>
       <ul class="checks">${result.checks.map((check) => html`
-        <li><span class="${check.ok ? 'ok' : 'bad'}">${check.ok ? '✓' : '✗'}</span><span>${check.name}: ${check.detail}${!check.ok && check.fix ? html`<br><span class="faint">${check.fix}</span>` : ''}</span></li>`)}</ul>`);
+        <li><span class="${!check.ok ? 'bad' : check.fix ? 'warn' : 'ok'}">${!check.ok ? '✗' : check.fix ? '!' : '✓'}</span><span>${check.name}: ${check.detail}${check.fix ? html`<br><span class="faint">${check.fix}</span>` : ''}</span></li>`)}</ul>`);
   } catch (error) {
     target.innerHTML = part(html`<p class="notice bad mt-10">${error.message}</p>`);
   } finally {

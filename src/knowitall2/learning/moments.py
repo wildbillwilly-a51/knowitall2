@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from ..files import write_text_atomic
+from ..files import read_text, write_text_atomic
 from ..paths import data_home
 
 NEWS_KEPT = 40
@@ -33,6 +33,11 @@ ITEM_CHARACTERS = 160
 REQUEST_DAYS = 2
 
 REASONS = ("commit", "session end", "asked", "finished", "catch-up")
+# A look for commits at more of a log than this notes it as read first.
+LOOK_AHEAD_BYTES = 1024 * 1024
+# Where each session's log was found last, by place and agent: newest_session_log looks there first.
+FOUND_LOGS_FILE = "found-logs.json"
+FOUND_LOGS_KEPT = 100
 
 # A command that makes a commit: ``git commit`` (also with ``-C dir`` or
 # ``-c name=value`` first), ``git cherry-pick``, or ``git revert``.
@@ -81,12 +86,21 @@ def commits_since_last_look(transcript: str | os.PathLike[str], *,
     path = Path(transcript)
     marker = learner_dir() / "watch" / f"{key(str(path))}.json"
     try:
-        start = int(json.loads(marker.read_text(encoding="utf-8")).get("offset", 0))
+        start = int(json.loads(read_text(marker)).get("offset", 0))
     except (OSError, ValueError, AttributeError, TypeError):
         start = max(0, first_look_from()) if first_look_from else 0
     try:
-        if path.stat().st_size < start:
+        size = path.stat().st_size
+        if size < start:
             start = 0  # the log was replaced
+        if size - start > LOOK_AHEAD_BYTES:
+            # A long stretch, as at the first look at a long session: noted as read before reading it, so a
+            # hook stopped meanwhile (the agent's time limit) does not try it again every turn. Its commits
+            # are learned with the rest of the session anyway.
+            try:
+                write_text_atomic(marker, json.dumps({"offset": size}) + "\n")
+            except OSError:
+                pass
         session, end = read_session(path, start=start)
     except OSError:
         return []
@@ -136,7 +150,7 @@ def pending_requests() -> list[dict[str, Any]]:
     cutoff = datetime.now(timezone.utc).timestamp() - REQUEST_DAYS * 86400
     for path in paths:
         try:
-            item = json.loads(path.read_text(encoding="utf-8"))
+            item = json.loads(read_text(path))
             stale = path.stat().st_mtime < cutoff
         except (OSError, ValueError):
             path.unlink(missing_ok=True)
@@ -165,26 +179,61 @@ def by_session(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 
 
 def newest_session_log(cwd: str | os.PathLike[str], agent: str | None, *, within_minutes: int = 30) -> Path | None:
-    """The log of the session working in ``cwd`` right now: the newest one there, written recently."""
+    """The log of the session working in ``cwd`` right now: the newest one there, written recently.
 
-    from .transcripts import claude_code_logs, codex_logs, session_folder
+    It looks first where that log would be: today's and yesterday's Codex
+    date folders, and the folder of the log found last for this place and
+    agent (a session asks on every tool call, each in a fresh process, so
+    that is kept in a file). Only when those have none does it go through
+    every log, as for a session that began days ago.
+    """
 
-    if agent == "codex":
-        logs = codex_logs()
-    elif agent == "claude-code":
-        logs = claude_code_logs()
-    else:
-        from .transcripts import session_logs
+    from .transcripts import claude_code_listing, codex_listing, folder_listing, recent_codex_listing
 
-        logs = session_logs()
     wanted = _same_folder(str(cwd))
     cutoff = datetime.now(timezone.utc).timestamp() - within_minutes * 60
-    for log in logs:  # newest first
-        try:
-            if log.stat().st_mtime < cutoff:
-                return None
-        except OSError:
-            continue
+    place = key(f"{agent}\n{wanted}")
+    found_before = _found_logs().get(place)
+    likely = recent_codex_listing() if agent in ("codex", None) else []
+    if isinstance(found_before, str):
+        likely += folder_listing(Path(found_before).parent)
+    found = _newest_here(sorted(set(likely), reverse=True), wanted, cutoff)
+    if found is None:
+        listing: list[tuple[float, Path]] = []
+        if agent in ("codex", None):
+            listing += codex_listing()
+        if agent in ("claude-code", None):
+            listing += claude_code_listing()
+        found = _newest_here(sorted(listing, key=lambda item: item[0], reverse=True), wanted, cutoff)
+    if found is not None and str(found) != found_before:
+        _remember_found(place, found)
+    return found
+
+
+def _found_logs() -> dict[str, Any]:
+    try:
+        found = json.loads((learner_dir() / FOUND_LOGS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def _remember_found(place: str, log: Path) -> None:
+    found = {name: value for name, value in _found_logs().items() if name != place}
+    found[place] = str(log)
+    try:
+        write_text_atomic(learner_dir() / FOUND_LOGS_FILE,
+                          json.dumps(dict(list(found.items())[-FOUND_LOGS_KEPT:])) + "\n")
+    except OSError:
+        pass  # it is only a shortcut
+
+
+def _newest_here(listing: list[tuple[float, Path]], wanted: str, cutoff: float) -> Path | None:
+    from .transcripts import session_folder
+
+    for modified, log in listing:  # newest first
+        if modified < cutoff:
+            return None
         folder = session_folder(log)
         if folder and _same_folder(folder) == wanted:
             return log
@@ -212,7 +261,7 @@ def read_now() -> dict[str, Any] | None:
     from .state import RunLock
 
     try:
-        state = json.loads((learner_dir() / "now.json").read_text(encoding="utf-8"))
+        state = json.loads(read_text(learner_dir() / "now.json"))
     except (OSError, ValueError):
         return None
     if not isinstance(state, dict) or not RunLock().busy():
@@ -246,7 +295,7 @@ def news() -> list[dict[str, Any]]:
     """Recent news, newest first."""
 
     try:
-        data = json.loads((learner_dir() / "news.json").read_text(encoding="utf-8"))
+        data = json.loads(read_text(learner_dir() / "news.json"))
     except (OSError, ValueError):
         return []
     entries = data.get("entries") if isinstance(data, dict) else None

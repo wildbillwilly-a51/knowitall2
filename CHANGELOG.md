@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.9.0 (2026-10-03)
+
+Fixes from an outside review of the whole program. Every finding was
+checked against the code, and each fix came with a test.
+
+- **Secrets are caught in many more shapes.** Passwords and tokens under any
+  key name (`DB_PASSWORD=`, `"password": "..."`), whole private keys,
+  credentials in addresses, command-line password options, and more
+  services' tokens are kept out of memory, the activity log, and the server.
+  `doctor` lists older memories that now look like they hold a secret, and
+  changes nothing itself.
+- **Only you change your own statements.** An agent that asks to forget or
+  replace something you said now asks you instead, and learning never
+  replaces your statements on its own. `knowitall2 remember` saves what it
+  is given as inferred unless `--source user` is passed.
+- **Learning trusts what it saw, not what it read.** A memory counts as
+  observed only when it rests on what a command printed. What came from
+  documents, searches, other tools, or helper agents stays unverified, and
+  what is learned from a project's documents stays with that project. A
+  memory said to be in your own words must say what you said.
+- **Sharing across computers never loses a change.** A sync cut short, a
+  memory that arrives before its project, a reconnect, a database put back
+  from an older copy, or an edit made during a sync no longer drops
+  anything, and a computer's first upload finishes later if it is
+  interrupted.
+- **On Windows, nothing stops on an odd path or a busy file.** Hooks work in
+  folders with accented names and never fail a session. Learning never runs
+  through `cmd.exe`, so a Claude Code installed with npm gets its whole
+  instructions, and an engine that hangs is stopped on time. Files another
+  process is reading or replacing are waited for, and the learner's and
+  sync's locks are free the moment their holder ends.
+- **Setup leaves your files as they were.** Settings files keep their line
+  endings, indentation, and escaping, and links stay links. Setup checks
+  that it can finish before it changes anything. Codex hooks are left out,
+  and `doctor` says why, where no Windows command can run them safely.
+  `doctor` checks only the agents you set up, and reads the memory store
+  without changing it.
+- **The server is harder to misuse.** A HEAD request no longer breaks the
+  next request on the same connection. Sign-in limits hold under many tries
+  at once. After an admin reset, the setup page needs a one-time code from
+  the server's log. New admin passwords are hashed at a higher cost. A
+  computer whose clock runs ahead no longer wins every disagreement, and
+  backups keep one copy for each of the last seven days.
+- **Smaller fixes.** Old activity and use records are tidied daily, whether
+  learning is on or not; the current chat's log is found quickly however
+  many logs there are; requests to this computer and its own network skip
+  the system proxy; output piped from the command line is UTF-8; and
+  `update` runs with the Python KnowItAll2 was set up with.
+
 ## 0.8.4 (2026-10-02)
 
 - **KnowItAll2 is public, as source-available software.** Anyone may install

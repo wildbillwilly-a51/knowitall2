@@ -1,14 +1,26 @@
 """The server's admin account and its page: setup, sign-in, recovery, the compose reset, and running agents."""
 
+import base64
+import hashlib
 import http.client
+import io
 import json
+import os
+import re
 import tempfile
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
+import _support  # noqa: F401  (keeps the journal out of the real data home)
+
+from knowitall2 import journal
 from knowitall2.remote import RemoteClient
-from knowitall2.server import accounts, admin, open_store
+from knowitall2.server import accounts, admin, open_store, web
 from knowitall2.server.admin_routes import COOKIE, FORM_HEADER
 from knowitall2.server.web import JOIN_FAILURES_PER_ADDRESS, KnowItAll2Server
 
@@ -91,6 +103,32 @@ class AdminAccountTests(unittest.TestCase):
         self.assertIsNotNone(admin.admin(self.store))
         self.assertTrue(admin.reset_from_setting(self.store, "2026-10-02", now=NOW))
 
+    def test_new_passwords_use_a_cost_that_older_versions_can_still_check(self) -> None:
+        stored = admin.hash_password(PASSWORD)
+        _, n, r, p, salt, digest = stored.split("$")
+        n, r, p = int(n), int(r), int(p)
+        self.assertEqual((n, r, p), (2 ** 14, 8, 5))
+        # What scrypt needs (OpenSSL's count), within the 64 MiB limit that 0.8.4 and earlier check with.
+        self.assertLessEqual(128 * r * (n + p + 2), 64 * 1024 * 1024)
+        checked = hashlib.scrypt(PASSWORD.encode("utf-8"), salt=base64.b64decode(salt), n=n, r=r, p=p, dklen=32,
+                                 maxmem=64 * 1024 * 1024)
+        self.assertEqual(checked, base64.b64decode(digest))
+
+    def test_a_password_kept_at_the_old_cost_still_works_and_is_upgraded_on_sign_in(self) -> None:
+        admin.create(self.store, "keeper", PASSWORD, now=NOW)
+        salt = b"0123456789abcdef"
+        digest = hashlib.scrypt(PASSWORD.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32,
+                                maxmem=64 * 1024 * 1024)
+        old = f"scrypt$16384$8$1${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
+        self.store.connection.execute("UPDATE server_admin SET password_hash = ?", (old,))
+        with self.assertRaises(admin.AdminError):
+            admin.sign_in(self.store, "keeper", "not the password", now=NOW)
+        stored = lambda: self.store.connection.execute("SELECT password_hash FROM server_admin").fetchone()[0]  # noqa: E731
+        self.assertEqual(stored(), old)
+        admin.sign_in(self.store, "keeper", PASSWORD, now=NOW)
+        self.assertTrue(stored().startswith("scrypt$16384$8$5$"))
+        admin.sign_in(self.store, "keeper", PASSWORD, now=NOW)
+
     def test_passwords_are_kept_only_as_hashes(self) -> None:
         code = admin.create(self.store, "keeper", PASSWORD, now=NOW)
         stored = self.store.connection.execute("SELECT password_hash, recovery_hash FROM server_admin").fetchone()
@@ -107,10 +145,11 @@ class Browser:
         self.cookie: str | None = None
         self.form: str | None = None
 
-    def request(self, method: str, path: str, body=None, *, origin: str | None = "same", form: bool = True):
+    def request(self, method: str, path: str, body=None, *, origin: str | None = "same", form: bool = True,
+                extra: dict[str, str] | None = None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         host = f"127.0.0.1:{self.port}"
-        headers = {"Host": host}
+        headers = {"Host": host, **(extra or {})}
         if origin == "same":
             headers["Origin"] = f"http://{host}"
         elif origin is not None:
@@ -162,7 +201,8 @@ class AdminPageTests(unittest.TestCase):
         self.stop()
 
     def set_up_admin(self) -> str:
-        status, data, _ = self.browser.request("POST", "/admin/api/setup", {"username": "keeper", "new_password": PASSWORD})
+        status, data, _ = self.browser.request("POST", "/admin/api/setup", {
+            "username": "keeper", "new_password": PASSWORD, "setup_code": self.server.setup_code})
         self.assertEqual(status, 200, data)
         return data["recovery_code"]
 
@@ -255,6 +295,53 @@ class AdminPageTests(unittest.TestCase):
         status, _, _ = guesser.request("POST", "/admin/api/sign-in", {"username": "keeper", "password": PASSWORD})
         self.assertEqual(status, 429)
 
+    def test_wrong_passwords_sent_at_once_are_checked_at_most_the_limit(self) -> None:
+        self.set_up_admin()
+        checked = []
+        check_password = admin.check_password
+
+        def slowly(password, stored):
+            checked.append(password)
+            time.sleep(0.3)  # every request arrives while the first ones are still being checked
+            return check_password(password, stored)
+
+        def guess(number: int) -> int:
+            return Browser(self.server.port).request(
+                "POST", "/admin/api/sign-in", {"username": "keeper", "password": f"guess {number}"})[0]
+
+        with mock.patch.object(admin, "check_password", side_effect=slowly):
+            with ThreadPoolExecutor(20) as pool:
+                statuses = list(pool.map(guess, range(20)))
+        self.assertLessEqual(len(checked), JOIN_FAILURES_PER_ADDRESS)
+        self.assertLessEqual(statuses.count(400), JOIN_FAILURES_PER_ADDRESS)
+        self.assertLessEqual(set(statuses), {400, 429, 503})
+
+    def test_a_server_busy_checking_passwords_says_so_and_counts_no_failure(self) -> None:
+        self.set_up_admin()
+        taken = threading.BoundedSemaphore(1)
+        taken.acquire()  # every place for a password check is in use
+        with mock.patch.object(admin, "_scrypt_slots", taken), mock.patch.object(admin, "SCRYPT_WAIT_SECONDS", 0.1):
+            for _ in range(JOIN_FAILURES_PER_ADDRESS):
+                status, data, headers = Browser(self.server.port).request(
+                    "POST", "/admin/api/sign-in", {"username": "keeper", "password": PASSWORD})
+                self.assertEqual(status, 503)
+                self.assertIn("busy", data["error"])
+                self.assertIn("Retry-After", headers)
+        status, _, _ = Browser(self.server.port).request(
+            "POST", "/admin/api/sign-in", {"username": "keeper", "password": PASSWORD})
+        self.assertEqual(status, 200)
+
+    def test_an_address_forwarded_by_a_proxy_the_server_does_not_trust_is_noted_once(self) -> None:
+        self.set_up_admin()
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"KNOWITALL2_HOME": home}):
+            for _ in range(2):
+                journal._last_problem.clear()  # the server notes it once, not merely the journal
+                self.browser.request("POST", "/admin/api/sign-in", {"username": "keeper", "password": PASSWORD},
+                                     extra={"X-Forwarded-For": "203.0.113.9"})
+            notes = [item for item in journal.read_problems() if "KNOWITALL2_TRUSTED_PROXY" in item["message"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("X-Forwarded-For", notes[0]["message"])
+
     def test_recovering_with_the_code(self) -> None:
         code = self.set_up_admin()
         stranger = Browser(self.server.port)
@@ -273,12 +360,62 @@ class AdminPageTests(unittest.TestCase):
         state = browser.request("GET", "/admin/api/state")[1]
         self.assertEqual((state["setup_needed"], state["reset_reminder"]), (True, True))
         self.assertTrue(self.server.admin_was_reset)
-        status, _, _ = browser.request("POST", "/admin/api/setup", {"username": "keeper", "new_password": PASSWORD})
+        status, _, _ = browser.request("POST", "/admin/api/setup", {"username": "keeper", "new_password": PASSWORD,
+                                                                    "setup_code": self.server.setup_code})
         self.assertEqual(status, 200)
         self.stop()
         self.start(reset="2026-10-01")
         self.assertFalse(self.server.admin_was_reset)
         self.assertFalse(Browser(self.server.port).request("GET", "/admin/api/state")[1]["setup_needed"])
+
+    def test_after_a_reset_only_the_setup_code_from_the_servers_log_sets_up_the_admin(self) -> None:
+        self.set_up_admin()
+        self.stop()
+        started = []
+
+        class Started(KnowItAll2Server):
+            def __init__(self, *args, **options) -> None:
+                super().__init__(*args, **options)
+                started.append(self)
+
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.object(web, "KnowItAll2Server", Started), \
+                mock.patch.dict(os.environ, {"KNOWITALL2_HOME": str(self.home), "KNOWITALL2_RESET_ADMIN": "2026-10-03"}):
+            self.thread = threading.Thread(target=web.run, args=("127.0.0.1", 0), daemon=True)
+            self.thread.start()
+            for _ in range(200):  # what `docker compose logs` shows
+                if "setup code: " in output.getvalue():
+                    break
+                time.sleep(0.05)
+        self.server = started[0]
+        code = re.search(r"setup code: ([A-Z2-9]{4}(?:-[A-Z2-9]{4}){4})", output.getvalue()).group(1)
+        self.assertEqual(code, self.server.setup_code)
+        port = self.server.port
+        wanted = {"username": "intruder", "new_password": PASSWORD}
+        refused = [
+            Browser(port).request("POST", "/admin/api/setup", wanted, origin=None),
+            Browser(port).request("POST", "/admin/api/setup", wanted, origin=f"http://evil.example:{port}",
+                                  extra={"Host": f"evil.example:{port}"}),
+            Browser(port).request("POST", "/admin/api/setup", {**wanted, "setup_code": "AAAA-BBBB-CCCC-DDDD-EEEE"}),
+        ]
+        self.assertEqual([status for status, _, _ in refused], [403, 403, 403])
+        self.assertIn("setup code", refused[0][1]["error"])
+        status, _, _ = Browser(port).request("POST", "/admin/api/setup", {
+            "username": "keeper", "new_password": PASSWORD, "setup_code": code.lower().replace("-", " ")})
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.server.setup_code)
+        status, data, _ = Browser(port).request("POST", "/admin/api/setup", {**wanted, "setup_code": code})
+        self.assertEqual(status, 400)
+        self.assertIn("already set up", data["error"])
+
+    def test_a_server_with_an_admin_has_no_setup_code(self) -> None:
+        self.set_up_admin()
+        self.stop()
+        self.start()
+        self.assertIsNone(self.server.setup_code)
+        status, _, _ = Browser(self.server.port).request(
+            "POST", "/admin/api/setup", {"username": "me", "new_password": PASSWORD, "setup_code": "AAAA"})
+        self.assertEqual(status, 400)
 
     def test_downloading_a_backup(self) -> None:
         self.set_up_admin()

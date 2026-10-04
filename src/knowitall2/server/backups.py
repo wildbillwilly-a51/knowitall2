@@ -1,7 +1,10 @@
-"""The server's daily backup: a consistent copy made with SQLite's backup method, the last seven kept.
+"""The server's daily backup: a consistent copy made with SQLite's backup method.
 
-Getting the backups off the server's computer is the user's own backup
-routine; they live in ``backups/`` in the data home (the container's volume).
+Kept: the newest copy of each of the last seven days (UTC) that have one,
+and the newest three whatever their day, so copies made after bursts of
+changes never push out the daily ones. Getting the backups off the server's
+computer is the user's own backup routine; they live in ``backups/`` in the
+data home (the container's volume).
 """
 
 from __future__ import annotations
@@ -10,7 +13,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-KEEP = 7
+KEEP_DAYS = 7
+KEEP_NEWEST = 3
 EVERY = timedelta(hours=24)
 _PREFIX = "knowitall2-"
 
@@ -41,8 +45,20 @@ def due(folder: Path, *, now: datetime) -> bool:
     return moment is None or now - moment >= EVERY
 
 
-def make(database: Path, folder: Path, *, now: datetime, keep: int = KEEP) -> Path:
-    """Copy the database into ``folder`` and keep only the newest ``keep`` copies."""
+def _kept(found: list[Path]) -> set[Path]:
+    kept, days = set(found[:KEEP_NEWEST]), set()
+    for path in found:  # newest first, so each day's first is its newest
+        moment = made_at(path)
+        if moment is None:
+            kept.add(path)  # not named like a backup this server made: left alone
+        elif moment.date() not in days and len(days) < KEEP_DAYS:
+            days.add(moment.date())
+            kept.add(path)
+    return kept
+
+
+def make(database: Path, folder: Path, *, now: datetime) -> Path:
+    """Copy the database into ``folder``; then remove the copies no longer kept (see the module)."""
 
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / f"{_PREFIX}{now.astimezone(timezone.utc):%Y%m%d-%H%M%S}.db"
@@ -55,6 +71,9 @@ def make(database: Path, folder: Path, *, now: datetime, keep: int = KEEP) -> Pa
         copy.close()
         origin.close()
     partial.replace(target)
-    for old in backups(folder)[keep:]:
-        old.unlink(missing_ok=True)
+    found = backups(folder)
+    kept = _kept(found)
+    for old in found:
+        if old not in kept:
+            old.unlink(missing_ok=True)
     return target

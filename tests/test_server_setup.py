@@ -129,8 +129,9 @@ class ServerSetupTests(unittest.TestCase):
                                             "--replace-memories")
         self.assertEqual(code, 0, errors)
         self.assertIn("set this computer's memories aside", output)
-        backup = database_path().with_name("knowitall2.pre-server-backup.db")
-        self.assertTrue(backup.exists())
+        backups = list(database_path().parent.glob("knowitall2.pre-server-backup-*.db"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn(str(backups[0]), output)
         store = Store.open(database_path())
         try:
             self.assertEqual(connected.local_memories(store), 0)

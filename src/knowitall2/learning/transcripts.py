@@ -2,9 +2,10 @@
 
 Only the user's own messages, the assistant's visible text, and tool calls
 with their results are kept. Thinking, harness attachments and meta records,
-system reminders, task notifications, side-chain (helper agent) records, and
-KnowItAll2's own tool calls are dropped. Reports that helper agents deliver
-through the user channel are labeled as agent reports, never as user words.
+system reminders, task notifications, compaction summaries, side-chain
+(helper agent) records, and KnowItAll2's own tool calls are dropped. Reports
+that helper agents deliver through the user channel are labeled as agent
+reports, never as user words.
 Codex helper-agent and non-interactive sessions are not learned from.
 """
 
@@ -14,8 +15,9 @@ import json
 import os
 import re
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 _HARNESS_MARKERS = (
@@ -27,6 +29,9 @@ _HARNESS_MARKERS = (
     "Caveat: The messages below were generated",
 )
 _AGENT_REPORT_MARKERS = ("[Subagent hand-back]", "<agent-message", "Another Claude session sent a message")
+# A compacted chat goes on from a summary written as a user message. The summary can repeat anything the chat
+# read, so it is never the user's own words; what it summarizes is earlier in the same log.
+_COMPACTION_SUMMARY = "This session is being continued from a previous conversation"
 _SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
 _PATH_ONLY_TOOLS = frozenset({"Read", "Edit", "Write", "NotebookEdit", "MultiEdit"})
 # Files whose contents are knowledge in words, not code or data.
@@ -72,11 +77,17 @@ def claude_code_log_root() -> Path:
 def claude_code_logs(root: Path | None = None) -> list[Path]:
     """Main session logs, newest first. Helper-agent logs live in subfolders and are skipped."""
 
+    return [path for _, path in claude_code_listing(root)]
+
+
+def claude_code_listing(root: Path | None = None) -> list[tuple[float, Path]]:
+    """Each main session log with the time it was last written, newest first."""
+
     folder = root if root is not None else claude_code_log_root()
-    if not folder.is_dir():
-        return []
-    logs = [path for path in folder.glob("*/*.jsonl") if path.is_file()]
-    return sorted(logs, key=lambda path: path.stat().st_mtime, reverse=True)
+    found: list[tuple[float, Path]] = []
+    for project in _scan(folder)[1]:
+        found += _scan(project, _is_claude_code_log)[0]
+    return _newest_first(found)
 
 
 def codex_log_root() -> Path:
@@ -88,16 +99,49 @@ def codex_log_root() -> Path:
 def codex_logs(root: Path | None = None) -> list[Path]:
     """Codex session logs (``sessions/YYYY/MM/DD/rollout-*.jsonl``), newest first."""
 
+    return [path for _, path in codex_listing(root)]
+
+
+def codex_listing(root: Path | None = None) -> list[tuple[float, Path]]:
+    """Each Codex session log with the time it was last written, newest first."""
+
+    found: list[tuple[float, Path]] = []
+    waiting = [root if root is not None else codex_log_root()]
+    while waiting:
+        files, folders = _scan(waiting.pop(), _is_rollout)
+        found += files
+        waiting += folders
+    return _newest_first(found)
+
+
+def recent_codex_listing(root: Path | None = None, *, days: int = 2) -> list[tuple[float, Path]]:
+    """The Codex logs in the date folders of the last ``days`` days, newest first.
+
+    Codex files each session under the day it started, so this finds a
+    current session without reading every log there ever was; a session that
+    began earlier is only in ``codex_listing``.
+    """
+
     folder = root if root is not None else codex_log_root()
-    if not folder.is_dir():
-        return []
-    return _newest_first(path for path in folder.rglob("rollout-*.jsonl") if path.is_file())
+    now = datetime.now(timezone.utc)
+    days_wanted = {moment.strftime("%Y/%m/%d") for back in range(days)
+                   for moment in (now - timedelta(days=back), (now - timedelta(days=back)).astimezone())}
+    found: list[tuple[float, Path]] = []
+    for day in sorted(days_wanted):
+        found += _scan(folder.joinpath(*day.split("/")), _is_rollout)[0]
+    return _newest_first(found)
+
+
+def folder_listing(folder: Path) -> list[tuple[float, Path]]:
+    """The session logs directly in ``folder`` with the time each was last written, newest first."""
+
+    return _newest_first(_scan(folder, lambda name: name.endswith(".jsonl"))[0])
 
 
 def session_logs() -> list[Path]:
     """Every agent's session logs, newest first."""
 
-    return _newest_first([*claude_code_logs(), *codex_logs()])
+    return [path for _, path in _newest_first([*claude_code_listing(), *codex_listing()])]
 
 
 def is_codex_log(path: Path) -> bool:
@@ -109,14 +153,41 @@ def read_session(path: Path, *, start: int = 0) -> tuple[Session, int]:
     return reader(path, start=start)
 
 
-def _newest_first(paths) -> list[Path]:
-    def modified(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
+def _is_claude_code_log(name: str) -> bool:
+    return name.endswith(".jsonl")
 
-    return sorted(paths, key=modified, reverse=True)
+
+def _is_rollout(name: str) -> bool:
+    return name.startswith("rollout-") and name.endswith(".jsonl")
+
+
+def _scan(folder: Path, wanted: Callable[[str], bool] | None = None) -> tuple[list[tuple[float, Path]], list[Path]]:
+    """The wanted files in ``folder`` with the time each was last written, and its subfolders.
+
+    One directory listing gives both; on Windows it also carries each file's
+    times, so this reads no file. A file deleted meanwhile is left out, and a
+    missing or unreadable folder is empty.
+    """
+
+    files: list[tuple[float, Path]] = []
+    folders: list[Path] = []
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):  # a linked folder could lead back here
+                        folders.append(Path(entry.path))
+                    elif wanted is not None and wanted(entry.name) and entry.is_file():
+                        files.append((entry.stat().st_mtime, Path(entry.path)))
+                except OSError:
+                    continue  # deleted since the folder was listed
+    except OSError:
+        pass
+    return files, folders
+
+
+def _newest_first(found: list[tuple[float, Path]]) -> list[tuple[float, Path]]:
+    return sorted(found, key=lambda item: item[0], reverse=True)
 
 
 def read_claude_code_session(path: Path, *, start: int = 0) -> tuple[Session, int]:
@@ -151,7 +222,7 @@ def _consume(record: dict[str, Any], session: Session, pending: dict[str, tuple[
     kind = record.get("type")
     if kind not in {"user", "assistant"} or record.get("isSidechain") or record.get("isMeta"):
         return
-    if record.get("isApiErrorMessage"):
+    if record.get("isApiErrorMessage") or record.get("isCompactSummary") or record.get("isVisibleInTranscriptOnly"):
         return
     if session.cwd is None and isinstance(record.get("cwd"), str):
         session.cwd = record["cwd"]
@@ -194,7 +265,7 @@ def _consume(record: dict[str, Any], session: Session, pending: dict[str, tuple[
 
 def _add_user_text(session: Session, value: object) -> None:
     text = _clean(value)
-    if not text or any(marker in text for marker in _HARNESS_MARKERS):
+    if not text or any(marker in text for marker in _HARNESS_MARKERS) or text.startswith(_COMPACTION_SUMMARY):
         return
     if any(marker in text for marker in _AGENT_REPORT_MARKERS):
         session.events.append(Event("agent_report", text))
@@ -350,7 +421,7 @@ def _codex_event(item: dict[str, Any]) -> Event | None:
             return None
         if text.startswith(_CODEX_DELEGATION):
             return Event("agent_report", text)
-        if text.startswith("<") or any(marker in text for marker in _HARNESS_MARKERS):
+        if text.startswith(("<", _COMPACTION_SUMMARY)) or any(marker in text for marker in _HARNESS_MARKERS):
             return None  # injected context, such as <environment_context>
         return Event("user", text)
     if kind == "AgentMessage":

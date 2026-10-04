@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -44,7 +45,7 @@ class DownloadTests(unittest.TestCase):
         git = FakeGit()
         self.assertEqual(0, self.run_update(git)[0])
         finish, options = git.commands[-1]
-        self.assertEqual(["-m", "knowitall2", "update", "--finish", "--previous", __version__], finish[2:8])
+        self.assertEqual(["-P", "-m", "knowitall2", "update", "--finish", "--previous", __version__], finish[2:9])
         self.assertNotIn("--unchanged", finish)
         self.assertTrue(options["env"]["PYTHONPATH"].startswith(str(Path("C:/kia2") / "src")))
         git = FakeGit(heads=("aaa", "aaa"))
@@ -165,10 +166,99 @@ class FinishTests(unittest.TestCase):
         self.assertIn("Close Codex, then run the update again", text)
         self.assertIn(str(update.launcher_path()), text)
 
+    def test_hook_launchers_are_refreshed_while_codex_is_open_with_nothing_to_trust_again(self) -> None:
+        from knowitall2.agents import claude_code, codex
+
+        launchers = [claude_code.hook_launcher_path(), codex.hook_launcher_path()]
+        for launcher in launchers:
+            launcher.write_text("# an older launcher\n", encoding="utf-8")
+        settings = [self.root / "codex" / "config.toml", self.root / "codex" / "hooks.json",
+                    self.root / "claude" / "settings.json"]
+        before = [path.read_bytes() for path in settings]
+        text = self.finish(codex_running=True)
+        self.assertNotIn("# an older launcher", "".join(path.read_text(encoding="utf-8") for path in launchers))
+        self.assertTrue(all(check.ok for name in ("codex", "claude-code")
+                            for check in adapter_for(name).checks(server_launch())))
+        # The launchers are KnowItAll2's own files: the agents' hook commands stay as they were.
+        self.assertEqual(before, [path.read_bytes() for path in settings])
+        self.assertIn("Codex: updated (refreshed the KnowItAll2 session hook launcher", text)
+        self.assertNotIn("Close Codex", text)
+        self.assertNotIn(update.TRUST_HOOKS, text)
+        self.assertNotIn("so it keeps the new settings", text)
+
+    def test_changed_hooks_are_trusted_again_in_codex(self) -> None:
+        (self.root / "codex" / "hooks.json").unlink()
+        text = self.finish(codex_running=False)
+        self.assertIn("added the KnowItAll2 session hooks", text)
+        self.assertIn(update.TRUST_HOOKS, text)
+
+    def test_hooks_no_windows_command_can_run_are_taken_out_with_nothing_to_trust(self) -> None:
+        from knowitall2.agents import codex
+
+        hooks = self.root / "codex" / "hooks.json"
+        reason = r"C:\Users\R&D\Python312\python.exe contains a character (such as ', &, $ or %)"
+        self.assertIn("codex_session_start", hooks.read_text(encoding="utf-8"))
+        with mock.patch.object(codex, "hooks_unavailable", return_value=reason):
+            # Hooks registered by an earlier version cannot run as they are: the update takes them out.
+            text = self.finish(codex_running=False)
+            self.assertNotIn("codex_session_start", hooks.read_text(encoding="utf-8") if hooks.exists() else "")
+            self.assertIn(f"did not add the KnowItAll2 session hooks: {reason}", text)
+            self.assertNotIn(update.TRUST_HOOKS, text)
+            # With none registered, a later update that sets Codex up again registers none either.
+            self.outdate_skill(self.root / "codex")
+            text = self.finish(codex_running=False)
+            self.assertIn(f"did not add the KnowItAll2 session hooks: {reason}", text)
+            self.assertNotIn(update.TRUST_HOOKS, text)
+            self.assertFalse(hooks.exists() and "codex_session_start" in hooks.read_text(encoding="utf-8"))
+
     def test_the_update_script_runs_this_installation(self) -> None:
         text = update.render_launcher()
         self.assertIn('main(["update"])', text)
         compile(text, "update.py", "exec")
+
+    def run_script(self, *, setup_python: Path, running: str) -> tuple[mock.Mock, mock.Mock, str]:
+        """Run the generated update script in this process, as if started by ``running``."""
+
+        with mock.patch("knowitall2.agents.base.console_python", return_value=str(setup_python)):
+            update.write_launcher()
+        script = update.launcher_path()
+        output = io.StringIO()
+        path = list(sys.path)
+        with redirect_stdout(output), mock.patch.object(sys, "executable", running), \
+                mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 3)) as relaunch, \
+                mock.patch("knowitall2.cli.main", return_value=0) as main, \
+                self.assertRaises(SystemExit) as exited:
+            exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"),
+                 {"__name__": "__main__", "__file__": str(script)})
+        sys.path[:] = path
+        self.assertIn(exited.exception.code, (0, 3))
+        return relaunch, main, output.getvalue()
+
+    def test_the_update_script_runs_with_the_python_it_was_set_up_with(self) -> None:
+        setup_python = self.root / "Python 312" / "python.exe"
+        setup_python.parent.mkdir()
+        setup_python.write_text("", encoding="utf-8")
+        relaunch, main, output = self.run_script(setup_python=setup_python, running=str(self.root / "conda.exe"))
+        self.assertEqual([str(setup_python), str(update.launcher_path())], relaunch.call_args.args[0][:2])
+        main.assert_not_called()
+        self.assertIn(f"with {setup_python}, the Python KnowItAll2 was set up with", output)
+        # Started by that Python, it runs the update itself.
+        relaunch, main, output = self.run_script(setup_python=setup_python, running=str(setup_python))
+        relaunch.assert_not_called()
+        main.assert_called_once_with(["update"])
+        self.assertEqual("", output)
+
+    def test_the_update_script_carries_on_when_that_python_is_gone(self) -> None:
+        gone = self.root / "gone" / "python.exe"
+        relaunch, main, output = self.run_script(setup_python=gone, running=str(self.root / "conda.exe"))
+        relaunch.assert_not_called()
+        main.assert_called_once_with(["update"])
+        self.assertIn(f"({gone}) is no longer there, so this update uses {self.root / 'conda.exe'}", output)
+
+    def test_the_update_command_names_the_python_it_was_set_up_with(self) -> None:
+        with mock.patch("knowitall2.agents.base.console_python", return_value="C:\\Py 312\\python.exe"):
+            self.assertIn("Py 312", update.update_command())
+            self.assertIn(str(update.launcher_path()), update.update_command())
 
     def test_whats_new_comes_from_the_changelog(self) -> None:
         notes = update.changelog_since("0.2.0")

@@ -6,6 +6,7 @@ import hashlib
 import json
 import platform
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,12 @@ CREATE TABLE IF NOT EXISTS usage (
     result_ids TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_by_time ON usage (at);
+CREATE TABLE IF NOT EXISTS usage_totals (
+    record_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    uses INTEGER NOT NULL,
+    PRIMARY KEY (record_id, operation)
+);
 CREATE TABLE IF NOT EXISTS questions (
     seq INTEGER PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,
@@ -231,7 +238,7 @@ def _synced(name: str, key: str, columns: str, *, quiet: str = "", stamp: str, j
     )
 
 
-# Parents before children, so a full copy can be sent in this order.
+# Parents before children, so a computer's whole memory is noted, and sent, in this order when it connects.
 SYNCED_TABLES: dict[str, SyncedTable] = {table.name: table for table in (
     _synced("projects", "id", "id, name, remote, created_at, last_seen_at", quiet="created_at, last_seen_at",
             stamp="last_seen_at"),
@@ -282,6 +289,11 @@ def _change_triggers() -> str:
     return "\n".join(statements)
 
 
+# Rule: any change to these triggers (a synced table, or its columns or quiet columns, added, removed or
+# changed) bumps SCHEMA_VERSION with a migration, even an empty one. Each process rebuilds the triggers when
+# their hash differs from the one in the database, so without the bump an older process (a learner or an app
+# still running across an update) would put its own triggers back, and the two versions would replace each
+# other's triggers back and forth; the bump makes the older process refuse the newer database instead.
 _CHANGE_TRIGGERS = _change_triggers()
 _TRIGGERS_VERSION = hashlib.sha256(_CHANGE_TRIGGERS.encode("utf-8")).hexdigest()[:16]
 TRIGGERS_KEY = "changes.triggers"
@@ -301,8 +313,95 @@ _COLUMNS = (
 _FROM = "FROM records r LEFT JOIN projects p ON p.id = r.project_id"
 
 
+_WAL_ATTEMPTS = 10
+
+
+def _busy(exc: sqlite3.Error) -> bool:
+    """Whether SQLite gave up because another connection held the lock it needed."""
+
+    return getattr(exc, "sqlite_errorcode", 0) & 0xFF == sqlite3.SQLITE_BUSY
+
+
 class StoreError(RuntimeError):
-    """The local memory store could not be opened or used."""
+    """The local memory store could not be opened or used.
+
+    ``reason`` says why, so the fix offered can fit: ``newer_schema`` (a newer
+    KnowItAll2 upgraded it), ``no_fts5`` (this Python's SQLite lacks full-text
+    search), ``busy`` (another process held it too long), ``unreadable`` (not
+    a database, or damaged), or ``io`` (it could not be opened, read or
+    written: permissions, disk space, or the path).
+    """
+
+    def __init__(self, message: str, *, reason: str = "io") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def error_reason(exc: sqlite3.Error) -> str:
+    """The :class:`StoreError` reason for an SQLite failure."""
+
+    if "fts5" in str(exc).lower():
+        return "no_fts5"
+    code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+    if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return "busy"
+    if code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        return "unreadable"
+    return "io"
+
+
+def _newer_schema(version: object) -> StoreError:
+    # Most often a long-running agent session whose server started before an
+    # update; the memories are fine, and a new session loads the new version.
+    return StoreError(
+        f"the memory store was upgraded to schema {version} by a newer KnowItAll2 than this process "
+        f"(schema {SCHEMA_VERSION}). If KnowItAll2 was updated while this session was running, restart the "
+        "session or the agent app to load the new version; the memories are safe. Otherwise, update "
+        "KnowItAll2 (see docs/install-for-agents.md)",
+        reason="newer_schema",
+    )
+
+
+def inspect_database(path: Path) -> dict[str, Any]:
+    """Look at a database file without changing it, for ``doctor``.
+
+    The file is opened read-only: nothing is migrated, rebuilt or written.
+    Returns its schema version (None for an empty file, which is set up on
+    first use), its active memory count, and each active memory's id with
+    the text screened for secrets, after SQLite's quick integrity check;
+    raises :class:`StoreError` with a reason when it cannot be used.
+    """
+
+    try:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        raise StoreError(f"cannot open the memory store at {path}: {exc}", reason=error_reason(exc)) from exc
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not tables:
+            return {"schema_version": None, "active": 0, "memories": []}
+        if "meta" not in tables or "records" not in tables:
+            raise StoreError(f"{path} is not a KnowItAll2 memory store", reason="unreadable")
+        row = connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        version = int(row[0]) if row is not None and str(row[0]).isdigit() else None
+        if version is not None and version > SCHEMA_VERSION:
+            raise _newer_schema(version)
+        problems = [str(found[0]) for found in connection.execute("PRAGMA quick_check").fetchall()]
+        if problems != ["ok"]:
+            raise StoreError(f"the memory store is damaged: {problems[0]}", reason="unreadable")
+        memories = []
+        for record_id, text, subjects, tags in connection.execute(
+            "SELECT id, text, subjects, tags FROM records WHERE status = 'active'"
+        ):
+            # The text ``remember`` screens for secrets: the memory and its subjects and tags.
+            memories.append((record_id, "\n".join([text, *json.loads(subjects), *json.loads(tags)])))
+    except sqlite3.Error as exc:
+        raise StoreError(f"the memory store cannot be read: {exc}", reason=error_reason(exc)) from exc
+    except ValueError as exc:
+        raise StoreError(f"the memory store is damaged: {exc}", reason="unreadable") from exc
+    finally:
+        connection.close()
+    return {"schema_version": version, "active": len(memories), "memories": memories}
 
 
 @dataclass(frozen=True)
@@ -370,7 +469,8 @@ class Store:
             path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(str(path), timeout=5.0, isolation_level=None)
         except (OSError, sqlite3.Error) as exc:
-            raise StoreError(f"cannot open the memory store at {path}: {exc}") from exc
+            reason = error_reason(exc) if isinstance(exc, sqlite3.Error) else "io"
+            raise StoreError(f"cannot open the memory store at {path}: {exc}", reason=reason) from exc
         store = cls(connection, path)
         try:
             store._initialize(file_backed=True)
@@ -395,37 +495,52 @@ class Store:
         return self._connection
 
     def _initialize(self, *, file_backed: bool) -> None:
+        read_version = "SELECT value FROM meta WHERE key = 'schema_version'"
         try:
             self._connection.execute("PRAGMA busy_timeout = 5000")
             self._connection.execute("PRAGMA foreign_keys = ON")
             if file_backed:
-                self._connection.execute("PRAGMA journal_mode = WAL")
+                self._use_wal()
             self._connection.executescript(_SCHEMA)
-            row = self._connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            row = self._connection.execute(read_version).fetchone()
+            if row is None:
+                # Several processes may create a new database together; the first to write the version wins.
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+                )
+                row = self._connection.execute(read_version).fetchone()
         except sqlite3.OperationalError as exc:
             if "fts5" in str(exc).lower():
                 raise StoreError(
-                    "this Python's SQLite lacks FTS5 full-text search, which KnowItAll2 requires"
+                    "this Python's SQLite lacks FTS5 full-text search, which KnowItAll2 requires", reason="no_fts5"
                 ) from exc
-            raise StoreError(f"cannot initialize the memory store: {exc}") from exc
+            raise StoreError(f"cannot initialize the memory store: {exc}", reason=error_reason(exc)) from exc
         except sqlite3.DatabaseError as exc:
-            raise StoreError(f"the memory store is unreadable: {exc}") from exc
-        if row is None:
-            self._connection.execute(
-                "INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
-            )
-        elif int(row["value"]) > SCHEMA_VERSION:
-            # Most often a long-running agent session whose server started before an
-            # update; the memories are fine, and a new session loads the new version.
-            raise StoreError(
-                f"the memory store was upgraded to schema {row['value']} by a newer KnowItAll2 than this process "
-                f"(schema {SCHEMA_VERSION}). If KnowItAll2 was updated while this session was running, restart the "
-                "session or the agent app to load the new version; the memories are safe. Otherwise, update "
-                "KnowItAll2 (see docs/install-for-agents.md)"
-            )
+            raise StoreError(f"the memory store is unreadable: {exc}", reason="unreadable") from exc
+        if int(row["value"]) > SCHEMA_VERSION:
+            raise _newer_schema(row["value"])
         elif int(row["value"]) < SCHEMA_VERSION:
             self._migrate()
         self._ensure_change_triggers()
+
+    def _use_wal(self) -> None:
+        """Switch the database to write-ahead logging, unless it already is.
+
+        Switching needs the file to itself, and SQLite reports "locked" at once
+        instead of waiting; when several processes create a new database
+        together, the ones that lose wait a moment and look again.
+        """
+
+        for attempt in range(1, _WAL_ATTEMPTS + 1):
+            try:
+                if str(self._connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                    return
+                self._connection.execute("PRAGMA journal_mode = WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if not _busy(exc) or attempt == _WAL_ATTEMPTS:
+                    raise
+            time.sleep(0.05 * attempt)
 
     def _ensure_change_triggers(self) -> None:
         """Create the change triggers, or rebuild them when their definition changed (such as a new column)."""
@@ -444,7 +559,7 @@ class Store:
                     self._connection.execute(statement)
                 self.set_meta(TRIGGERS_KEY, _TRIGGERS_VERSION)
         except sqlite3.Error as exc:
-            raise StoreError(f"cannot prepare the memory store for sharing: {exc}") from exc
+            raise StoreError(f"cannot prepare the memory store for sharing: {exc}", reason=error_reason(exc)) from exc
 
     def _migrate(self) -> None:
         """Bring an older database up to date, once, even if several processes open it together.
@@ -473,11 +588,15 @@ class Store:
                     "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),),
                 )
         except sqlite3.Error as exc:
-            raise StoreError(f"cannot upgrade the memory store: {exc}") from exc
+            raise StoreError(f"cannot upgrade the memory store: {exc}", reason=error_reason(exc)) from exc
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """Run a block atomically; a nested block joins the outer transaction."""
+        """Run a block atomically; a nested block joins the outer transaction.
+
+        A COMMIT that fails (such as on a deferred link that does not hold) is
+        rolled back too: SQLite leaves it open, holding the write lock.
+        """
 
         if self._connection.in_transaction:
             yield
@@ -485,10 +604,11 @@ class Store:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             yield
+            self._connection.execute("COMMIT")
         except BaseException:
-            self._connection.execute("ROLLBACK")
+            if self._connection.in_transaction:  # some errors end the transaction themselves
+                self._connection.execute("ROLLBACK")
             raise
-        self._connection.execute("COMMIT")
 
     def ensure_project(self, identity: ProjectIdentity, now: str) -> None:
         """Record a project known only by its remote, leaving any existing entry as it is."""
@@ -697,19 +817,23 @@ class Store:
         self, *, question_id: str, kind: str, prompt: str, record_ids: Sequence[str],
         options: Sequence[dict[str, str]], now: str,
     ) -> bool:
-        """Queue a question unless an open one already covers the same memories; True if added."""
+        """Queue a question unless an open one already covers the same memories; True if added.
+
+        The check and the insert are one transaction, so two processes asking at once ask once.
+        """
 
         key = json.dumps(sorted(record_ids))
-        for row in self._connection.execute(
-            "SELECT record_ids FROM questions WHERE status = 'open' AND kind = ?", (kind,),
-        ).fetchall():
-            if json.dumps(sorted(json.loads(row[0]))) == key:
-                return False
-        self._connection.execute(
-            "INSERT INTO questions (id, kind, prompt, record_ids, options, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'open', ?)",
-            (question_id, kind, prompt, json.dumps(list(record_ids)), json.dumps(list(options)), now),
-        )
+        with self.transaction():
+            for row in self._connection.execute(
+                "SELECT record_ids FROM questions WHERE status = 'open' AND kind = ?", (kind,),
+            ).fetchall():
+                if json.dumps(sorted(json.loads(row[0]))) == key:
+                    return False
+            self._connection.execute(
+                "INSERT INTO questions (id, kind, prompt, record_ids, options, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'open', ?)",
+                (question_id, kind, prompt, json.dumps(list(record_ids)), json.dumps(list(options)), now),
+            )
         return True
 
     def open_questions(self, *, limit: int) -> list[dict[str, Any]]:
@@ -734,11 +858,14 @@ class Store:
         return {"id": row[0], "kind": row[1], "prompt": row[2], "record_ids": json.loads(row[3]),
                 "options": json.loads(row[4]), "status": row[5], "answer": row[6]}
 
-    def close_question(self, question_id: str, *, answer: str, now: str) -> None:
-        self._connection.execute(
-            "UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ?",
+    def close_question(self, question_id: str, *, answer: str, now: str) -> bool:
+        """Record the answer to an open question; False when it was no longer open (answered meanwhile)."""
+
+        cursor = self._connection.execute(
+            "UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'",
             (answer, now, question_id),
         )
+        return cursor.rowcount == 1
 
     def answered_questions(self, *, limit: int) -> list[dict[str, Any]]:
         rows = self._connection.execute(
@@ -782,6 +909,13 @@ class Store:
             (summary, json.dumps(list(gaps)), profiled, now, system_id),
         )
 
+    def set_system_profiled(self, system_id: str, *, profiled: str, now: str) -> None:
+        """Mark a system as described for this state of its memories, leaving its summary and gaps as they are."""
+
+        self._connection.execute(
+            "UPDATE systems SET profiled = ?, updated_at = ? WHERE id = ?", (profiled, now, system_id),
+        )
+
     def set_system_gaps(self, system_id: str, *, gaps: Sequence[str], now: str) -> None:
         """Replace only what a system's profile says is missing, such as after a gap was filled."""
 
@@ -799,6 +933,23 @@ class Store:
             "written_at = excluded.written_at",
             (record_id, headline, system_id, facet, written_by, now),
         )
+
+    def add_note(
+        self, record_id: str, *, headline: str, system_id: str | None, facet: str, written_by: str, now: str,
+    ) -> bool:
+        """Give an active memory its first note; whether it was added.
+
+        A note it already has, such as one the user wrote, stays, and a
+        memory no longer active gets none.
+        """
+
+        cursor = self._connection.execute(
+            "INSERT INTO record_notes (record_id, headline, system_id, facet, written_by, written_at) "
+            "SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM records WHERE id = ? AND status = 'active') "
+            "ON CONFLICT (record_id) DO NOTHING",
+            (record_id, headline, system_id, facet, written_by, now, record_id),
+        )
+        return cursor.rowcount == 1
 
     def notes_for(self, record_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         if not record_ids:
@@ -1214,6 +1365,36 @@ class Store:
     def prune_events(self, *, before: str) -> int:
         return self._connection.execute("DELETE FROM events WHERE at < ?", (before,)).rowcount
 
+    def roll_up_usage(self, *, before: str, sent_up_to: int | None = None) -> int:
+        """Fold the uses made before ``before`` into each memory's totals and drop them; returns how many went.
+
+        "Used N times" is each memory's own counter, and ``record_details``
+        adds the totals to the uses still kept, so what a memory shows stays
+        the same. ``sent_up_to`` keeps the uses not yet sent to a server.
+        """
+
+        condition, values = "at < ?", [before]
+        if sent_up_to is not None:
+            condition, values = condition + " AND seq <= ?", [before, sent_up_to]
+        with self.transaction():
+            totals: dict[tuple[str, str], int] = {}
+            for operation, result_ids in self._connection.execute(
+                f"SELECT operation, result_ids FROM usage WHERE {condition}", values,
+            ).fetchall():
+                try:
+                    ids = json.loads(result_ids)
+                except ValueError:
+                    continue
+                for record_id in set(ids) if isinstance(ids, list) else ():
+                    if isinstance(record_id, str):
+                        totals[(record_id, operation)] = totals.get((record_id, operation), 0) + 1
+            self._connection.executemany(
+                "INSERT INTO usage_totals (record_id, operation, uses) VALUES (?, ?, ?) "
+                "ON CONFLICT (record_id, operation) DO UPDATE SET uses = uses + excluded.uses",
+                [(record_id, operation, count) for (record_id, operation), count in totals.items()],
+            )
+            return self._connection.execute(f"DELETE FROM usage WHERE {condition}", values).rowcount
+
     def browse(
         self,
         *,
@@ -1285,12 +1466,18 @@ class Store:
         if row is None:
             return None
         details = _record_dict(row)
-        details["uses"] = {
-            operation: int(count) for operation, count in self._connection.execute(
+        details["uses"] = {}
+        for operation, count in [
+            *self._connection.execute(
                 "SELECT operation, COUNT(*) FROM usage WHERE result_ids LIKE ? GROUP BY operation",
                 (f'%"{record_id}"%',),
-            ).fetchall()
-        }
+            ).fetchall(),
+            # Uses older than a year are kept only as these totals (``roll_up_usage``).
+            *self._connection.execute(
+                "SELECT operation, uses FROM usage_totals WHERE record_id = ?", (record_id,),
+            ).fetchall(),
+        ]:
+            details["uses"][operation] = details["uses"].get(operation, 0) + int(count)
         details["replaced"] = [
             RecordRow.from_row(item).__dict__ for item in self._connection.execute(
                 f"SELECT {_COLUMNS} {_FROM} WHERE r.superseded_by = ? ORDER BY r.updated_at DESC", (record_id,),

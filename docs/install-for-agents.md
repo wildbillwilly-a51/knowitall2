@@ -17,8 +17,10 @@ install arrives with the first release.
   server entry, its session hooks, one Skill, and one marked section in the
   agent's global instructions (Claude Code's `CLAUDE.md`, Codex's
   `AGENTS.md`) that tells agents to read the briefing and look things up
-  first. It changes nothing else in those files, never writes into the
-  user's projects, and never stores secrets.
+  first. It keeps everything else in those files, with their line endings
+  and indentation, never writes into the user's projects, and never stores
+  secrets. Uninstalling removes what setup added; it can leave an empty
+  settings section behind, or change the blank lines at the end of a file.
 
 Each step gives a Windows (PowerShell) and a Linux (bash) form. Use the one for
 this computer.
@@ -104,20 +106,24 @@ Then ask where their memories should be kept:
   user its message; nothing was changed, so the command can be run again
   with a new code, or without the server to keep memories on this computer.
 
+Run each line below as one command, exactly as it is, including the
+`PYTHONPATH` part at its start: many agents start a new shell for every
+command, so a setting made by an earlier command is gone. The other
+`knowitall2` commands in this guide are run the same way, with the words
+after `knowitall2` changed.
+
 Windows (PowerShell):
 
 ```powershell
-$env:PYTHONPATH = "$env:USERPROFILE\.knowitall2\app\src"
-python -m knowitall2 setup codex
-python -m knowitall2 setup claude-code
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 setup codex
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 setup claude-code
 ```
 
 Linux (bash):
 
 ```bash
-export PYTHONPATH=~/.knowitall2/app/src
-python3 -m knowitall2 setup codex
-python3 -m knowitall2 setup claude-code
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 setup codex
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 setup claude-code
 ```
 
 `setup` also installs the KnowItAll2 app, a local window that shows what
@@ -140,15 +146,40 @@ KnowItAll2 through its tools, but do not get the automatic briefing, learning
 after a commit, the messages about what was learned, or what is new since a
 chat started.
 
+On Windows, if setup says it did not add the KnowItAll2 session hooks, a
+folder name in the path to Python or to the user's home has a character
+(such as `'`, `&`, `$` or `%`) that PowerShell or cmd would read as part of
+the command. Codex then works with KnowItAll2 through its tools only, as
+above. Tell the user; do not edit `hooks.json` to work around it.
+
 ## 4. Verify
 
-Run `doctor` with the same `PYTHONPATH` as in step 3: `python -m knowitall2
-doctor` on Windows, `python3 -m knowitall2 doctor` on Linux.
+Windows (PowerShell):
 
-Every line should start with `OK`. For any `FAIL` line, show the user the
-`fix:` line under it. If the Claude Code registration was lost, ask the user
-to quit Claude Code, run the Claude Code setup command from step 3 in a
-terminal, and then reopen Claude Code.
+```powershell
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 doctor
+```
+
+Linux (bash):
+
+```bash
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 doctor
+```
+
+Every line should start with `OK`. An agent that is installed but was not
+set up here is listed as `not set up; skipped`. To check only one agent, add
+`--agent codex` or `--agent claude-code`; that agent is then checked in
+full, set up or not.
+
+For any `FAIL` line, show the user the `fix:` line under it; it gives the
+whole command to run on this computer. If the Claude Code registration was
+lost, ask the user to quit Claude Code, run the Claude Code setup command
+from step 3 in a terminal, and then reopen Claude Code.
+
+Until the user has trusted the Codex hooks with `/hooks`, the `Codex session
+hook` line says `OK` and ends with "Codex runs the ... hooks once you trust
+them with /hooks". Nothing is wrong: it is a reminder of the step above, and
+the line says "trusted in Codex" once the user has done it.
 
 Codex calls MCP tools, including KnowItAll2's, through its code mode. If a
 Codex session says the tools are unavailable because `codex-code-mode-host`
@@ -188,6 +219,8 @@ python3 ~/.knowitall2/update.py
 ```
 
 On Windows (PowerShell): `python "$env:USERPROFILE\.knowitall2\update.py"`.
+Whichever `python` starts it, the script runs the update with the Python
+KnowItAll2 was set up with (and says so), so the agents keep using that one.
 
 It downloads the new version, refreshes the setup of every agent that was
 set up (changing only what is out of date), refreshes the app's shortcut,
@@ -197,16 +230,19 @@ While Codex is open, the script changes nothing in Codex's own settings; it
 says when Codex must be closed and the update run again.
 
 If `update.py` is missing (installs from before version 0.2.1), download the
-new version first, then run the update, with the same `PYTHONPATH` as in
-step 3:
+new version first, then run the update:
 
 ```bash
 git -C ~/.knowitall2/app pull --ff-only
-python3 -m knowitall2 update
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 update
 ```
 
-On Windows: `git -C "$env:USERPROFILE\.knowitall2\app" pull --ff-only`, then
-`python -m knowitall2 update`.
+On Windows (PowerShell):
+
+```powershell
+git -C "$env:USERPROFILE\.knowitall2\app" pull --ff-only
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 update
+```
 
 Each running agent session keeps the KnowItAll2 version it started with. Tell
 the user to start new sessions, or quit and reopen the agent app, after an
@@ -216,11 +252,23 @@ that session fixes it, and the memories are safe.
 
 ## Uninstalling
 
-With the same `PYTHONPATH` as in step 3, run `knowitall2 uninstall codex` and
-`knowitall2 uninstall claude-code` (`python -m` on Windows, `python3 -m` on
-Linux).
+Remove KnowItAll2 from each agent, then the app's shortcut.
 
-Then run `knowitall2 app --remove-shortcut` to remove the app's shortcut.
+Windows (PowerShell):
+
+```powershell
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 uninstall codex
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 uninstall claude-code
+$env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 app --remove-shortcut
+```
+
+Linux (bash):
+
+```bash
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 uninstall codex
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 uninstall claude-code
+PYTHONPATH="$HOME/.knowitall2/app/src" python3 -P -m knowitall2 app --remove-shortcut
+```
 
 When the computer was connected to a KnowItAll2 server, uninstalling an
 agent also removes its key here; uninstalling the last one disconnects the
@@ -228,6 +276,10 @@ computer and keeps its copy of the memory. Tell the user to remove those
 agents on the server's page too.
 
 ## Connecting to a server later, or leaving it
+
+Run these the same way as the commands in step 3: the `PYTHONPATH` part,
+then `python -P -m knowitall2` (`python3 -P -m knowitall2` on Linux) and the
+words shown after `knowitall2`.
 
 `knowitall2 server status` shows whether this computer shares its memory
 through a server and whether the server answers. `knowitall2 server connect

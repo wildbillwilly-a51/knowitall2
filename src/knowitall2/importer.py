@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import review
+from .files import read_text
 from .identity import ProjectIdentity, identify, identify_remote
 from .memory import Memory, MemoryInputError
 
@@ -63,7 +64,7 @@ def _import_lines(memory: Memory, path: Path, report: ImportReport) -> None:
     by_origin: dict[str, str] = {}
     conflicts: list[tuple[str, list[str]]] = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = read_text(path).splitlines()
     except (OSError, UnicodeDecodeError) as exc:
         raise MemoryInputError(f"Cannot read {path}: {exc}") from exc
     for number, line in enumerate(lines, 1):

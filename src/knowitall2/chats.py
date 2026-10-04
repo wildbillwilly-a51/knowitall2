@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from .files import short_path, write_text_atomic
+from .files import read_text, short_path, write_text_atomic
 from .paths import data_home
 
 KEPT_DAYS = 30
@@ -61,7 +61,7 @@ def chat_key(session_id: str | None, transcript: str | None) -> str | None:
 
 def load(chat: str) -> dict[str, Any] | None:
     try:
-        state = json.loads((folder() / f"{chat}.json").read_text(encoding="utf-8"))
+        state = json.loads(read_text(folder() / f"{chat}.json"))
     except (OSError, ValueError):
         return None
     return state if isinstance(state, dict) else None

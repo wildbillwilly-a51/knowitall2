@@ -3,13 +3,19 @@
 The server has the final word on what it accepts:
 
 - It checks every row like a computer would (``sync.check_row``) and screens
-  memories for secrets again.
+  new or changed memory text for secrets again.
 - A new memory that another computer already saved is kept as replaced by
   the first one, so one memory stays one memory.
+- A row exactly as the server already has it (such as a computer sending
+  its whole memory again on reconnecting) is accepted and changes nothing.
 - When another agent changed a row since the sender last saw it, the newer
   version wins by the row's own time, and the disagreement is kept in
-  ``server_conflicts``.
-- An operation sent twice gets its first answer again.
+  ``server_conflicts``. A version's time counts for no later than a few
+  minutes after the server got it, so a computer whose clock runs ahead
+  cannot win every later disagreement.
+- An operation sent twice gets its first answer again. An applied one says
+  the row's change number on the server (``seq``), so the sender's next
+  change of it is based on that version, whichever agent's key sends it.
 """
 
 from __future__ import annotations
@@ -27,6 +33,8 @@ from . import later
 MAX_OPERATIONS = 500
 LEASE_SECONDS = (60, 4 * 60 * 60)
 DUPLICATE_REASON = "the same memory was already saved from another computer"
+# How far a computer's clock may run ahead of the server's before its rows' times stop counting as later.
+CLOCK_SKEW_SECONDS = 5 * 60
 
 
 def apply_operations(
@@ -43,8 +51,11 @@ def apply_operations(
     answers = []
     with store.transaction():
         store.set_meta(BY_KEY, connection_id)
+        before = connection.execute("SELECT COALESCE(MAX(seq), 0) FROM changes").fetchone()[0]
         for operation in operations:
             answers.append(_apply_one(store, connection_id, operation, now))
+        # When the server got each version, by its own clock, for weighing that version's time later.
+        connection.execute("UPDATE changes SET at = ? WHERE seq > ?", (now, before))
         connection.execute("DELETE FROM meta WHERE key = ?", (BY_KEY,))
     return answers
 
@@ -71,12 +82,22 @@ def _apply_one(store: Store, connection_id: str, operation: object, now: str) ->
         if current is not None:
             refused["row"], refused["seq"] = current
         return refused
+    if answer["result"] == "applied":
+        # Older computers ignore it; a newer one bases its next change of the row on it.
+        seq = _latest_seq(connection, operation["table"], operation["key"])
+        if seq:
+            answer["seq"] = seq
     connection.execute(
         "INSERT INTO server_applied (op_id, connection_id, result, at) VALUES (?, ?, ?, ?)",
         (op_id, connection_id, json.dumps(answer), now),
     )
     connection.execute("RELEASE operation")
     return {"op_id": op_id, **answer}
+
+
+def _latest_seq(connection: sqlite3.Connection, name: str, key: str) -> int:
+    return int(connection.execute("SELECT COALESCE(MAX(seq), 0) FROM changes WHERE tbl = ? AND key = ?",
+                                  (name, key)).fetchone()[0])
 
 
 def _current(connection: sqlite3.Connection, operation: dict[str, Any]) -> tuple[dict[str, Any], int] | None:
@@ -89,9 +110,7 @@ def _current(connection: sqlite3.Connection, operation: dict[str, Any]) -> tuple
     row = read_row(connection, table, key)
     if row is None:
         return None
-    seq = connection.execute("SELECT COALESCE(MAX(seq), 0) FROM changes WHERE tbl = ? AND key = ?",
-                             (table.name, key)).fetchone()[0]
-    return row, int(seq)
+    return row, _latest_seq(connection, table.name, key)
 
 
 def _plain_reason(error: Exception) -> str:
@@ -120,7 +139,10 @@ def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], n
     if operation.get("op") != "upsert":
         raise SyncError("op must be upsert or delete")
     row = check_row(table, key, operation.get("row"))
-    if table.name == "records" and isinstance(row.get("text"), str) and contains_secret(row["text"]):
+    # Only new or changed text is screened: retiring or replacing a memory kept
+    # since before the screening knew its shape must never be refused.
+    if (table.name == "records" and isinstance(row.get("text"), str)
+            and (existing is None or row["text"] != existing.get("text")) and contains_secret(row["text"])):
         raise SyncError("the memory looks like it holds a secret; save where the secret is kept instead")
     if existing is None:
         if table.name == "records" and row.get("status") == "active" and row.get("content_hash"):
@@ -140,9 +162,13 @@ def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], n
         # Use counts are the server's own, from the usage computers send.
         row.pop("recall_count", None)
         row.pop("last_used_at", None)
+    if all(existing.get(column) == value for column, value in row.items()):
+        return {"result": "applied"}  # the server has this version already: nothing to settle or to change
     if _changed_by_others(connection, table, key, base, connection_id):
         merged = {**existing, **row}
-        incoming, current = stamp(table, merged), stamp(table, existing)
+        # Each version's time counts for no later than a few minutes after the server got it.
+        incoming = _no_later_than(stamp(table, merged), now)
+        current = _no_later_than(stamp(table, existing), _arrived(connection, table, key) or now)
         newer = incoming is not None and (current is None or incoming > current)
         connection.execute(
             "INSERT INTO server_conflicts (at, tbl, key, connection_id, outcome, incoming, kept) "
@@ -157,6 +183,27 @@ def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], n
             return {"result": "kept_newer", "row": current[0], "seq": current[1]}
     write_row(connection, table, row)
     return {"result": "applied"}
+
+
+def _arrived(connection: sqlite3.Connection, table: SyncedTable, key: str) -> str | None:
+    """When the server got the version of a row it holds (its newest change), if it noted one."""
+
+    row = connection.execute("SELECT at FROM changes WHERE tbl = ? AND key = ? ORDER BY seq DESC LIMIT 1",
+                             (table.name, key)).fetchone()
+    return row[0] if row else None
+
+
+def _no_later_than(value: str | None, arrived: str) -> str | None:
+    """A version's time, or the moment it arrived plus the allowed clock difference, whichever is earlier.
+
+    Times compare as text, as they do everywhere in KnowItAll2, so "9999-..." counts as that moment.
+    """
+
+    try:
+        ceiling = later(arrived, seconds=CLOCK_SKEW_SECONDS)
+    except ValueError:
+        return value
+    return ceiling if value is not None and value > ceiling else value
 
 
 def _changed_by_others(
@@ -256,7 +303,8 @@ def make_copy(source: Path, target: Path) -> int:
         copy.execute("BEGIN")
         for name in tables:
             copy.execute(f"DROP TABLE {name}")
-        for name in ("changes", "events", "usage", "project_paths"):
+        # The uses are the server's bookkeeping: older ones live on as totals (``Store.roll_up_usage``).
+        for name in ("changes", "events", "usage", "usage_totals", "project_paths"):
             copy.execute(f"DELETE FROM {name}")
         copy.execute("DELETE FROM meta WHERE key LIKE 'changes.%' OR key LIKE 'sync.%' OR key LIKE 'server.%'")
         copy.execute("COMMIT")

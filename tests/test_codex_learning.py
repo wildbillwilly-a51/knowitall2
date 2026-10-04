@@ -13,7 +13,7 @@ from _support import Clock, make_repository
 from knowitall2 import hooks
 from knowitall2.cli import main
 from knowitall2.learning.dossier import build_dossiers
-from knowitall2.learning.learner import learn
+from knowitall2.learning.learner import learn, validate
 from knowitall2.learning.state import LearnerSettings, LearnerState
 from knowitall2.learning.transcripts import codex_logs, read_codex_session, read_session, session_logs
 from knowitall2.memory import Memory
@@ -115,6 +115,23 @@ class CodexReaderTests(CodexTestCase):
         [dossier] = build_dossiers(session)
         self.assertEqual(["Please check the router. Always keep router backups in /srv/backups."], dossier.user_texts)
         self.assertIn("(codex)", dossier.text)
+
+    def test_only_commands_the_agent_ran_make_a_memory_observed(self) -> None:
+        builder = self.sample().command("Get-Content docs\\handoff.md", "Deploy with make ship from jump01.")
+        log = builder.write(self.log_path)
+        session, _ = read_codex_session(log)
+        [dossier] = build_dossiers(session)
+        for evidence, source in (
+            ("DISTRIB_RELEASE='23.05.3'", "observed"),  # a command the agent ran
+            ("(exit code 1) cannot find path", "observed"),
+            ("dnsmasq manual", "inferred"),  # an MCP tool's answer
+            ("Deploy with make ship from jump01.", "inferred"),  # a document the agent read
+        ):
+            with self.subTest(evidence=evidence):
+                checked, reason = validate({"text": "The homelab has a detail worth keeping in mind.", "kind": "fact",
+                                            "subjects": [], "scope": "global", "evidence": evidence}, dossier)
+                self.assertIsNotNone(checked, reason)
+                self.assertEqual(source, checked["source"])
 
     def test_helper_and_non_interactive_sessions_yield_nothing(self) -> None:
         for source in ({"subagent": {"thread_spawn": {}}}, "exec"):

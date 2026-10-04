@@ -21,15 +21,18 @@ from knowitall2.store import Store
 class FakeEngine:
     """Answers each catalog step from scripted replies, keyed by which prompt it was given."""
 
-    def __init__(self, **replies) -> None:
+    def __init__(self, *, during=None, **replies) -> None:
         self.replies = {name: list(values) for name, values in replies.items()}
         self.inputs: list[tuple[str, str]] = []
         self.last_usage = {"input_tokens": 100, "output_tokens": 10}
+        self.during = during or {}  # what changes in the store while the model works on a step
 
     def run(self, text, *, schema, system_prompt):
         step = {cataloguer.FILE_PROMPT: "file", cataloguer.PROFILE_PROMPT: "profile",
                 cataloguer.REVIEW_PROMPT: "review"}[system_prompt]
         self.inputs.append((step, text))
+        if step in self.during:
+            self.during.pop(step)()
         reply = self.replies.get(step, []).pop(0) if self.replies.get(step) else {step_key(step): []}
         if isinstance(reply, Exception):
             raise reply
@@ -110,6 +113,33 @@ class FilingTests(CatalogTestCase):
                          (system["summary"], system["gaps"], system["aliases"]))
         self.assertEqual(0, self.run_catalog(FakeEngine()).calls)
 
+    def test_what_changed_while_the_model_filed_memories_is_kept(self) -> None:
+        told = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        forgotten = self.save("The old NAS is nas00 in the basement.")
+        plain = self.save("The office printer is on the second floor.")
+        system_id = catalog.system_id_for("vCenter")
+
+        def meanwhile():
+            # The user files one memory and forgets another while the model works.
+            self.store.upsert_system(system_id=system_id, name="vCenter", area="Servers and virtual machines",
+                                     kind="service", aliases=[], now=self.clock())
+            self.store.set_note(told.id, headline="Where the user says vCenter is", system_id=system_id,
+                                facet="where", written_by="user", now=self.clock())
+            self.memory.forget(forgotten.id, by_user=True)
+
+        engine = FakeEngine(file=[{"notes": [
+            note(told, "Something else", facet="other"),
+            note(forgotten, "The old NAS", name="NAS", kind="device", area="Storage and backups", facet="where"),
+        ]}], during={"file": meanwhile})
+        report = self.run_catalog(engine)
+        notes = self.store.notes_for([told.id, forgotten.id, plain.id])
+        self.assertEqual(("user", "where", system_id),
+                         (notes[told.id]["written_by"], notes[told.id]["facet"], notes[told.id]["system_id"]))
+        self.assertNotIn(forgotten.id, notes)
+        self.assertEqual("other", notes[plain.id]["facet"])  # skipped by the model: filed as general
+        self.assertEqual(["vCenter"], [system["name"] for system in self.store.systems_list()])
+        self.assertEqual((0, 0), (report.filed, report.new_systems))
+
     def test_the_budget_limits_calls_and_a_backend_problem_stops_the_pass(self) -> None:
         for number in range(30):
             self.save(f"Host server{number:02d} runs service number {number}.")
@@ -149,6 +179,24 @@ class ProfileTests(CatalogTestCase):
         [area] = listed["areas"]
         self.assertEqual(("Servers and virtual machines", "vCenter", 3), (area["area"], area["systems"][0]["name"],
                                                                          area["systems"][0]["memories"]))
+
+    def test_a_profile_changed_while_the_model_skipped_its_system_is_kept(self) -> None:
+        system = self.file(self.save("vCenter is at 10.9.15.16.", source="observed"), "where")
+        self.store.set_system_profile(system["id"], summary="Runs the lab's virtual machines.",
+                                      gaps=["Its license key", "How to renew its certificate"], profiled="old",
+                                      now=self.clock())
+
+        def meanwhile():
+            # The finder fills a gap while the model describes the system.
+            self.store.set_system_gaps(system["id"], gaps=["Its license key"], now=self.clock())
+
+        self.run_catalog(FakeEngine(profile=[{"systems": []}], during={"profile": meanwhile}))
+        described = self.store.system(system["id"])
+        self.assertEqual(("Runs the lab's virtual machines.", ["Its license key"]),
+                         (described["summary"], described["gaps"]))
+        # Marked as described all the same, so it is not sent again until its memories change.
+        self.assertEqual(catalog.profile_fingerprint(self.store.system_records(system["id"])), described["profiled"])
+        self.assertEqual(0, self.run_catalog(FakeEngine()).calls)
 
     def test_projects_have_no_readiness_and_the_user_can_fill_a_gap(self) -> None:
         system = self.file(self.save("Releases are cut from main.", kind="decision"), "decision", system="Homelab",
@@ -269,6 +317,21 @@ class FindOutTests(CatalogTestCase):
         self.assertIn("Saved", answer)
         shown = catalog.profile(self.store, self.store.system(system_id))
         self.assertEqual([], shown["missing"][:0] + [item for item in shown["missing"] if item["facet"] == "signin"])
+        self.assertEqual("done", self.store.task(task_id)["status"])
+
+    def test_a_note_the_user_wrote_stays_when_an_agent_finds_the_same_thing(self) -> None:
+        system_id = catalog.system_id_for("vCenter")
+        self.store.upsert_system(system_id=system_id, name="vCenter", area="Servers and virtual machines",
+                                 kind="service", aliases=[], now=self.clock())
+        system = self.store.system(system_id)
+        told = catalog.tell(self.memory, system, "other", "The vCenter sign-in is in Vaultwarden item vcenter-admin.")
+        task_id = review.ask_to_find_out(Memory(self.store, agent="app", clock=self.clock), system, "signin",
+                                         "Where the sign-in is kept")
+        answer = review.settle_task(self.memory, task_id, choice="found", certain=True,
+                                    found="The vCenter sign-in is in Vaultwarden item vcenter-admin.")
+        self.assertIn(f"Saved [{told.record.id}]", answer)
+        note = self.store.notes_for([told.record.id])[told.record.id]
+        self.assertEqual(("other", "user"), (note["facet"], note["written_by"]))
         self.assertEqual("done", self.store.task(task_id)["status"])
 
 

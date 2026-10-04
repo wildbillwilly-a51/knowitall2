@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -22,7 +22,12 @@ from knowitall2.learning.maintenance import maintain
 from knowitall2.learning.state import LearnerSettings, LearnerState
 from knowitall2.mcp_server import McpServer
 from knowitall2.memory import Memory
+from knowitall2.paths import database_path
 from knowitall2.store import Store, StoreError
+
+
+def _stamp(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class HomeTestCase(unittest.TestCase):
@@ -102,6 +107,16 @@ class JournalTests(HomeTestCase):
         self.assertIn("[REDACTED API key]", event["summary"])
         self.assertLessEqual(len(event["summary"]), journal.SUMMARY_CHARACTERS)
 
+    def test_database_passwords_are_redacted(self) -> None:
+        password = "Xk9" + "#mQ2vL8pR"  # split so repository secret scanners do not flag it
+        for text in (f"PGPASSWORD={password} psql -h db -U app", f"machine nas01\n  login admin\n  password {password}",
+                     f"DB_PASSWORD={password}"):
+            journal.record(self.store, "recall", text, details={"command": text})
+        events = self.store.events()
+        self.assertEqual(3, len(events))
+        self.assertNotIn(password, json.dumps(events))
+        self.assertEqual(3, sum("[REDACTED password]" in event["summary"] for event in events))
+
     def test_the_journal_never_breaks_an_operation(self) -> None:
         broken = mock.Mock()
         broken.add_event.side_effect = RuntimeError("disk full")
@@ -119,6 +134,68 @@ class JournalTests(HomeTestCase):
         self.assertEqual(2, len(self.store.events(kinds=["candidate"])))
         journal.prune(self.store, now=datetime(2026, 9, 28, tzinfo=timezone.utc))
         self.assertNotIn("long ago", [event["summary"] for event in self.store.events()])
+
+
+class HousekeepingTests(HomeTestCase):
+    """Old events and uses go in everyday use, with learning off (review findings M18 growth, T3)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.project = make_repository(self.root / "alpha", "https://gitlab.example.com/team/alpha.git")
+        now = datetime.now(timezone.utc)
+        self.store = Store.open(database_path())
+        memory = Memory(self.store, agent="cli")
+        self.record_id = memory.remember("The router is rtr01.").record.id
+        for days, operation in ((400, "recall"), (400, "briefing"), (3, "recall")):
+            self.store.log_usage(at=_stamp(now - timedelta(days=days)), operation=operation, agent="codex",
+                                 project_id=None, query="router", record_ids=[self.record_id])
+        journal.record(self.store, "recall", "long ago", at=_stamp(now - timedelta(days=100)))
+        journal.record(self.store, "recall", "last week", at=_stamp(now - timedelta(days=7)))
+        self.before = self.uses()
+
+    def tearDown(self) -> None:
+        self.store.close()
+        super().tearDown()
+
+    def uses(self) -> tuple[int, dict[str, int]]:
+        details = self.store.record_details(self.record_id)
+        return details["recall_count"], details["uses"]
+
+    def usage_rows(self) -> int:
+        return self.store.connection.execute("SELECT COUNT(*) FROM usage").fetchone()[0]
+
+    def summaries(self) -> list[str]:
+        return [event["summary"] for event in self.store.events(kinds=["recall"], limit=100)]
+
+    def test_a_session_start_with_learning_off_drops_old_events_and_uses_and_keeps_the_counts(self) -> None:
+        self.assertFalse(LearnerSettings().enabled)
+        self.assertEqual((3, {"recall": 2, "briefing": 1}), self.before)
+        hooks.session_start(json.dumps({"session_id": SESSION, "cwd": str(self.project)}),
+                            start_learner=lambda: None)
+        self.assertNotIn("long ago", self.summaries())
+        self.assertIn("last week", self.summaries())
+        self.assertEqual(2, self.usage_rows())  # the recent recall and the briefing just given
+        self.assertEqual(self.before, self.uses())
+
+    def test_the_tools_tidy_up_too_but_at_most_once_a_day(self) -> None:
+        from knowitall2.mcp_server import handle_once
+
+        call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "recall", "arguments": {"query": "printer"}}}
+        handle_once({"initialize": {"clientInfo": {"name": "codex"}}, "message": call})
+        self.assertNotIn("long ago", self.summaries())
+        self.assertEqual(self.before, self.uses())
+        journal.record(self.store, "recall", "found later", at="2020-01-01T00:00:00Z")
+        handle_once({"initialize": {"clientInfo": {"name": "codex"}}, "message": call})
+        self.assertIn("found later", self.summaries())
+
+    def test_uses_not_yet_sent_to_the_server_are_kept(self) -> None:
+        from knowitall2.connected import USAGE_CURSOR_KEY
+
+        self.store.set_meta(USAGE_CURSOR_KEY, "1")  # the first old use was sent, the second not yet
+        journal.tidy(self.store)
+        self.assertEqual(2, self.usage_rows())
+        self.assertEqual(self.before, self.uses())
 
 
 class ProblemTests(HomeTestCase):
