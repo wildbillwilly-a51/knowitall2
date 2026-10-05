@@ -123,10 +123,12 @@ def _same_log(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
 
 
-def read_new(state: dict[str, Any], transcript: str | None) -> tuple[list[str], set[str]]:
+def read_new(state: dict[str, Any], transcript: str | None, *,
+             said: list[str] | None = None) -> tuple[list[str], set[str]]:
     """What the chat's log added since the last look: its tool calls' inputs, and the memory ids it mentions.
 
-    Moves the state's offset to the end of what was read.
+    With ``said``, the agent's own messages to the user are added to it too. Moves the state's offset to
+    the end of what was read.
     """
 
     if not transcript:
@@ -152,6 +154,8 @@ def read_new(state: dict[str, Any], transcript: str | None) -> tuple[list[str], 
 
         session, _ = read_session(path, start=start)
         inputs = [part for event in session.events if event.kind == "tool" for part in (event.text, event.cwd) if part]
+        if said is not None:
+            said.extend(event.text for event in session.events if event.kind == "assistant" and event.text)
     except (OSError, ValueError):
         pass
     state["log"], state["offset"] = transcript, size

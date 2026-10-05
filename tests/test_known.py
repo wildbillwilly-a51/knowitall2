@@ -316,13 +316,15 @@ class RefreshTests(KnownTestCase):
 
 
 class PointerTests(KnownTestCase):
-    def systems(self):
-        nas = self.remember("To read files on the NAS, sudo -u hermes and run the helper.", scope="global")
-        self.file(nas.id, "Synology", aliases=["nas-file1", "NAS", "shared-name"])
-        gateway = self.remember("The gateway is reached as codex with the openclaw key.", scope="global")
-        self.file(gateway.id, "gw-control", aliases=["control host", "shared-name"])
-        hermes = self.remember("Hermes runs the helpers.", scope="global")
-        self.file(hermes.id, "Hermes", aliases=["gw-control"])
+    def systems(self, *, memories: int = 3):
+        """Three systems, each with enough memories that a pointer to it is worth showing."""
+
+        for system, aliases, words in (("Synology", ["nas-file1", "NAS", "shared-name"], "the NAS"),
+                                       ("gw-control", ["control host", "shared-name"], "the gateway"),
+                                       ("Hermes", ["gw-control"], "the helper runner")):
+            for number in range(memories):
+                saved = self.remember(f"Note {number} about {words}: sudo -u hermes, step {number}.", scope="global")
+                self.file(saved.id, system, aliases=aliases)
         known.refresh(self.connection)
         return self.project / known.FOLDER
 
@@ -340,7 +342,7 @@ class PointerTests(KnownTestCase):
         folder = self.systems()
         found = known.find_pointers(self.connection, ["the images are on nas-file1/files/cisco ap"], folder, [])
         self.assertEqual(["synology.md"], [target for target, _ in found])
-        self.assertIn(f"{known.FOLDER}/synology.md (1 memories)", found[0][1])
+        self.assertIn(f"{known.FOLDER}/synology.md (3 memories)", found[0][1])
         self.assertIn("what is known about Synology", found[0][1])
         self.assertEqual([], known.find_pointers(self.connection, ["nas-file1 again"], folder, ["synology.md"]))
 
@@ -350,7 +352,20 @@ class PointerTests(KnownTestCase):
         text = "ssh codex@gw-control then Synology, Hermes, and the alpha repo"
         found = known.find_pointers(self.connection, [text], folder, [])
         self.assertEqual(known.POINTERS_PER_MESSAGE, len(found))
-        self.assertEqual("gw-control.md", found[0][0])   # in the order the text names them
+        self.assertEqual("gw-control.md", found[0][0])   # in the order the text names them; a host after @ counts
+
+    def test_logins_paths_and_small_files_bring_no_pointer(self) -> None:
+        # Each of these pointed agents to files the work did not need, so they skipped the rest (2026-10-05).
+        folder = self.systems()
+        tiny = self.remember("Linux note.", scope="global")
+        self.file(tiny.id, "Linux")
+        known.refresh(self.connection)
+        for text in ("ssh synology@10.0.0.5", r"C:\Projects\synology\src", "see .synology/config",
+                     "https://synology.example.com/admin", "it runs on Linux"):
+            with self.subTest(text):
+                self.assertEqual([], known.find_pointers(self.connection, [text], folder, []))
+        self.assertEqual(["synology.md"], [t for t, _ in known.find_pointers(
+            self.connection, ["the files are on nas-file1/files/cisco ap"], folder, [])])   # a host first in a path
 
     def test_no_pointer_without_the_folder_knowitall2_wrote(self) -> None:
         self.systems()
@@ -394,12 +409,13 @@ class PointerHookTests(unittest.TestCase):
         store = Store.open(self.root / "data" / "knowitall2.db")
         try:
             memory = Memory(store, agent="cli")
-            nas = memory.remember("To read files on the NAS, sudo -u hermes and run the helper.", scope="global",
-                                  project_path=self.alpha).record
             store.upsert_system(system_id="sys-syn", name="Synology", area="Homelab", kind="device",
                                 aliases=["nas-file1"], now=memory.now())
-            store.set_note(nas.id, headline="NAS", system_id="sys-syn", facet="access", written_by="catalog",
-                           now=memory.now())
+            for number in range(3):
+                nas = memory.remember(f"To read files on the NAS, step {number}: sudo -u hermes and run the helper.",
+                                      scope="global", project_path=self.alpha).record
+                store.set_note(nas.id, headline="NAS", system_id="sys-syn", facet="access", written_by="catalog",
+                               now=memory.now())
             known.refresh(store._connection)
         finally:
             store.close()
@@ -422,21 +438,26 @@ class PointerHookTests(unittest.TestCase):
         hooks.session_start(json.dumps({"session_id": self.session, "transcript_path": str(self.log),
                                         "cwd": str(self.alpha), "source": "startup"}), start_learner=lambda: None)
         context = self.message("the .tar is on nas-file1/files/cisco ap")
-        self.assertIn(f"{known.FOLDER}/synology.md (1 memories)", context)
+        self.assertIn(f"{known.FOLDER}/synology.md (3 memories)", context)
         self.assertNotIn("synology.md", self.message("still about nas-file1"))
         logged = (self.root / "data" / known.POINTER_LOG).read_text(encoding="utf-8").splitlines()
         self.assertEqual("synology.md", json.loads(logged[0])["file"])
 
-    def test_the_agents_own_tool_calls_bring_a_pointer_at_the_next_message(self) -> None:
+    def test_the_agents_own_words_bring_a_pointer_but_its_commands_do_not(self) -> None:
         from knowitall2 import hooks
+        from test_learning import text
 
         hooks.session_start(json.dumps({"session_id": self.session, "transcript_path": str(self.log),
                                         "cwd": str(self.alpha), "source": "startup"}), start_learner=lambda: None)
         self.message("hello")
         with self.log.open("a", encoding="utf-8") as stream:
-            for record in self.builder(self.alpha).tool("t1", "Bash", {"command": "net view \\\\nas-file1"}, "denied").records:
+            for record in self.builder(self.alpha).tool("t1", "Bash", {"command": "net view nas-file1"}, "denied").records:
                 stream.write(json.dumps(record) + "\n")
-        self.assertIn("synology.md", self.message("it did not work"))
+        self.assertNotIn("synology.md", self.message("it did not work"))
+        with self.log.open("a", encoding="utf-8") as stream:
+            for record in self.builder(self.alpha).assistant(text("I'll try nas-file1 another way.")).records:
+                stream.write(json.dumps(record) + "\n")
+        self.assertIn("synology.md", self.message("go on"))
 
     def test_turned_off_means_no_pointer(self) -> None:
         from knowitall2 import hooks

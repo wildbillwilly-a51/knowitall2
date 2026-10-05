@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.1 (2026-10-05)
+
+- **Fewer pointers, to files worth reading.** In the first day of 0.10.0
+  agents opened the pointed file after only 8 of 45 pointers: most named
+  something the work did not need. A pointer now comes only from your
+  message and the agent's own words, not from every command it runs; a
+  login name (`name@host`) or a folder deeper in a path or a web address no
+  longer counts, though a host at the start of a path still does; and a
+  file with fewer than three memories gets no pointer. Replayed on those
+  chats: about a quarter fewer pointers, every one an agent followed kept,
+  and more of the files that held a missed answer pointed to in time.
+
 ## 0.10.0 (2026-10-04)
 
 Everything KnowItAll2 knows is now where agents already look: in files in

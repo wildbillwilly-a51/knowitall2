@@ -229,8 +229,11 @@ def _start_chat(payload: dict[str, Any], agent: str, *, since: str, project_id: 
         chats.prune()
 
 
-def _pointers(payload: dict[str, Any], store: Any, inputs: Sequence[str], state: dict[str, Any]) -> list[tuple[str, str]]:
-    """Which knowledge files the user's message or the agent's tool calls since the last message name.
+def _pointers(payload: dict[str, Any], store: Any, said: Sequence[str], state: dict[str, Any]) -> list[tuple[str, str]]:
+    """Which knowledge files the user's message or the agent's own words since the last message name.
+
+    Not the agent's tool calls: their logins, paths, and long commands named many systems the work did
+    not need, and agents learned to skip the pointers (2026-10-05: 8 of 45 opened).
 
     Never raises: a pointer is a help, and a failure must not cost the chat what else this hook adds.
     """
@@ -245,7 +248,7 @@ def _pointers(payload: dict[str, Any], store: Any, inputs: Sequence[str], state:
         root = find_git_root(Path(cwd))
         if root is None:
             return []
-        texts = [_text(payload, "prompt") or "", *inputs]
+        texts = [_text(payload, "prompt") or "", *said]
         return known.find_pointers(store._connection, texts, root / known.FOLDER, state.get("pointed", []))
     except Exception as exc:
         journal.problem("message hook", f"knowledge-file pointers could not be found: {type(exc).__name__}: {exc}")
@@ -275,7 +278,8 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
             project = identify(Path(cwd)) if cwd else None
             state = {"since": memory.now(), "projects": [], "told": [], "log": transcript,
                      "offset": max(0, chats.log_size(transcript) - chats.CATCH_UP_READ)}
-            inputs, mentioned = chats.read_new(state, transcript)
+            said: list[str] = []
+            inputs, mentioned = chats.read_new(state, transcript, said=said)
             state["told"] = sorted(mentioned)
             if project is not None:
                 state["projects"].append(project.id)
@@ -284,9 +288,10 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
                     parts.append(contents)
                     state["told"] += chats.RECORD_ID.findall(contents)
         else:
-            inputs, mentioned = chats.read_new(state, transcript)
+            said = []
+            inputs, mentioned = chats.read_new(state, transcript, said=said)
             state["told"] = [*state.get("told", []), *sorted(mentioned)]
-        pointers = _pointers(payload, store, inputs, state)
+        pointers = _pointers(payload, store, said, state)
         if pointers:
             parts.append("\n".join(line for _, line in pointers))
             state["pointed"] = [*state.get("pointed", []), *(target for target, _ in pointers)]

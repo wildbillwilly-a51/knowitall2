@@ -419,6 +419,7 @@ def _write_status(data: dict[str, Any]) -> None:
 POINTERS_PER_MESSAGE = 3
 POINTER_TEXT_LIMIT = 200_000
 POINTER_MINIMUM_CHARACTERS = 4
+POINTER_MINIMUM_MEMORIES = 3
 POINTER_LOG = "pointers.jsonl"
 POINTER_LOG_KEPT = 2000
 _WORD = re.compile(r"[^\W_]+")
@@ -463,25 +464,38 @@ def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: 
     alternatives = sorted((r"[\W_]+".join(map(re.escape, words)) for words in table if words), key=len, reverse=True)
     pattern = re.compile(r"(?<![^\W_])(?:" + "|".join(alternatives) + r")(?![^\W_])")
     text = "\n".join(str(item)[:POINTER_TEXT_LIMIT] for item in texts if item).casefold()
-    found: list[str] = []
+    found: list[tuple[str, str, int]] = []
+    rejected: set[str] = set()
     for match in pattern.finditer(text):
+        if _not_a_mention(text, match.start(), match.end()):
+            continue
         target = table.get(tuple(_WORD.findall(match.group(0))))
-        if target and target not in shown and target not in found and (folder / target).is_file():
-            found.append(target)
-            if len(found) == POINTERS_PER_MESSAGE:
-                break
-    pointers = []
-    for target in found:
+        if not target or target in shown or target in rejected or any(target == item[0] for item in found):
+            continue
         try:
             head = read_text(folder / target).splitlines()[:3]
         except OSError:
+            rejected.add(target)
+            continue
+        count = next((line.split(" ", 1)[0] for line in head if line.endswith("memories, newest first.")), "0")
+        if not count.isdigit() or int(count) < POINTER_MINIMUM_MEMORIES:
+            rejected.add(target)   # a file this small rarely holds what the work needs
             continue
         title = head[0][2:] if head and head[0].startswith("# ") else target
-        count = next((line.split(" ", 1)[0] for line in head if line.endswith("memories, newest first.")), "")
-        size = f" ({count} memories)" if count.isdigit() else ""
-        pointers.append((target, f"KnowItAll2: what is known about {title} is in {FOLDER}/{target}{size}; "
-                                 "read or search it before working this out again."))
-    return pointers
+        found.append((target, title, int(count)))
+        if len(found) == POINTERS_PER_MESSAGE:
+            break
+    return [(target, f"KnowItAll2: what is known about {title} is in {FOLDER}/{target} ({count} memories); "
+                     "read or search it before working this out again.") for target, title, count in found]
+
+
+def _not_a_mention(text: str, start: int, end: int) -> bool:
+    """A name that is part of something else: a login (``codex@host``), or a folder deeper in a path or a
+    URL (``C:\\Projects\\name\\``, ``.codex``, ``https://name...``). A host at the start of a path counts."""
+
+    before = text[start - 1] if start else ""
+    after = text[end] if end < len(text) else ""
+    return after == "@" or before in ("\\", "/", ".")
 
 
 def log_pointers(agent: str, chat: str, files: Sequence[str], *, at: str) -> None:
