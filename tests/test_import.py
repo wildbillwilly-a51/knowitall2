@@ -71,6 +71,11 @@ class ImportTests(unittest.TestCase):
         for reason in ("not a JSON object", "contains a secret", "rules must come from the user's own words",
                        "is in the future", "its project was not found"):
             self.assertIn(reason, described)
+        # The report shows nothing of the secret (review 2026-10-04, U-L1).
+        self.assertNotIn("hunter22", report.describe(dry_run=True, verbose=True))
+        broken = self.write('{"text": "DB_PASSWORD=Sup3rSecretValue99" oops')
+        self.assertNotIn("Sup3rSecretValue99", import_file(self.memory, broken, dry_run=True).describe(
+            dry_run=True, verbose=True))
 
     def test_importing_twice_confirms_instead_of_copying(self) -> None:
         path = self.write({"text": "The NAS is nas01."}, {"text": "The router is rtr01."})

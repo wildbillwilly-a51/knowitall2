@@ -93,8 +93,8 @@ class FilingTests(CatalogTestCase):
         self.assertIn("VMware vCenter", systems["vCenter"]["aliases"] + ["VMware vCenter"])
         notes = self.store.notes_for([address.id, route.id, stray.id])
         self.assertEqual(notes[address.id]["system_id"], notes[route.id]["system_id"])
-        self.assertEqual((None, "other"), (notes[stray.id]["system_id"], notes[stray.id]["facet"]))
-        self.assertEqual(0, self.store.count_unnoted())
+        self.assertNotIn(stray.id, notes)  # left out of the answer: tried again in a later run
+        self.assertEqual(1, self.store.count_unnoted())
         self.assertIn("[" + systems["vCenter"]["id"] + "] vCenter", engine.inputs[-1][1] if engine.inputs[-1][0] == "file"
                       else engine.inputs[1][1])
 
@@ -136,7 +136,7 @@ class FilingTests(CatalogTestCase):
         self.assertEqual(("user", "where", system_id),
                          (notes[told.id]["written_by"], notes[told.id]["facet"], notes[told.id]["system_id"]))
         self.assertNotIn(forgotten.id, notes)
-        self.assertEqual("other", notes[plain.id]["facet"])  # skipped by the model: filed as general
+        self.assertNotIn(plain.id, notes)  # skipped by the model: tried again in a later run
         self.assertEqual(["vCenter"], [system["name"] for system in self.store.systems_list()])
         self.assertEqual((0, 0), (report.filed, report.new_systems))
 
@@ -144,9 +144,37 @@ class FilingTests(CatalogTestCase):
         for number in range(30):
             self.save(f"Host server{number:02d} runs service number {number}.")
         report = self.run_catalog(FakeEngine(file=[{"notes": []}, {"notes": []}]), budget=1)
-        self.assertEqual((1, 1, 25), (report.calls, report.deferred, 30 - self.store.count_unnoted()))
+        self.assertEqual((1, 1, 30), (report.calls, report.deferred, self.store.count_unnoted()))
         blocked = self.run_catalog(FakeEngine(file=[ExtractionError("Not logged in", blocking=True)]))
         self.assertIn("Not logged in", blocked.blocked)
+
+    def test_a_memory_left_out_of_answers_is_filed_as_general_only_after_a_few_runs(self) -> None:
+        # Review 2026-10-04, U-M1: one empty or short answer filed the whole batch as general, for good.
+        filed = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        left = self.save("The office printer is on the second floor.")
+        engine = FakeEngine(file=[{"notes": [note(filed, "Where vCenter is", name="vCenter", kind="service",
+                                                  facet="where")]}])
+        self.run_catalog(engine)
+        self.assertEqual(1, [step for step, _ in engine.inputs].count("file"))  # not asked again in the same run
+        self.assertNotIn(left.id, self.store.notes_for([left.id]))
+        for runs in range(1, cataloguer.SKIPS_BEFORE_GENERAL):
+            self.assertNotIn(left.id, self.store.notes_for([left.id]))
+            self.run_catalog(FakeEngine(file=[{"notes": []}]))
+        note_left = self.store.notes_for([left.id])[left.id]
+        self.assertEqual((None, "other"), (note_left["system_id"], note_left["facet"]))
+        self.assertEqual(0, self.store.count_unnoted())
+
+    def test_a_new_system_left_out_of_an_answer_is_described_later(self) -> None:
+        address = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        system_id = catalog.system_id_for("vCenter")
+        self.run_catalog(FakeEngine(
+            file=[{"notes": [note(address, "Where vCenter is", name="vCenter", kind="service", facet="where")]}],
+            profile=[{"systems": []}]))
+        self.assertFalse(self.store.system(system_id)["profiled"])
+        engine = FakeEngine(profile=[{"systems": [{"id": system_id, "summary": "Runs the virtual machines.",
+                                                   "gaps": [], "aliases": []}]}])
+        self.assertEqual(1, self.run_catalog(engine).profiled)
+        self.assertEqual("Runs the virtual machines.", self.store.system(system_id)["summary"])
 
     def test_calls_count_toward_the_daily_budget(self) -> None:
         self.save("vCenter vc01 is at 10.9.15.16.")
@@ -400,6 +428,67 @@ class CatchUpTests(unittest.TestCase):
                 self.assertEqual(2, sum(group["sessions"] for group in catchup.groups()))
                 # Sessions that need no model call cost nothing, so a cap of 0 still takes them.
                 self.assertEqual(2, catchup.catch_up(str(root / "Homelab"), max_calls=0))
+
+    def test_catching_up_reads_only_the_set_aside_part_and_then_carries_on(self) -> None:
+        # Review 2026-10-04, U-M3: the part a later run had already learned was sent to the model again.
+        from knowitall2.learning.learner import learn
+        from knowitall2.learning.state import LearnerSettings
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            folder = root / "work"
+            folder.mkdir()
+            logs = root / "claude" / "projects" / "C--work"
+            logs.mkdir(parents=True)
+            log = logs / "11111111-2222-3333-4444-555555555555.jsonl"
+
+            def record(kind: str, text: str, at: str) -> str:
+                message = {"role": kind, "content": text if kind == "user" else [{"type": "text", "text": text}]}
+                return json.dumps({"type": kind, "message": message, "cwd": str(folder), "sessionId": log.stem,
+                                   "timestamp": at}) + "\n"
+
+            old = "".join(record("user", f"Old part {number}: the router is at 10.0.0.{number}",
+                                 f"2026-08-01T10:{number:02d}:00Z")
+                          + record("assistant", f"Noted, old {number}", f"2026-08-01T10:{number:02d}:30Z")
+                          for number in range(5))
+            new = "".join(record("user", f"New part {number}: DNS moved to 10.0.1.{number}",
+                                 f"2026-09-20T10:{number:02d}:00Z")
+                          + record("assistant", f"Noted, new {number}", f"2026-09-20T10:{number:02d}:30Z")
+                          for number in range(5))
+            log.write_bytes((old + new).encode("utf-8"))
+            past = time.time() - 7200
+            os.utime(log, (past, past))
+            boundary, size = len(old.encode("utf-8")), log.stat().st_size
+            environment = {"KNOWITALL2_HOME": str(root / "home"), "CODEX_HOME": str(root / "codex"),
+                           "CLAUDE_CONFIG_DIR": str(root / "claude")}
+            with mock.patch.dict(os.environ, environment):
+                state = LearnerState()
+                state.entry(log).update({"offset": size, "status": "done", "baseline_to": boundary,
+                                         "session_id": log.stem})
+                state.save()
+                self.assertEqual(1, catchup.catch_up(str(folder)))
+                extractor = FakeExtractorForCatchUp()
+                learn(logs=[log], state=LearnerState(), settings=LearnerSettings(enabled=True),
+                      memory_factory=lambda: Memory(Store.in_memory(), agent="learner"), extractor=extractor,
+                      dry_run=False)
+                sent = "".join(dossier.text for dossier in extractor.dossiers)
+                self.assertIn("Old part 4", sent)
+                self.assertNotIn("New part", sent)
+                entry = LearnerState().entry(log)
+        self.assertEqual((size, "done"), (entry["offset"], entry["status"]))
+        self.assertNotIn("learn_to", entry)
+
+
+class FakeExtractorForCatchUp:
+    name = "fake"
+    last_usage = None
+
+    def __init__(self) -> None:
+        self.dossiers = []
+
+    def extract(self, dossier):
+        self.dossiers.append(dossier)
+        return []
 
 
 if __name__ == "__main__":

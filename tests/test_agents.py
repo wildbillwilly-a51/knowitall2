@@ -234,6 +234,19 @@ class CodexAdapterTests(unittest.TestCase):
                 self.assertIsNone(windows_command(python.replace(name, name + " X"), launcher.replace(name, name + " X"),
                                                   shorten=lambda path: None))
 
+    def test_a_python_under_program_files_x86_gets_its_short_name(self) -> None:
+        # Review 2026-10-04, C-M2: the parentheses of the long name are not in its short name.
+        shortened = {r"C:\Program Files (x86)\Python312": r"C:\PROGRA~2\Python312"}
+        self.assertEqual(
+            r"C:\PROGRA~2\Python312\python.exe -B C:\Users\alex\.knowitall2\hooks\codex_session_start.py",
+            windows_command(r"C:\Program Files (x86)\Python312\python.exe",
+                            r"C:\Users\alex\.knowitall2\hooks\codex_session_start.py", shorten=shortened.get),
+        )
+        # Without short names, PowerShell's call operator cannot be used safely for it either.
+        self.assertIsNone(windows_command(r"C:\Program Files (x86)\Python312\python.exe",
+                                          r"C:\Users\alex\.knowitall2\hooks\codex_session_start.py",
+                                          shorten=lambda path: None))
+
     def test_hooks_are_skipped_where_no_windows_command_runs_them(self) -> None:
         unsafe = ServerLaunch(command=r"C:\Users\R&D\Python312\python.exe", args=LAUNCH.args, env=LAUNCH.env)
         hooks = self.codex_home / "hooks.json"

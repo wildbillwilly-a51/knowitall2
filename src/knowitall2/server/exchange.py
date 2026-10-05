@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -35,6 +36,48 @@ LEASE_SECONDS = (60, 4 * 60 * 60)
 DUPLICATE_REASON = "the same memory was already saved from another computer"
 # How far a computer's clock may run ahead of the server's before its rows' times stop counting as later.
 CLOCK_SKEW_SECONDS = 5 * 60
+EPOCH_KEY = "server.epoch"
+RUN_KEY = "server.run"
+# Beside the database, outside it: a database put back from a backup, or a new one, does not match it.
+RUN_MARKER = "server-run"
+
+
+def begin_run(store: Store, home: Path) -> str:
+    """Note this start of the server, and return its epoch: the id of this run of its memory.
+
+    Computers keep the epoch, and a change tells them the server's memory
+    went back (a backup put back, a new volume), so they send theirs again.
+    The database and a file beside it hold the same run id; when they
+    differ, or the database has no epoch yet, this database is not the one
+    that last ran here, and a new epoch begins. A backup's run id is never
+    a running server's (``backups.copy_database``), so a backup put back
+    always begins one. (A whole computer put back, file and database
+    together, is noticed by the computers instead: their next fetch would
+    start past the server's newest change.)
+    """
+
+    marker = home / RUN_MARKER
+    try:
+        on_disk = marker.read_text(encoding="ascii").strip() or None
+    except (OSError, UnicodeDecodeError):
+        on_disk = None
+    run = "r-" + uuid.uuid4().hex[:16]
+    with store.transaction():
+        epoch = store.get_meta(EPOCH_KEY)
+        recorded = store.get_meta(RUN_KEY)
+        # A database without an epoch (new, or from before epochs) begins one; a computer that never kept an
+        # epoch just keeps this one, so only a computer that saw another epoch sends its memory again.
+        if epoch is None or (recorded is not None and recorded != on_disk):
+            epoch = "e-" + uuid.uuid4().hex[:16]
+            store.set_meta(EPOCH_KEY, epoch)
+        store.set_meta(RUN_KEY, run)
+    try:
+        temporary = marker.with_name(marker.name + ".tmp")
+        temporary.write_text(run + "\n", encoding="ascii")
+        temporary.replace(marker)
+    except OSError:
+        pass  # the next start then begins a new epoch, which only makes computers send their memory again
+    return epoch
 
 
 def apply_operations(
@@ -345,4 +388,5 @@ def summary(store: Store) -> dict[str, Any]:
             "SELECT COUNT(*) FROM server_connections WHERE removed_at IS NULL").fetchone()[0]),
         "latest": int(connection.execute("SELECT COALESCE(MAX(seq), 0) FROM changes").fetchone()[0]),
         "columns": {name: list(table.columns) for name, table in SYNCED_TABLES.items()},
+        "epoch": store.get_meta(EPOCH_KEY),
     }

@@ -20,6 +20,7 @@ from . import review
 from .files import read_text
 from .identity import ProjectIdentity, identify, identify_remote
 from .memory import Memory, MemoryInputError
+from .secrets import redact
 
 PREVIEW_CHARACTERS = 110
 
@@ -73,16 +74,18 @@ def _import_lines(memory: Memory, path: Path, report: ImportReport) -> None:
         try:
             item = json.loads(line)
         except ValueError:
-            report.items.append((number, "rejected (not a JSON object)", line[:PREVIEW_CHARACTERS]))
+            report.items.append((number, "rejected (not a JSON object)", redact(line)[:PREVIEW_CHARACTERS]))
             continue
         if not isinstance(item, dict):
-            report.items.append((number, "rejected (not a JSON object)", line[:PREVIEW_CHARACTERS]))
+            report.items.append((number, "rejected (not a JSON object)", redact(line)[:PREVIEW_CHARACTERS]))
             continue
-        preview = " ".join(str(item.get("text") or "").split())[:PREVIEW_CHARACTERS]
+        # Redacted: a rejected line is shown in the report, and an agent running the import reads the report.
+        preview = redact(" ".join(str(item.get("text") or "").split()))[:PREVIEW_CHARACTERS]
         try:
             result = _remember(memory, item)
         except MemoryInputError as exc:
-            report.items.append((number, f"rejected ({_first_sentence(str(exc))})", preview))
+            reason = _first_sentence(str(exc))
+            report.items.append((number, f"rejected ({reason})", "" if "secret" in reason else preview))
             continue
         report.items.append((number, "imported" if result.status == "saved" else "already known", preview))
         origin = str(item.get("origin") or "").strip()

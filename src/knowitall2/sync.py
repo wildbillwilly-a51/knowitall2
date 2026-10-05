@@ -27,6 +27,7 @@ from .store import APPLYING_KEY, SYNCED_TABLES, TRACK_KEY, Store, SyncedTable
 MAX_TEXT = 20_000
 CURSOR_KEY = "sync.cursor"
 SOURCE_KEY = "sync.source"
+EPOCH_KEY = "sync.server_epoch"
 
 
 class SyncError(ValueError):
@@ -294,6 +295,44 @@ def note_all(store: Store, name: str) -> None:
         f"INSERT INTO changes (tbl, key, op) SELECT ?, {table.key}, 'upsert' FROM {table.name} ORDER BY rowid",
         (table.name,),
     )
+
+
+def server_went_back(store: Store, hello: dict[str, Any]) -> bool:
+    """Whether the server's memory went back since this computer last synced (a backup put back, a new volume).
+
+    The server's change numbers only grow, so a next fetch that starts past
+    the server's newest change says so, with any server; and a server that
+    names its epoch says so when the epoch differs from the one kept here.
+    """
+
+    latest = hello.get("latest")
+    if isinstance(latest, int) and not isinstance(latest, bool) and cursor(store) > latest:
+        return True
+    epoch, kept = hello.get("epoch"), store.get_meta(EPOCH_KEY)
+    return isinstance(epoch, str) and bool(epoch) and kept is not None and kept != epoch
+
+
+def keep_epoch(store: Store, hello: dict[str, Any]) -> None:
+    epoch = hello.get("epoch")
+    if isinstance(epoch, str) and epoch and store.get_meta(EPOCH_KEY) != epoch:
+        with store.transaction():
+            store.set_meta(EPOCH_KEY, epoch)
+
+
+def send_everything_again(store: Store) -> None:
+    """After the server's memory went back: fetch from the start, and note every shared row to be sent again.
+
+    The server keeps one copy of a row it already has exactly, settles a
+    row it has another version of as it settles any change, and gets back
+    the rows it lost. What this computer saw of the server's numbers no
+    longer holds, so nothing sent is based on them.
+    """
+
+    with store.transaction():
+        store.connection.execute("DELETE FROM sync_seen")
+        store.set_meta(CURSOR_KEY, "0")
+        for name in SYNCED_TABLES:  # parents first
+            note_all(store, name)
 
 
 def note_parents(store: Store, table: SyncedTable, row: dict[str, Any]) -> None:

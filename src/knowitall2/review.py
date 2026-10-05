@@ -28,14 +28,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from . import journal
-from .memory import QUESTION_REVIEW_DAYS, QUESTIONS_SHOWN_KEY, Memory, MemoryInputError
+from .memory import QUESTION_CHECK_DAYS, QUESTION_REVIEW_DAYS, QUESTIONS_SHOWN_KEY, Memory, MemoryInputError
 from .store import RecordRow, Store
 
 UNCONFIRMED_RULE_PREFIX = "Possible rule, not confirmed by the user: "
 LIST_LIMIT = 5
 STAGES = ("review", "checking", "ask_user")
 CHECK_OFFERS = 6
-CHECK_DAYS = 7
+CHECK_DAYS = QUESTION_CHECK_DAYS
 FIND_OUT_OFFERS = 12
 FIND_OUT_DAYS = 30
 # A question KnowItAll2 has not reviewed within this time (learning off, no engine) goes to the user.
@@ -130,16 +130,20 @@ def for_user(store: Store, *, limit: int = 100, now: datetime | None = None) -> 
     for question in store.open_questions(limit=500):
         row = store.question_stage(question["id"])
         current = row["stage"] if row else "review"
-        overdue = current == "review" and _parse(question["created_at"]) < moment - timedelta(days=REVIEW_DAYS)
+        created = _parse(question["created_at"])
+        # A question no review settled in a few days, or no agent checked within a week after that, is the
+        # user's, whether or not a learning run comes to hand it over.
+        overdue = (current == "review" and created < moment - timedelta(days=REVIEW_DAYS)) or (
+            current == "checking" and created < moment - timedelta(days=REVIEW_DAYS + CHECK_DAYS))
         if current == "ask_user" or overdue:
             waiting.append(with_plain(question, row, store))
     return waiting[:limit]
 
 
-def in_progress(store: Store) -> list[dict[str, Any]]:
+def in_progress(store: Store, *, now: datetime | None = None) -> list[dict[str, Any]]:
     """Open questions KnowItAll2 or an agent is still looking into."""
 
-    user = {item["id"] for item in for_user(store)}
+    user = {item["id"] for item in for_user(store, now=now)}
     found = []
     for question in store.open_questions(limit=500):
         if question["id"] in user:

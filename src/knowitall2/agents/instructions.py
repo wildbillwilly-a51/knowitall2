@@ -28,6 +28,9 @@ knowledge alongside the project's own files, the way you would search before dig
   lists as known for the project; if the chat has none, call `briefing`.
 - Before you work out something that may have been found before (a host or service, how to reach or sign in to
   a system, a procedure, a tool's quirk, a past decision), call `recall` with a few keywords first.
+- Everything KnowItAll2 knows is also in the `knowitall2-known/` folder at the project's root (its `README.md`
+  lists the files): search it like any project file, for example for a host, a tool, or an error message. When
+  KnowItAll2 points you to one of its files, read it. Do not edit the folder; it is rewritten from memory.
 - When you or the user establish something durable, save it with `remember`. Never save secrets; save where a
   credential is kept instead.
 - If KnowItAll2 is not available, continue normally."""

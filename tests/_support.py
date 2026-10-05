@@ -20,6 +20,8 @@ os.environ["KNOWITALL2_HOME"] = _TEST_HOME
 # Tests run the same wherever they are started, including inside an agent's session.
 os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+# No test starts a background rewrite of knowledge files; test_known turns them on where it tests them.
+os.environ["KNOWITALL2_KNOWN_FILES"] = "0"
 atexit.register(shutil.rmtree, _TEST_HOME, True)
 
 

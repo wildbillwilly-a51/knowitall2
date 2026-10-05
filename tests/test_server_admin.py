@@ -408,6 +408,13 @@ class AdminPageTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("already set up", data["error"])
 
+    def test_wrong_setup_codes_are_limited_like_wrong_passwords(self) -> None:
+        # Review 2026-10-04, S-6.
+        wanted = {"username": "keeper", "new_password": PASSWORD, "setup_code": "AAAA-BBBB-CCCC-DDDD-EEEE"}
+        statuses = [self.browser.request("POST", "/admin/api/setup", wanted)[0] for _ in range(6)]
+        self.assertEqual(statuses[:5], [403] * 5)
+        self.assertEqual(statuses[5], 429)
+
     def test_a_server_with_an_admin_has_no_setup_code(self) -> None:
         self.set_up_admin()
         self.stop()

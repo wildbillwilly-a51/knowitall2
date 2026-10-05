@@ -17,6 +17,7 @@ nothing about a memory's own text changes.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,6 +36,10 @@ HEADLINE_CHARACTERS = 120
 SUMMARY_CHARACTERS = 200
 MAX_GAPS = 4
 MAX_ALIASES = 6
+# A memory, or a new system, the model leaves out of its answer is tried again; after this many answers that
+# left it out, it is filed as general (or the system kept without a summary) so it cannot hold the queue.
+SKIPS_BEFORE_GENERAL = 3
+SKIPS_KEY = "catalog.skips"
 
 FILE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -159,6 +164,8 @@ class CatalogReport:
     usage: Counter = field(default_factory=Counter)
     # Questions already sent to the model in this run, so one it skips is not paid for twice.
     reviewed: set = field(default_factory=set)
+    # Memories and systems the model left out of an answer in this run: tried again in a later run, not this one.
+    left_out: set = field(default_factory=set)
 
     def describe(self) -> str:
         parts = [f"filed {self.filed} memories", f"{self.new_systems} new systems", f"described {self.profiled} systems"]
@@ -237,7 +244,8 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
                run: str | None = None) -> int:
     """With ``peek``, whether there is work; otherwise one batch, returning the model calls made."""
 
-    batch = memory.store.unnoted_records(limit=FILE_BATCH)
+    batch = [record for record in memory.store.unnoted_records(limit=FILE_BATCH + len(report.left_out))
+             if record.id not in report.left_out][:FILE_BATCH]
     if peek or not batch:
         return int(bool(batch))
     systems = memory.store.systems_list()
@@ -260,11 +268,42 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
                 written_by=CATALOG_AGENT, now=now,
             ):
                 report.filed += 1
-        # A memory the model skipped is filed as general, so it cannot hold the queue.
+        # A memory the model skipped (a short or cut-off answer) waits for the next batch; one skipped again
+        # and again is filed as general, so it cannot hold the queue.
+        skips = _skips(memory)
+        for record_id in open_ids - set(wanted):
+            skips.pop(record_id, None)
         for record in wanted.values():
-            memory.store.add_note(record.id, headline=_clean(record.text, 100), system_id=None, facet="other",
-                                  written_by=CATALOG_AGENT, now=now)
+            if record.id not in open_ids:
+                continue
+            report.left_out.add(record.id)
+            if _skipped_again(skips, record.id):
+                memory.store.add_note(record.id, headline=_clean(record.text, 100), system_id=None, facet="other",
+                                      written_by=CATALOG_AGENT, now=now)
+        _save_skips(memory, skips)
     return 1
+
+
+def _skips(memory: Memory) -> dict[str, int]:
+    try:
+        found = json.loads(memory.store.get_meta(SKIPS_KEY) or "{}")
+    except ValueError:
+        return {}
+    return {str(key): int(value) for key, value in found.items() if isinstance(value, int)} if isinstance(found, dict) else {}
+
+
+def _skipped_again(skips: dict[str, int], key: str) -> bool:
+    """Count one more answer that left ``key`` out; True (and forget it) once that has happened often enough."""
+
+    skips[key] = skips.get(key, 0) + 1
+    if skips[key] >= SKIPS_BEFORE_GENERAL:
+        del skips[key]
+        return True
+    return False
+
+
+def _save_skips(memory: Memory, skips: dict[str, int]) -> None:
+    memory.store.set_meta(SKIPS_KEY, json.dumps(dict(list(skips.items())[-500:]), sort_keys=True))
 
 
 def _active(memory: Memory, record_id: str) -> bool:
@@ -335,7 +374,8 @@ def _systems_to_describe(memory: Memory) -> list[tuple[dict[str, Any], list[dict
 
 def _profile_step(memory: Memory, report: CatalogReport, *, peek: bool = False, engine: Any = None,
                   run: str | None = None) -> int:
-    pending = _systems_to_describe(memory)[:PROFILE_BATCH]
+    pending = [item for item in _systems_to_describe(memory)
+               if f"system:{item[0]['id']}" not in report.left_out][:PROFILE_BATCH]
     if peek or not pending:
         return int(bool(pending))
     lines = []
@@ -365,10 +405,18 @@ def _profile_step(memory: Memory, report: CatalogReport, *, peek: bool = False, 
             described.add(system["id"])
             report.profiled += 1
         # A system the model skipped keeps its summary and gaps as they are now (the finder may have filled a
-        # gap meanwhile) but is not asked about again until its memories change.
-        for system_id, (_, fingerprint) in by_id.items():
-            if system_id not in described:
+        # gap meanwhile) but is not asked about again until its memories change; one with no summary yet is
+        # asked about again, until answers have left it out a few times.
+        skips = _skips(memory)
+        for system_id, (system, fingerprint) in by_id.items():
+            key = f"system:{system_id}"
+            if system_id in described:
+                skips.pop(key, None)
+            elif system.get("summary") or _skipped_again(skips, key):
                 memory.store.set_system_profiled(system_id, profiled=fingerprint, now=now)
+            else:
+                report.left_out.add(key)
+        _save_skips(memory, skips)
     return 1
 
 
@@ -417,7 +465,8 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
         if question["kind"] == "conflict" and item.get("certain") is True and decision in keys:
             outcome = review.settle(memory, question, decision, by="KnowItAll2", evidence=reason or "")
             if outcome:
-                report.questions["settled"] += 1
+                # Settled now, or meanwhile by someone else (already answered, memories changed): done either way.
+                report.questions["settled" if "nothing was changed" not in outcome else "settled meanwhile"] += 1
                 continue
         if question["kind"] == "conflict" and not _user_must_decide(records, decision):
             review.start_check(memory, question, records, plain=plain, labels=labels, reason=reason)
@@ -432,11 +481,13 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
 
 
 def _user_must_decide(records: list[Any], decision: Any) -> bool:
-    """Whether only the user can settle a conflict: when the likely answer would change their own words."""
+    """Whether only the user can settle a conflict: when either side is in their own words.
 
-    older, newer = records
-    return (older.verification == "user_stated" and decision == "use_new") or (
-        newer.verification == "user_stated" and decision == "keep_mine")
+    Whatever the model leans towards, an agent's check would settle a
+    disagreement with what the user said, so it goes straight to the user.
+    """
+
+    return any(record.verification == "user_stated" for record in records)
 
 
 def _render_question(memory: Memory, question: dict[str, Any], records: list[Any]) -> str:

@@ -64,6 +64,8 @@ QUESTION_NOTICE_DAYS = 3
 QUESTIONS_SHOWN_KEY = "questions_shown_at"
 # A question the background review has not settled within this time goes to the user.
 QUESTION_REVIEW_DAYS = 3
+# And one handed to agents that none checked within this time after that.
+QUESTION_CHECK_DAYS = 7
 TASK_OFFER_HEADER = (
     "KnowItAll2 asks (optional; only if it is quick and look-only, and never in the way of the user's task):"
 )
@@ -550,6 +552,9 @@ class Memory:
         rules, elsewhere = self._rules_for_its_systems(rules, project)
         entries, snapshots = self._contents(project) if project is not None else ([], 0)
         notice = self._question_notice()
+        from .known import folder_line
+
+        where_everything_is = folder_line(project_path)
         if not rules and not entries and not instructed and not elsewhere:
             self._log_usage("briefing", project, None, [])
             where = "this project" if project else "this folder"
@@ -557,12 +562,16 @@ class Memory:
                 f"{title}\nNothing is stored for {where} yet. Use recall to search all memories, "
                 "and remember to save durable facts."
             ]
+            if where_everything_is:
+                lines_out.append(where_everything_is)
             if notice:
                 lines_out.append(notice)
             if project_id is not None:
                 lines_out.extend(self._task_lines(project_id=project_id, record_ids=[]))
             return "\n".join(lines_out)
         footer = "Use recall with a few keywords before rediscovering something; save durable facts with remember."
+        if where_everything_is:
+            footer = where_everything_is + "\n" + footer
         lines = _BoundedLines(max_characters - len(footer) - 48)
         lines.add(title)
         shown: list[str] = []
@@ -744,8 +753,11 @@ class Memory:
         """One briefing line about open questions, at most once every few days."""
 
         try:
-            overdue = (_parse_time(self._clock()) - timedelta(days=QUESTION_REVIEW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            count = self.store.count_user_questions(overdue_before=overdue)
+            moment = _parse_time(self._clock())
+            overdue = (moment - timedelta(days=QUESTION_REVIEW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            unchecked = (moment - timedelta(days=QUESTION_REVIEW_DAYS + QUESTION_CHECK_DAYS)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            count = self.store.count_user_questions(overdue_before=overdue, checking_before=unchecked)
             if not count:
                 return None
             shown = self.store.get_meta(QUESTIONS_SHOWN_KEY)
@@ -1030,12 +1042,29 @@ def _without_instructed(
     for row in rules:
         found = None
         if len(significant_words(row.text)) >= _INSTRUCTED_MINIMUM_WORDS:
-            found = next((name for name, section in sections if quoted_in(row.text, [section])), None)
+            found = next((name for name, section in sections if _states(section, row.text)), None)
         if found:
             instructed.append((row, found))
         else:
             kept.append(row)
     return kept, instructed
+
+
+_NEGATIONS = frozenset({"not", "never", "don't", "dont", "doesn't", "doesnt", "ignore", "skip", "except",
+                        "unless", "instead", "no", "nor", "without"})
+
+
+def _states(section: str, rule: str) -> bool:
+    """Whether a section of an instruction file states ``rule``: copied word for word into a paragraph that
+    does not turn it around ("the following rule does NOT apply here: ...")."""
+
+    allowed = {word.lower() for word in re.findall(r"[A-Za-z']+", rule)}
+    for paragraph in re.split(r"\n\s*\n|\n\s*(?=[-*+]\s|\d+[.)]\s)", section):
+        if quoted_in(rule, [paragraph]):
+            words = {word.lower() for word in re.findall(r"[A-Za-z']+", paragraph)}
+            if not (words - allowed) & _NEGATIONS:
+                return True
+    return False
 
 
 def _instruction_sections(project: ProjectIdentity | None) -> list[tuple[str, str]]:

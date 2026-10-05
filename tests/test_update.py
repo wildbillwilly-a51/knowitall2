@@ -61,6 +61,32 @@ class DownloadTests(unittest.TestCase):
         self.assertIn("could not sign in", output)
         self.assertIn("Nothing was changed.", output)
 
+    def test_a_new_version_that_does_not_start_is_undone(self) -> None:
+        # Review 2026-10-04, U-M4.
+        class Broken(FakeGit):
+            def __call__(self, command, **options):
+                if command[0] != "git" and "--version" in command:
+                    self.commands.append((command, options))
+                    return subprocess.CompletedProcess(command, 1, "", "SyntaxError: invalid syntax")
+                return super().__call__(command, **options)
+
+        git = Broken()
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"KNOWITALL2_HOME": home}):
+            code, output = self.run_update(git)
+        self.assertEqual(1, code)
+        self.assertIn("went back to the version you had", output)
+        self.assertIn(["reset", "--hard", "aaa"], [command[3:] for command, _ in git.commands if command[0] == "git"])
+        self.assertFalse(any("--finish" in command for command, _ in git.commands))
+
+    def test_one_update_at_a_time(self) -> None:
+        from knowitall2.learning.state import RunLock
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"KNOWITALL2_HOME": home}):
+            with RunLock(Path(home) / update.UPDATE_LOCK):
+                code, output = self.run_update(FakeGit())
+        self.assertEqual(1, code)
+        self.assertIn("Another KnowItAll2 update is running", output)
+
     def test_a_copy_that_is_not_a_clone_says_how_to_reinstall(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output), mock.patch.object(update, "checkout_root", return_value=None):

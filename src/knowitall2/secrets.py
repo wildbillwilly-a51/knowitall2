@@ -109,6 +109,9 @@ _PROSE_FOR = re.compile(
     re.IGNORECASE,
 )
 _PASSWORD_SHAPED = re.compile(r"[0-9]|[^A-Za-z0-9\s]")
+# Factory and habitual passwords, which are passwords even as plain words, such as a device's default.
+_WELL_KNOWN_PASSWORDS = frozenset({"password", "admin", "changeme", "letmein", "welcome", "qwerty", "toor", "root",
+                                   "ubnt", "raspberry", "guest", "abc123", "passw0rd"})
 # Flags such as --password, --api-key, and openssl's -passin; never --password-stdin.
 _CLI_FLAG = re.compile(
     r"(?<![\w-])--?(?P<key>(?:[A-Za-z0-9]+-)*(?:pass(?:word|wd|phrase|in|out)?|pwd|secret|token"
@@ -133,6 +136,9 @@ _COMMAND_FORMS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:\bmachine\s+\S+|(?m:^)[ \t]*default)(?:\s+(?:login|account|port)\s+\S+)*"
                r"\s+password\s+(?P<value>\S{1,%d})" % _REACH),
     re.compile(r"\bConvertTo-SecureString\b(?:\s+-String)?\s+(?P<value>\"[^\"\n]*\"|'[^'\n]*')", re.IGNORECASE),
+    re.compile(r"\b(?:docker|podman|helm)\s+(?:registry\s+)?login\b" + _OPTIONS + r"\s-p(?:\s+|=)" + _VALUE_GROUP),
+    re.compile(r"\bsmbclient\b" + _OPTIONS + r"\s(?:-U|--user)(?:\s+|=)?[\"']?[^\s%%\"']+%%(?P<value>[^\s\"']{1,%d})"
+               % _REACH),
 )
 
 _REFERENCE_WORDS = frozenset({
@@ -170,6 +176,7 @@ _CODE_REFERENCE = re.compile(
     r"|^(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*[\[(][ \t]*[\"'][A-Za-z_][\w.\-]*(?:[\"'][ \t]*[\])]?)?$"
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
+_CALL = re.compile(r"^[A-Za-z_][\w.]*\([^()\s]*\)$")
 _PLAIN_WORDS = re.compile(r"^[a-z]+(?:[-_][a-z]+)*$")
 _QUOTES = "\"'`"
 # Punctuation and closing quotes after a value: "(see the vault)", 'is weak".'
@@ -196,6 +203,8 @@ def find_secrets(text: str) -> list[SecretFinding]:
         kind = _kind(key)
         if value is None or _is_reference(value.group(), loose=kind != "password", code=not match.group("prose")):
             continue
+        if match.group("prose") and not _prose_password(value.group()):
+            continue  # "the password is weak", "the password was shared": prose, as with "for nas01 is weak"
         findings.append(SecretFinding(kind, value.start(), ends.end(*value.span())))
     for match in _PROSE_FOR.finditer(text):
         value = match.group("value")
@@ -254,6 +263,23 @@ class _ValueEnds:
         return self.stretch[1]
 
 
+def _prose_password(value: str) -> bool:
+    """Whether the value prose gives for a password counts as one: quoted, password-shaped, or well known.
+
+    An all-letter word, or words joined by hyphens ("case-sensitive",
+    "per-user"), is how people describe a password, not the password; the
+    same known limit as "the password for X is Y".
+    """
+
+    raw = value.strip().rstrip(".,:;!?)]}")
+    if raw[:1] in _QUOTES and raw[-1:] == raw[:1] and len(raw) > 2:
+        return True
+    bare = raw.strip(_QUOTES)
+    if bare.lower() in _WELL_KNOWN_PASSWORDS:
+        return True
+    return bool(_PASSWORD_SHAPED.search(bare)) and not re.fullmatch(r"[A-Za-z]+(?:-[A-Za-z]+)+", bare)
+
+
 def _secret_key(key: str) -> bool:
     return bool(_SNAKE_KEY.search(key) or _CAMEL_KEY.search(key) or _UPPER_KEY.match(key))
 
@@ -285,6 +311,8 @@ def _is_placeholder(candidate: str) -> bool:
         return True
     code = _CODE_REFERENCE.match(bare)
     if code and (code.group("field") is None or _secret_key(code.group("field"))):
+        return True
+    if _CALL.match(candidate.rstrip(".,:;!?" + _QUOTES)):  # password = getpass(), pwd = Path.cwd(): code, not a value
         return True
     return bool(_VARIABLE_NAME.match(bare) or _CONSTANT.match(bare) or _SHELL_VARIABLE.match(bare)
                 or _FORMAT_FIELD.match(bare) or _FETCH_COMMAND.match(bare))

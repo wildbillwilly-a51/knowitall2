@@ -185,6 +185,14 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--previous", default=__version__, help=argparse.SUPPRESS)
     update.add_argument("--unchanged", action="store_true", help=argparse.SUPPRESS)
 
+    known = commands.add_parser(
+        "known", help="write what KnowItAll2 knows as files in each project (knowitall2-known/) now",
+    )
+    switch = known.add_mutually_exclusive_group()
+    switch.add_argument("--off", action="store_true", help="take the files out of every project and keep them out")
+    switch.add_argument("--on", action="store_true", help="write the files again after --off")
+    known.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
+
     commands.add_parser("version", help="print the version")
     return parser
 
@@ -237,6 +245,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .connected import run_command as run_sync
 
         return run_sync(arguments)
+    if arguments.command == "known":
+        from .known import run_command as run_known
+
+        return run_known(arguments)
     if arguments.command in {"setup", "uninstall", "doctor"}:
         return _run_agent_command(arguments)
     if arguments.command == "server":
@@ -276,8 +288,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         agent = f"import:{arguments.label}"[:40] if arguments.command == "import" else "cli"
         print(_run(Memory(store, agent=agent), store, arguments))
         from .connected import nudge
+        from .known import nudge as refresh_known_files
 
         nudge("cli", store=store, pull=False)
+        refresh_known_files()
         return 0
     except MemoryInputError as exc:
         print(f"knowitall2: {exc}", file=sys.stderr)
@@ -460,6 +474,8 @@ def _run_agent_command(arguments: argparse.Namespace) -> int:
         return 1
     if arguments.command == "uninstall":
         shared = _forget_agent_key(arguments.agent)
+        if arguments.user_home is None:
+            shared = [*shared, *_remove_knowledge_files_if_last()]
     verb = "setup" if arguments.command == "setup" else "uninstall"
     # The app is installed with KnowItAll2; testing against another home leaves the real shortcut alone.
     app_changes: list[str] = []
@@ -549,6 +565,30 @@ def _forget_agent_key(agent: str) -> list[str]:
     finally:
         store.close()
     return [f"removed {agent}'s key for the KnowItAll2 server; remove its entry on the server's page"]
+
+
+def _remove_knowledge_files_if_last() -> list[str]:
+    """After uninstalling an agent: when no agent here still has KnowItAll2's instructions, take out the
+    knowledge files KnowItAll2 wrote into projects (memories are kept)."""
+
+    from . import known
+    from .agents import instructions
+
+    for name in AGENT_NAMES:
+        path = getattr(adapter_for(name), "instructions_path", None)
+        if path is not None and instructions.state(path) != "missing":
+            return []
+    try:
+        store = Store.open(database_path()) if database_path().is_file() else None
+    except StoreError:
+        store = None
+    try:
+        changes = known.remove_all(store._connection if store is not None else None)
+    finally:
+        if store is not None:
+            store.close()
+    return [f"no agent here uses KnowItAll2 any more, so its knowledge files were taken out of projects "
+            f"({len(changes)} changes)"] if changes else []
 
 
 def _run_server_command(arguments: argparse.Namespace) -> int:

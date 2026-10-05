@@ -178,6 +178,7 @@ class SyncReport:
     refused: int = 0
     uses: int = 0
     skipped: bool = False
+    resent: bool = False  # the server's memory went back, so everything here was sent again
     problem: str | None = None
     status: int | None = None
     details: list[str] = field(default_factory=list)
@@ -190,7 +191,9 @@ class SyncReport:
         parts = [f"sent {self.sent} change(s)", f"received {self.received}"]
         if self.refused:
             parts.append(f"{self.refused} refused by the server")
-        return "Synced with the KnowItAll2 server: " + ", ".join(parts) + "."
+        again = (" The server's memory had gone back (a backup put back, or a new start), so this computer sent "
+                 "all its memories again.") if self.resent else ""
+        return "Synced with the KnowItAll2 server: " + ", ".join(parts) + "." + again
 
 
 class SyncLock(RunLock):
@@ -287,9 +290,12 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
                 # The server's number for the version sent (older servers leave it out), so this row's next
                 # change is based on it even when another agent's key sends it.
                 seen.append((operation["table"], operation["key"], result["seq"]))
-        sync.acknowledge(store, settled, seen=seen)
-        if server_rows:  # a row changed here again since it was sent is left alone, as in a pull
-            sync.apply_pulled(store, server_rows)
+        # One transaction: a change counts as settled only together with the server's version of it, so a
+        # failure between the two never leaves a version here that the server turned down.
+        with store.transaction():
+            sync.acknowledge(store, settled, seen=seen)
+            if server_rows:  # a row changed here again since it was sent is left alone, as in a pull
+                sync.apply_pulled(store, server_rows)
         if not settled and len(waiting) == before:  # the server answered none of them
             break
     return sent, refused
@@ -372,7 +378,12 @@ def sync_now(store: Store, *, agent: str | None = None, remote: RemoteClient | N
     try:
         with SyncLock():
             try:
-                columns = remote.hello().get("columns") or {}
+                hello = remote.hello()
+                columns = hello.get("columns") or {}
+                if sync.server_went_back(store, hello):
+                    sync.send_everything_again(store)
+                    report.resent = True
+                sync.keep_epoch(store, hello)
                 for _ in range(ROUNDS):
                     report.received += pull(store, remote)
                     sent, refused = push(store, remote, columns)
@@ -396,7 +407,7 @@ def sync_now(store: Store, *, agent: str | None = None, remote: RemoteClient | N
         report.skipped = True
         return report
     write_status(report, pending=sync.has_pending(store))
-    if report.sent or report.received or report.refused:
+    if report.sent or report.received or report.refused or report.resent:
         journal.record(store, "sync", report.describe(), outcome="problem" if report.problem else "ok",
                        agent=remote.agent, details={"sent": report.sent, "received": report.received,
                                                     "refused": report.refused})
@@ -555,14 +566,13 @@ def connect(
                               "uploaded": 0, "received": 0}
     if existing is not None:
         return report
-    write_text_atomic(folder() / "connection.json",
-                      json.dumps({"address": address, "connected_at": journal.utc_now()}, indent=2) + "\n")
     with store.transaction():
         store.connection.execute("DELETE FROM changes")
         store.connection.execute("DELETE FROM sync_seen")
         # A new id for the operations sent from now on, so the answers the server keeps for an earlier
         # connection's operations are never taken for this one's.
         store.connection.execute("DELETE FROM meta WHERE key = ?", (sync.SOURCE_KEY,))
+        store.connection.execute("DELETE FROM meta WHERE key = ?", (sync.EPOCH_KEY,))
         store.set_meta(sync.CURSOR_KEY, "0")
         last_use = store.connection.execute("SELECT COALESCE(MAX(seq), 0) FROM usage").fetchone()[0]
         store.set_meta(USAGE_CURSOR_KEY, str(last_use))
@@ -574,6 +584,10 @@ def connect(
     with store.transaction():
         for name in SYNCED_TABLES if upload else ("projects",):
             sync.note_all(store, name)
+    # Last: only a computer that notes its changes counts as connected, so a failure above (such as a database
+    # held by another process) leaves it as it was, and running the command again connects it in full.
+    write_text_atomic(folder() / "connection.json",
+                      json.dumps({"address": address, "connected_at": journal.utc_now()}, indent=2) + "\n")
     try:
         sent, refused = push(store, remote, remote.hello().get("columns") or {})
         if upload:

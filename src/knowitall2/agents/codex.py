@@ -394,11 +394,12 @@ def windows_command(python: str, launcher: str | PurePath, *, shorten=None) -> s
     """
 
     shorten = shorten or _short_path
-    if not all(_plain(str(path).replace(" ", "")) for path in (python, launcher)):
-        return None
     parts = [_without_spaces(PureWindowsPath(python), shorten), _without_spaces(PureWindowsPath(launcher), shorten)]
     if all(part is not None for part in parts):
+        # What counts is the command as written: "Program Files (x86)" is C:\PROGRA~2, which both shells run.
         return f"{parts[0]} -B {parts[1]}" if all(_plain(part) for part in parts) else None
+    if not all(_plain(str(path).replace(" ", "")) for path in (python, launcher)):
+        return None
     return f"& {_powershell_quote(python)} -B {_powershell_quote(str(launcher))}"
 
 

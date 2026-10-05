@@ -102,6 +102,11 @@ def main(argv: Sequence[str] | None = None, *, stdin: str | None = None) -> int:
                 nudge(arguments[0])
         except Exception as exc:
             journal.problem(source, f"a sync could not start: {type(exc).__name__}: {exc}")
+        # Rewrite the knowledge files in each project when memories changed (including by that sync's
+        # previous run); one read-only query when nothing changed. Never raises.
+        from .known import nudge as refresh_known_files
+
+        refresh_known_files()
     return 0
 
 
@@ -224,6 +229,29 @@ def _start_chat(payload: dict[str, Any], agent: str, *, since: str, project_id: 
         chats.prune()
 
 
+def _pointers(payload: dict[str, Any], store: Any, inputs: Sequence[str], state: dict[str, Any]) -> list[tuple[str, str]]:
+    """Which knowledge files the user's message or the agent's tool calls since the last message name.
+
+    Never raises: a pointer is a help, and a failure must not cost the chat what else this hook adds.
+    """
+
+    try:
+        from . import known
+        from .identity import find_git_root
+
+        cwd = _text(payload, "cwd")
+        if not cwd or not known.enabled():
+            return []
+        root = find_git_root(Path(cwd))
+        if root is None:
+            return []
+        texts = [_text(payload, "prompt") or "", *inputs]
+        return known.find_pointers(store._connection, texts, root / known.FOLDER, state.get("pointed", []))
+    except Exception as exc:
+        journal.problem("message hook", f"knowledge-file pointers could not be found: {type(exc).__name__}: {exc}")
+        return []
+
+
 def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None) -> str:
     """What is new to this chat since its briefing: memories added since, and projects it moved to."""
 
@@ -258,6 +286,13 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
         else:
             inputs, mentioned = chats.read_new(state, transcript)
             state["told"] = [*state.get("told", []), *sorted(mentioned)]
+        pointers = _pointers(payload, store, inputs, state)
+        if pointers:
+            parts.append("\n".join(line for _, line in pointers))
+            state["pointed"] = [*state.get("pointed", []), *(target for target, _ in pointers)]
+            from .known import log_pointers
+
+            log_pointers(agent, chat, [target for target, _ in pointers], at=memory.now())
         worked = chats.projects_worked_in(inputs, store.all_project_paths())
         moved = [project_id for project_id, calls in sorted(worked.items(), key=lambda item: -item[1])
                  if calls >= chats.WORK_CALLS and project_id not in state["projects"]]

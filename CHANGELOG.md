@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.10.0 (2026-10-04)
+
+Everything KnowItAll2 knows is now where agents already look: in files in
+each project. Measured in real sessions, agents asked KnowItAll2 for
+knowledge rarely and found about 30% of what they needed through it; given
+the same knowledge as files, with a pointer to the right one, they found the
+stored answer every time in a test on real failures.
+
+- **Everything KnowItAll2 knows, as files in each project.** Every active
+  memory is written to `knowitall2-known/` at the root of each project folder
+  KnowItAll2 has seen: one file per system or project, how to reach it and
+  where its sign-in is kept first, then how-tos, then the rest, newest first,
+  and a `README.md` listing the files. Agents search it like any project
+  file. Nothing is filtered or ranked: what an agent can find is everything
+  KnowItAll2 knows. The files are rewritten in the background when memories
+  change, here or on another computer (after a sync).
+- **Git never sees it.** The folder is listed in the repository's own
+  exclude file (shared by its worktrees), and a `.ignore` file lets search
+  tools that follow Git's ignore rules see it. A folder or `.ignore` that
+  KnowItAll2 did not write is left alone, and `knowitall2 doctor` names any
+  project where your own `.ignore` hides the folder. Folders that are not Git
+  repositories get no files.
+- **A pointer to the right file.** When your message, or the agent's own
+  commands, name a system or project KnowItAll2 knows about, the agent is
+  told once in that chat which file holds what is known about it.
+- **The instructions say where everything is.** The KnowItAll2 section of
+  `AGENTS.md` and `CLAUDE.md`, the skill, and the briefing tell agents to
+  search the folder and read the file they are pointed to, and never to edit
+  it. Run the update to refresh each agent's instructions.
+- **Off when you want.** `knowitall2 known --off` removes the folders and
+  keeps them out; `knowitall2 known --on` brings them back;
+  `knowitall2 known` writes them now. Uninstalling the last agent removes
+  them.
+
+Fixes from a second review of the whole program, a day after 0.9.0, first
+prepared as 0.9.1. Each fix came with a test that fails without it.
+
+- **A server put back from a backup no longer splits your memory.** When
+  the server's memory goes back (a backup put back, or a new, empty
+  volume), every connected computer notices at its next sync and sends its
+  memories again, so the server and every computer end up with everything.
+  Before, they silently kept different memories. A sync interrupted at the
+  wrong moment also no longer leaves one memory different from the server.
+- **Learning trusts less of what it reads.** A web page fetched from the
+  command line, a commit or diff, or a settings file printed from a
+  project's own folder no longer counts as something a command observed. A
+  learned memory counts as your own words only when it says nearly only
+  what you said, with no address, path, or command you did not write; text
+  you pasted into a chat is not your words. A memory the model wrongly says
+  it updates is left alone, and a run that hits a busy memory store keeps
+  what it already learned.
+- **"Learn these" works.** The app's button for catching up on past
+  sessions answered with an error since the app's first version. Catching
+  up now reads only the part of a session that was set aside.
+- **Questions reach you.** A question handed to agents that none checked
+  comes to you after a week even when learning is off, and the app lets you
+  answer it. A disagreement with something you said always comes to you.
+- **"Ask an agent to find these out" stays in the project folder** on
+  Claude Code 2.1 or later.
+- **Fewer false alarms about secrets.** "The password is shared with the
+  team" and similar sentences are no longer refused as secrets, while
+  passwords given to `docker login` and `smbclient` are now caught.
+- **Codex's hooks stay** for a Python installed under `Program Files
+  (x86)`, which 0.9.0's update removed.
+- **The update undoes itself** when the new version cannot start, and two
+  updates never run at once.
+- **The server is cheaper to refuse**: it checks an agent's key before
+  reading what the agent sends. Removing an agent frees its maintenance
+  turn, and wrong setup codes are limited like wrong passwords.
+- **Smaller fixes.** The catalog tries again what a short model answer left
+  out instead of filing it as general for good; a project's instructions
+  no longer hide one of your rules by quoting it in a "does not apply"
+  sentence; the import report never shows a secret; a Codex answer that
+  mentions a login no longer stops learning; the learner's state file
+  stops growing for deleted sessions.
+
 ## 0.9.0 (2026-10-03)
 
 Fixes from an outside review of the whole program. Every finding was

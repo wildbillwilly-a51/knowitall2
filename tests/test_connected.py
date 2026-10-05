@@ -589,6 +589,152 @@ class SyncingTests(TwoComputers):
                 self.assertTrue((connected.folder() / "sync.again").exists())
 
 
+class ConnectFailureTests(TwoComputers):
+    def test_a_store_failure_while_connecting_leaves_the_computer_unconnected_and_a_retry_connects_it(self) -> None:
+        # Review 2026-10-04, S-8: the computer counted as connected before it noted its changes.
+        with self.on("a") as store:
+            record_id = self.remember(store, "The build server is build-1.")
+        with mock.patch.object(sync, "set_tracking", side_effect=sqlite3.OperationalError("database is locked")), \
+                self.assertRaises(sqlite3.OperationalError):
+            self.connect("a")
+        with mock.patch.dict(os.environ, {"KNOWITALL2_HOME": str(self.root / "a")}):
+            self.assertIsNone(connected.load())
+        report = self.connect("a")
+        self.assertTrue(report["first"])
+        self.assertEqual(self.on_server(record_id), "active")
+
+
+class SettlingTests(TwoComputers):
+    def test_a_failure_after_the_server_settles_a_change_leaves_it_to_be_sent_again(self) -> None:
+        with self.on("a") as store:
+            record_id = self.remember(store, "The build server is build-1.")
+        self.connect("a")
+        self.connect("b", upload=False)
+        with self.on("b") as store:
+            Memory(store, agent="codex", clock=Clock("2026-10-01T13:00:00Z")).forget(record_id, reason="moved")
+        self.sync("b")
+        with self.on("a") as store:  # an older edit here, not yet sent: the server keeps b's newer version
+            store.connection.execute("UPDATE records SET text = ?, updated_at = ? WHERE id = ?",
+                                     ("The build server is build-1 (older).", "2026-10-01T12:30:00Z", record_id))
+        original, failed = sync.apply_pulled, []
+
+        def fails_once(store, changes, **options):
+            if "cursor" not in options and changes and not failed:  # the server's version of a sent change
+                failed.append(True)
+                raise sqlite3.OperationalError("database is locked")
+            return original(store, changes, **options)
+
+        with mock.patch.object(connected.sync, "apply_pulled", fails_once):
+            self.assertIn("locked", self.sync("a").problem)
+        with self.on("a") as store:
+            self.assertTrue(sync.has_pending(store))  # not settled: it goes again
+        self.assertIsNone(self.sync("a").problem)
+        with self.on("a") as store:
+            self.assertEqual(store.get(record_id).status, "retired")
+            self.assertFalse(sync.has_pending(store))
+        self.assertEqual(self.on_server(record_id), "retired")
+
+
+class ServerWentBackTests(TwoComputers):
+    """The server's memory goes back: a backup put back, or a new, empty volume."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.connect("a")
+        self.connect("b", upload=False)
+
+    def server_texts(self) -> set[str]:
+        store = self.server.open()
+        try:
+            return {row[0] for row in store.connection.execute("SELECT text FROM records WHERE status = 'active'")}
+        finally:
+            store.close()
+
+    def texts(self, computer: str) -> set[str]:
+        with self.on(computer) as store:
+            return {row[0] for row in store.connection.execute("SELECT text FROM records WHERE status = 'active'")}
+
+    def replace_server_database(self, source: Path | None) -> None:
+        """Stop the server, put ``source`` in place of its database (None: a new volume), and start it again."""
+
+        self.stop_server()
+        home = self.root / "server"
+        if source is None:
+            for path in list(home.iterdir()):
+                if path.is_file():
+                    path.unlink()
+        else:
+            for suffix in ("", "-wal", "-shm"):
+                (home / f"knowitall2.db{suffix}").unlink(missing_ok=True)
+            (home / "knowitall2.db").write_bytes(source.read_bytes())
+        self.start_server()
+
+    def test_a_backup_put_back_brings_every_computer_and_the_server_together_again(self) -> None:
+        from knowitall2.server import backups
+
+        with self.on("a") as store:
+            self.remember(store, "The build server is build-1.")
+        self.sync("a")
+        self.sync("b")
+        backup = self.root / "backup.db"
+        backups.copy_database(self.server.database, backup)
+        with self.on("a") as store:
+            self.remember(store, "The NAS is nas01.")
+            self.remember(store, "The CI runner is runner-3.")
+        self.sync("a")
+        self.sync("b")
+        self.replace_server_database(backup)  # no restart between the backup and putting it back
+        with self.on("a") as store:
+            self.remember(store, "The VPN gateway is vpn-2.")
+        for _ in range(2):
+            for computer in ("a", "b"):
+                self.assertIsNone(self.sync(computer).problem)
+        expected = {"The build server is build-1.", "The NAS is nas01.", "The CI runner is runner-3.",
+                    "The VPN gateway is vpn-2."}
+        self.assertEqual(self.server_texts(), expected)
+        self.assertEqual(self.texts("a"), expected)
+        self.assertEqual(self.texts("b"), expected)
+
+    def test_a_new_volume_gets_every_computers_memory_back_after_reconnecting(self) -> None:
+        with self.on("a") as store:
+            self.remember(store, "The build server is build-1.")
+        self.sync("a")
+        self.sync("b")
+        self.replace_server_database(None)
+        self.assertEqual(self.sync("a").status, 401)
+        self.connect("a")  # what the sync's message tells the user to do
+        self.connect("b", upload=False)
+        with self.on("b") as store:
+            self.remember(store, "The DNS server is dns1.")
+        for _ in range(2):
+            for computer in ("a", "b"):
+                report = self.sync(computer)
+                self.assertIsNone(report.problem)
+        expected = {"The build server is build-1.", "The DNS server is dns1."}
+        self.assertEqual(self.server_texts(), expected)
+        self.assertEqual(self.texts("a"), expected)
+        self.assertEqual(self.texts("b"), expected)
+
+    def test_the_epoch_stays_while_the_same_database_restarts(self) -> None:
+        first = self.server.epoch
+        self.stop_server()
+        self.start_server()
+        self.assertEqual(self.server.epoch, first)
+        with self.on("a") as store:
+            self.remember(store, "The build server is build-1.")
+            report = connected.sync_now(store)
+        self.assertFalse(report.resent)
+
+    def test_a_server_whose_newest_change_is_behind_this_computer_is_sent_everything(self) -> None:
+        with self.on("a") as store:
+            self.remember(store, "The build server is build-1.")
+            connected.sync_now(store)
+            store.set_meta(sync.CURSOR_KEY, "999")  # as after a whole computer was put back, file and database
+            report = connected.sync_now(store)
+        self.assertTrue(report.resent)
+        self.assertIn("gone back", report.describe())
+
+
 class NudgeTests(TwoComputers):
     def test_nothing_starts_on_a_computer_that_is_not_connected(self) -> None:
         launcher = mock.Mock()

@@ -19,7 +19,6 @@ admin's session is never accepted on the agents' routes.
 from __future__ import annotations
 
 import os
-import sqlite3
 import tempfile
 from contextlib import contextmanager
 from http import HTTPStatus
@@ -111,6 +110,9 @@ def _guarded(handler: Any) -> Iterator[None]:
     except admin.AdminError as exc:
         failed = "do not match" in str(exc)
         raise
+    except Exception as exc:
+        failed = getattr(exc, "status", None) == HTTPStatus.FORBIDDEN  # a setup code that does not match
+        raise
     finally:
         guard.end(address, failed=failed)
 
@@ -144,7 +146,8 @@ def _setup(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> N
         started = admin.start_session(store, now=now)
         return {"recovery_code": code, "form": started["form"]}, _cookie(handler, started["token"])
 
-    _run(handler, work)
+    with _guarded(handler):  # like signing in: a few wrong codes, then a wait
+        _run(handler, work)
 
 
 def _sign_in(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> None:
@@ -266,13 +269,7 @@ def _backup(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> 
     os.close(handle)
     target = Path(name)
     try:
-        origin = sqlite3.connect(str(handler.server.database), timeout=5.0)
-        copy = sqlite3.connect(str(target))
-        try:
-            origin.backup(copy)
-        finally:
-            copy.close()
-            origin.close()
+        backups.copy_database(handler.server.database, target)
         data = target.read_bytes()
     finally:
         target.unlink(missing_ok=True)

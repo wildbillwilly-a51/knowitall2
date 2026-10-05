@@ -29,6 +29,8 @@ MAX_FAILURES = 3
 LOCK_FILE = "run.lock"
 CALL_HISTORY_KEPT = 500
 FINGERPRINTS_KEPT = 5000
+# A log missing this long after its entry last changed is forgotten (its sessions were deleted).
+FORGET_MISSING_LOGS_DAYS = 90
 
 
 @dataclass
@@ -118,6 +120,11 @@ class LearnerState:
         return count
 
     def save(self) -> None:
+        # A log deleted long ago (an agent's old sessions cleaned up) needs no entry: the file stays small.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=FORGET_MISSING_LOGS_DAYS)).isoformat()
+        for key in [key for key, entry in self.logs.items()
+                    if str(entry.get("updated_at") or "9999") < cutoff and not os.path.exists(key)]:
+            del self.logs[key]
         document = {"schema_version": 1, "logs": self.logs, "calls": self.calls, "fingerprints": self.fingerprints}
         write_text_atomic(self.path, json.dumps(document, indent=2) + "\n")
 
@@ -135,9 +142,12 @@ def record_other_call(what: str, *, at: datetime | None = None, folder: Path | N
     path = (folder if folder is not None else data_home() / "learner") / OTHER_CALLS_FILE
     moment = (at or datetime.now(timezone.utc)).isoformat()
     path.parent.mkdir(parents=True, exist_ok=True)
-    kept = other_calls(path.parent)[-(OTHER_CALLS_KEPT - 1):]
-    lines = [json.dumps(call) for call in [*kept, {"at": moment, "session": what, "outcome": "ok"}]]
-    write_text_atomic(path, "\n".join(lines) + "\n")
+    # Appended, so two calls finishing together both count; trimmed now and then, which drops only old lines.
+    with open(path, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps({"at": moment, "session": what, "outcome": "ok"}) + "\n")
+    calls = other_calls(path.parent)
+    if len(calls) > 2 * OTHER_CALLS_KEPT:
+        write_text_atomic(path, "\n".join(json.dumps(call) for call in calls[-OTHER_CALLS_KEPT:]) + "\n")
 
 
 def other_calls(folder: Path) -> list[dict[str, Any]]:

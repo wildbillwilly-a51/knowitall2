@@ -132,9 +132,12 @@ class AccountTests(TemporaryFolder):
         code = accounts.new_join_code(self.store, "Laptop - Codex", now=NOW)
         key, connection = accounts.redeem(self.store, code["code"], agent="codex", computer=None, version=None,
                                           now=NOW)
+        self.assertTrue(exchange.take_lease(self.store, "maintenance", connection["id"], seconds=3600, now=NOW)["granted"])
         self.assertTrue(accounts.remove(self.store, connection["id"], now=NOW))
         self.assertIsNone(accounts.authenticate(self.store, key, now=NOW))
         self.assertEqual(accounts.connections(self.store), [])
+        # Its turn goes with it (review 2026-10-04, S-5): another computer need not wait out the hour.
+        self.assertTrue(exchange.take_lease(self.store, "maintenance", "c-other", seconds=600, now=NOW)["granted"])
 
     def test_the_server_keeps_neither_codes_nor_keys(self) -> None:
         code = accounts.new_join_code(self.store, "Laptop - Codex", now=NOW)

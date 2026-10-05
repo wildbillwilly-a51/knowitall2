@@ -102,6 +102,16 @@ The memories, the admin account, and the backups all live in the Docker
 volume `knowitall2_knowitall2-data`. Recreating the container (for example
 to update it) keeps them; deleting the volume erases them.
 
+### Putting a backup back
+
+Stop the server, replace `knowitall2.db` in the volume with the backup (and
+delete `knowitall2.db-wal` and `knowitall2.db-shm` beside it, if present),
+and start the server again. Nothing else is needed: every connected computer
+notices at its next sync that the server's memory went back, and sends all
+of its memories again. The server keeps one copy of what it already has, and
+gets back everything saved since the backup. The sync's message on each
+computer says when this happened.
+
 ## Updating
 
 Replace the KnowItAll2 folder with the new version, then run the same command
@@ -133,3 +143,9 @@ docker compose -f deploy/compose.yaml down
 stops it and keeps its data. Adding `--volumes` also deletes the data. Each
 computer keeps its own copy of the memory either way; `knowitall2 server
 disconnect` on a computer makes it keep its memory there only again.
+
+A server started again on an empty volume has no admin and knows no agents.
+Set up the admin with the setup code from its log, make a join code for each
+agent, and run `knowitall2 server connect` on each computer as its sync
+message says. Each computer then sends all of its memories to the new
+server at its next sync.

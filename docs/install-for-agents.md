@@ -19,8 +19,10 @@ install arrives with the first release.
   `AGENTS.md`) that tells agents to read the briefing and look things up
   first. It keeps everything else in those files, with their line endings
   and indentation, never writes into the user's projects, and never stores
-  secrets. Uninstalling removes what setup added; it can leave an empty
-  settings section behind, or change the blank lines at the end of a file.
+  secrets. Setup may write a short list in Claude Code's settings one item
+  per line. Uninstalling removes what setup added; it can leave an empty
+  settings section behind, remove a settings file that holds nothing else,
+  or change the blank lines at the end of a file.
 
 Each step gives a Windows (PowerShell) and a Linux (bash) form. Use the one for
 this computer.

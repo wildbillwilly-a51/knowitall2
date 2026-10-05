@@ -396,6 +396,39 @@ class LearningScreenTests(AppTestCase):
         self.assertEqual(404, self.request("POST", "/api/learning/news/n-00000000/anyway", body={})[0])
 
 
+class RouteTests(AppTestCase):
+    def test_every_route_is_found_for_its_own_method(self) -> None:
+        # Review 2026-10-04, U-H1: a GET listed first for a path made its POST answer 405.
+        import re
+
+        from knowitall2.app.server import _find_route
+
+        for method, pattern, handler in api.ROUTES:
+            if re.search(r"[\\^$*+?()\[\]{}|]", pattern):
+                continue  # only plain paths: several routes share one
+            with self.subTest(route=f"{method} {pattern}"):
+                found, _ = _find_route(method, pattern)
+                self.assertIs(found, handler)
+
+    def test_learn_these_starts_catching_up(self) -> None:
+        from knowitall2.learning import catchup
+
+        with mock.patch.object(catchup, "catch_up", return_value=2) as started:
+            status, data, _ = self.request("POST", "/api/learning/catch-up", body={"folder": "C:/work/homelab"})
+        self.assertEqual((200, 2), (status, data.get("marked")), data)
+        started.assert_called_once()
+        self.assertEqual(405, self.request("POST", "/api/learning", body={})[0])  # a path known only for GET
+
+    def test_catching_up_while_learning_runs_says_so_plainly(self) -> None:
+        from knowitall2.learning import catchup
+        from knowitall2.learning.state import LockBusy
+
+        with mock.patch.object(catchup, "catch_up", side_effect=LockBusy("busy")):
+            status, data, _ = self.request("POST", "/api/learning/catch-up", body={"folder": "C:/work/homelab"})
+        self.assertEqual(400, status, data)
+        self.assertIn("in progress", data["error"])
+
+
 class QuestionScreenTests(AppTestCase):
     def test_questions_show_their_memories_and_answers_are_the_users_word(self) -> None:
         store, memory = self.memory()

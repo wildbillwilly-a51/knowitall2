@@ -7,6 +7,7 @@ bad excerpt can never block the rest of its session, other logs, or learning.
 
 from __future__ import annotations
 
+import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ from ..memory import (
 from ..quotes import nearly_quoted_in as _nearly_quoted_in, quoted_in as _quoted_in
 from ..review import UNCONFIRMED_RULE_PREFIX
 from ..secrets import contains_secret, redact
-from ..store import RecordRow
+from ..store import RecordRow, StoreError
 from .dossier import Dossier, build_dossiers, file_by_work
 from .extractor import ExtractionError, Extractor
 from .state import MAX_FAILURES, LearnerSettings, LearnerState, day_ago
@@ -29,9 +30,22 @@ from .transcripts import read_session
 MIN_TEXT_CHARACTERS = 20
 # The model is asked for under 500 characters and to split larger knowledge; a little over is still kept.
 MAX_TEXT_CHARACTERS = 1000
-# A memory in the user's own words: this share of its significant words must be in the quoted words.
+# A finder's answer: this share of its significant words must be in the quoted words.
 USER_WORDS_SHARE = 0.5
+# A memory in the user's own words: nearly all its significant words are theirs, and every address, path, or
+# command in it too, so a sentence the user typed cannot carry someone else's instruction.
+USER_STATEMENT_SHARE = 0.8
+_COMMAND_WORDS = frozenset({
+    "curl", "wget", "sudo", "rm", "sh", "bash", "zsh", "powershell", "pwsh", "iex", "invoke-expression",
+    "invoke-webrequest", "iwr", "irm", "chmod", "chown", "ssh", "scp", "nc", "eval", "exec",
+})
+# A memory a candidate says it updates or contradicts must share this much with it, or a subject.
+RELATED_WORDS = 2
+RELATED_SHARE = 0.25
 LEARNER_AGENT = "learner"
+# A log's entry while its set-aside part is caught up: read up to here, then go on from ``RESUME_AT``.
+LEARN_TO = "learn_to"
+RESUME_AT = "resume_at"
 KNOWN_LIMIT = 40
 # The project's newest memories, plus those of it and the global ones that match the excerpt's words.
 KNOWN_PROJECT_RECENT = 12
@@ -109,101 +123,113 @@ def learn(
     report = LearnReport(logs=len(logs))
     memory = None if dry_run or memory_factory is None else memory_factory()
     run_seen: set[str] = set()
-    for log in logs:
-        try:
-            status = log.stat()
-        except OSError:
-            continue
-        entry = state.entry(log)
-        if status.st_size <= int(entry.get("offset", 0)):
-            continue
-        if not right_away and datetime.fromtimestamp(status.st_mtime, tz=timezone.utc) > idle_since:
-            report.active += 1
-            continue
-        start = int(entry.get("offset", 0))
-        session, end = read_session(log, start=start)
-        dossiers = build_dossiers(session, require_user=start == 0)
-        if memory is not None:
-            # What was learned belongs to the project the work was in, not always the chat's folder.
-            file_by_work(dossiers, known=memory.store.all_project_paths(), resolve=memory.stored_project,
-                         started=session.started_at, ended=session.ended_at)
-        duplicates = [item for item in dossiers if state.seen(item.fingerprint) or item.fingerprint in run_seen]
-        run_seen.update(item.fingerprint for item in dossiers)
-        report.ready.append(ReadySession(
-            session.session_id, log, len(dossiers), sum(len(item.text) for item in dossiers), len(duplicates),
-        ))
-        if dry_run:
-            continue
-        if not dossiers:
-            _finish(entry, session.session_id, end, moment)
-            continue
-        if extractor is None:
-            raise ExtractionError("no extractor is configured")
-        budget = min(settings.max_calls_per_run - report.calls, settings.max_calls_per_day - calls_today - report.calls)
-        progress: int | None = None
-        completed = True
-        current: Dossier | None = None
-        try:
-            for dossier in dossiers:
-                if any(dossier is item for item in duplicates):
-                    report.outcomes["duplicate dossier"] += 1
+    try:
+        for log in logs:
+            try:
+                status = log.stat()
+            except OSError:
+                continue
+            entry = state.entry(log)
+            if status.st_size <= int(entry.get("offset", 0)):
+                continue
+            if not right_away and datetime.fromtimestamp(status.st_mtime, tz=timezone.utc) > idle_since:
+                report.active += 1
+                continue
+            start = int(entry.get("offset", 0))
+            # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
+            session, end = read_session(log, start=start, stop=int(entry.get(LEARN_TO) or 0) or None)
+            dossiers = build_dossiers(session, require_user=start == 0)
+            if memory is not None:
+                # What was learned belongs to the project the work was in, not always the chat's folder.
+                file_by_work(dossiers, known=memory.store.all_project_paths(), resolve=memory.stored_project,
+                             started=session.started_at, ended=session.ended_at)
+            duplicates = [item for item in dossiers if state.seen(item.fingerprint) or item.fingerprint in run_seen]
+            run_seen.update(item.fingerprint for item in dossiers)
+            report.ready.append(ReadySession(
+                session.session_id, log, len(dossiers), sum(len(item.text) for item in dossiers), len(duplicates),
+            ))
+            if dry_run:
+                continue
+            if not dossiers:
+                _finish(entry, session.session_id, end, moment)
+                continue
+            if extractor is None:
+                raise ExtractionError("no extractor is configured")
+            budget = min(settings.max_calls_per_run - report.calls, settings.max_calls_per_day - calls_today - report.calls)
+            progress: int | None = None
+            completed = True
+            current: Dossier | None = None
+            try:
+                for dossier in dossiers:
+                    if any(dossier is item for item in duplicates):
+                        report.outcomes["duplicate dossier"] += 1
+                        progress = dossier.end_offset
+                        continue
+                    if budget <= 0:
+                        completed = False
+                        break
+                    assert memory is not None
+                    current = dossier
+                    dossier.known = known_context(memory, dossier)
+                    try:
+                        candidates = extractor.extract(dossier)
+                    finally:
+                        report.usage.update(getattr(extractor, "last_usage", None) or {})
+                    budget -= 1
+                    report.calls += 1
+                    state.record_call(at=moment, session=session.session_id, outcome="ok")
+                    for candidate in candidates:
+                        outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
+                        report.outcomes[outcome] += 1
+                        report.results.append({"outcome": outcome, "ids": record_ids,
+                                               "text": result_text(outcome, candidate)})
+                    state.mark_seen(dossier.fingerprint)
                     progress = dossier.end_offset
-                    continue
-                if budget <= 0:
-                    completed = False
+            except ExtractionError as exc:
+                if progress is not None:
+                    entry["offset"] = progress
+                if exc.blocking:
+                    # The backend itself is unusable: keep progress, blame no session, stop the run.
+                    report.blocked = str(exc)
                     break
-                assert memory is not None
-                current = dossier
-                dossier.known = known_context(memory, dossier)
-                try:
-                    candidates = extractor.extract(dossier)
-                finally:
-                    report.usage.update(getattr(extractor, "last_usage", None) or {})
-                budget -= 1
+                journal.problem("learning", f"a learning call failed for session {session.session_id}: {exc}")
                 report.calls += 1
-                state.record_call(at=moment, session=session.session_id, outcome="ok")
-                for candidate in candidates:
-                    outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
-                    report.outcomes[outcome] += 1
-                    report.results.append({"outcome": outcome, "ids": record_ids,
-                                           "text": result_text(outcome, candidate)})
-                state.mark_seen(dossier.fingerprint)
-                progress = dossier.end_offset
-        except ExtractionError as exc:
+                state.record_call(at=moment, session=session.session_id, outcome="failed")
+                # Only failures in a row count: a run that got further first starts the count again.
+                entry["failures"] = 1 if progress is not None else int(entry.get("failures", 0)) + 1
+                entry["last_error"] = str(exc)[:300]
+                entry["updated_at"] = moment.isoformat()
+                if entry["failures"] >= MAX_FAILURES:
+                    # Give up on the excerpt that keeps failing, not on the rest of the session.
+                    last = current is None or current is dossiers[-1]
+                    entry["offset"] = end if last else current.end_offset
+                    entry["failures"] = 0
+                    entry["status"] = "skipped" if last else "partial"
+                    report.skipped.append(session.session_id)
+                else:
+                    entry["status"] = "failed"
+                    report.failed.append(session.session_id)
+                continue
+            except (sqlite3.Error, StoreError, OSError) as exc:
+                # The memory store failed (a write held too long by another process, say): keep what this
+                # session already gave, blame no session, and stop; the next run carries on from here.
+                if progress is not None:
+                    entry.update({"offset": progress, "session_id": session.session_id, "status": "partial",
+                                  "updated_at": moment.isoformat()})
+                report.blocked = f"the memory store failed: {exc}"
+                journal.problem("learning", f"learning stopped because the memory store failed: {exc}")
+                break
+            if completed:
+                _finish(entry, session.session_id, end, moment)
+                continue
+            # The budget ran out part-way: keep what was learned and continue next run.
             if progress is not None:
                 entry["offset"] = progress
-            if exc.blocking:
-                # The backend itself is unusable: keep progress, blame no session, stop the run.
-                report.blocked = str(exc)
-                break
-            journal.problem("learning", f"a learning call failed for session {session.session_id}: {exc}")
-            report.calls += 1
-            state.record_call(at=moment, session=session.session_id, outcome="failed")
-            # Only failures in a row count: a run that got further first starts the count again.
-            entry["failures"] = 1 if progress is not None else int(entry.get("failures", 0)) + 1
-            entry["last_error"] = str(exc)[:300]
-            entry["updated_at"] = moment.isoformat()
-            if entry["failures"] >= MAX_FAILURES:
-                # Give up on the excerpt that keeps failing, not on the rest of the session.
-                last = current is None or current is dossiers[-1]
-                entry["offset"] = end if last else current.end_offset
-                entry["failures"] = 0
-                entry["status"] = "skipped" if last else "partial"
-                report.skipped.append(session.session_id)
-            else:
-                entry["status"] = "failed"
-                report.failed.append(session.session_id)
-            continue
-        if completed:
-            _finish(entry, session.session_id, end, moment)
-            continue
-        # The budget ran out part-way: keep what was learned and continue next run.
-        if progress is not None:
-            entry["offset"] = progress
-        entry.update({"session_id": session.session_id, "status": "partial", "updated_at": moment.isoformat()})
-        report.deferred += 1
-    if not dry_run:
-        state.save()
+            entry.update({"session_id": session.session_id, "status": "partial", "updated_at": moment.isoformat()})
+            report.deferred += 1
+    finally:
+        if not dry_run:
+            state.save()
     return report
 
 
@@ -328,7 +354,9 @@ def _changed_memory(memory: Memory, checked: dict[str, Any], dossier: Dossier) -
     if checked["relation"] not in ("updates", "contradicts") or checked["known_id"] not in dossier.known_ids:
         return None
     record = memory.store.get(checked["known_id"])
-    return record if record is not None and record.status == "active" else None
+    if record is None or record.status != "active" or not _about_the_same(record, checked):
+        return None  # an unrelated memory is never replaced or questioned: the candidate is new
+    return record
 
 
 
@@ -355,7 +383,8 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
     if dossier.from_documents and dossier.project is not None:
         # A project's documents may be wrong or planted: what they teach reaches only that project's agents.
         scope = "project"
-    if not _quoted_in(evidence, [dossier.text]) and not _nearly_quoted_in(evidence, [dossier.text]):
+    body = dossier.text[dossier.body_start:]  # not the header KnowItAll2 wrote (the session's id and folder)
+    if not _quoted_in(evidence, [body]) and not _nearly_quoted_in(evidence, [body]):
         # Every memory must rest on the session itself: not on the known-memory
         # list, and not on context an engine adds, such as the user's AGENTS.md.
         # A near quote (a few words re-typed) counts, but only an exact one below
@@ -366,7 +395,7 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
     proposed_rule = False
     if kind == "rule":
         quoted = _quoted_in(evidence, dossier.user_texts)
-        if quoted and _says_what_was_quoted(text, evidence):
+        if quoted and _in_the_users_words(text, evidence):
             source = "user"
         elif quoted or _nearly_quoted_in(evidence, dossier.user_texts):
             # The user's words, re-typed, or quoted for a rule they do not state: ask the user whether it is theirs.
@@ -378,7 +407,7 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
         # What a command printed is often raw data that the memory explains in its own words, so no shared words
         # are needed. Documents, searches, MCP tools, and helper agents only say what someone wrote: unverified.
         source = "observed"
-    elif _quoted_in(evidence, dossier.user_texts) and _says_what_was_quoted(text, evidence):
+    elif _quoted_in(evidence, dossier.user_texts) and _in_the_users_words(text, evidence):
         source = "user"
     relation = candidate.get("relation") if candidate.get("relation") in ("updates", "contradicts") else "new"
     known_id = str(candidate.get("known_id") or "").strip().strip("[]")
@@ -388,19 +417,60 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
     }, None
 
 
-def _says_what_was_quoted(text: str, quote: str) -> bool:
-    """Whether the quoted words support ``text``: most of its significant words, endings aside, are in them.
-
-    A memory said to be in the user's own words must say what the user said,
-    not rest a document's instruction on a harmless sentence of theirs.
-    """
+def _says_what_was_quoted(text: str, quote: str, *, share: float = USER_WORDS_SHARE) -> bool:
+    """Whether the quoted words support ``text``: most of its significant words, endings aside, are in them."""
 
     words = {_stem(word) for word in significant_words(text)}
     if not words:
         return False
     quoted = {_stem(word) for word in significant_words(quote)}
     found = sum(1 for word in words if any(_same_word(word, other) for other in quoted))
-    return found / len(words) >= USER_WORDS_SHARE
+    return found / len(words) >= share
+
+
+def _in_the_users_words(text: str, quote: str) -> bool:
+    """Whether ``text`` says what the user said in ``quote``, and nothing more that matters.
+
+    A memory said to be in the user's own words must say what the user said,
+    not rest a document's instruction on a harmless sentence of theirs: nearly
+    all its significant words are in the quote, and so is every address,
+    path, option, or command it names.
+    """
+
+    if not _says_what_was_quoted(text, quote, share=USER_STATEMENT_SHARE):
+        return False
+    said = {_bare(token) for token in quote.split()}
+    return all(_bare(token) in said for token in text.split() if _matters(token))
+
+
+def _bare(token: str) -> str:
+    return token.strip(".,;:!?()[]{}\"'`").lower()
+
+
+def _matters(token: str) -> bool:
+    """An address, path, option, or command: what would make a sentence an instruction to run something."""
+
+    bare = _bare(token)
+    return bool(bare) and (bare in _COMMAND_WORDS or bare.startswith("-") or any(mark in bare for mark in "/\\.:|$@=&;>"))
+
+
+def _about_the_same(older: RecordRow, checked: dict[str, Any]) -> bool:
+    """Whether a memory a candidate says it updates or contradicts is about what the candidate is about.
+
+    A shared subject, or a few significant words in common: otherwise the
+    claim is the model's mistake (or an instruction it read), and the known
+    memory is left alone.
+    """
+
+    mine = {" ".join(str(subject).lower().split()) for subject in checked.get("subjects") or []}
+    if mine & {" ".join(subject.lower().split()) for subject in older.subjects}:
+        return True
+    first = {_stem(word) for word in significant_words(older.text)}
+    second = {_stem(word) for word in significant_words(checked["text"])}
+    if not first or not second:
+        return False
+    shared = sum(1 for word in first if any(_same_word(word, other) for other in second))
+    return shared >= RELATED_WORDS and shared / min(len(first), len(second)) >= RELATED_SHARE
 
 
 _WORD_PREFIX_MINIMUM = 4
@@ -416,6 +486,11 @@ def _same_word(first: str, second: str) -> bool:
 
 
 def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime) -> None:
+    bound = int(entry.get(LEARN_TO) or 0)
+    if bound and end >= bound:
+        # The set-aside part is caught up: carry on from where learning had already got to.
+        end = max(end, int(entry.pop(RESUME_AT, 0) or 0))
+        entry.pop(LEARN_TO, None)
     entry.update(
         {"session_id": session_id, "offset": end, "status": "done", "failures": 0, "last_error": None,
          "updated_at": moment.isoformat()}

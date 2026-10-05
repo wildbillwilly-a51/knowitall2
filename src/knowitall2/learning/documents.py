@@ -148,37 +148,39 @@ def learn(memory, state: LearnerState, extractor, dossiers: list[Dossier], *, ma
         report.ready.append(ReadySession(first.session_id, Path(first.cwd or "."), len(dossiers),
                                          sum(len(item.text) for item in dossiers),
                                          sum(1 for item in dossiers if state.seen(item.fingerprint))))
-    for dossier in dossiers:
-        if state.seen(dossier.fingerprint):
-            report.outcomes["already read"] += 1
-            continue
-        if report.calls >= max_calls:
-            report.deferred += 1
-            continue
-        dossier.known = known_context(memory, dossier)
-        try:
-            candidates = extractor.extract(dossier)
-        except ExtractionError as exc:
+    try:
+        for dossier in dossiers:
+            if state.seen(dossier.fingerprint):
+                report.outcomes["already read"] += 1
+                continue
+            if report.calls >= max_calls:
+                report.deferred += 1
+                continue
+            dossier.known = known_context(memory, dossier)
+            try:
+                candidates = extractor.extract(dossier)
+            except ExtractionError as exc:
+                report.calls += 1
+                state.record_call(at=at, session=dossier.session_id, outcome="failed")
+                if exc.blocking:
+                    report.blocked = str(exc)
+                    break
+                report.failed.append(dossier.session_id)
+                continue
+            finally:
+                report.usage.update(getattr(extractor, "last_usage", None) or {})
             report.calls += 1
-            state.record_call(at=at, session=dossier.session_id, outcome="failed")
-            if exc.blocking:
-                report.blocked = str(exc)
-                break
-            report.failed.append(dossier.session_id)
-            continue
-        finally:
-            report.usage.update(getattr(extractor, "last_usage", None) or {})
-        report.calls += 1
-        state.record_call(at=at, session=dossier.session_id, outcome="ok")
-        for candidate in candidates:
-            outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
-            report.outcomes[outcome] += 1
-            report.results.append({"outcome": outcome, "ids": record_ids, "text": result_text(outcome, candidate)})
-        state.mark_seen(dossier.fingerprint)
-        if progress:
-            progress(f"read {dossier.text[dossier.body_start:].count('[document ')} document part(s) of "
-                     f"project {dossier.project.name}: {len(candidates)} ideas")
-    state.save()
+            state.record_call(at=at, session=dossier.session_id, outcome="ok")
+            for candidate in candidates:
+                outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
+                report.outcomes[outcome] += 1
+                report.results.append({"outcome": outcome, "ids": record_ids, "text": result_text(outcome, candidate)})
+            state.mark_seen(dossier.fingerprint)
+            if progress:
+                progress(f"read {dossier.text[dossier.body_start:].count('[document ')} document part(s) of "
+                         f"project {dossier.project.name}: {len(candidates)} ideas")
+    finally:
+        state.save()  # what was read and the calls made, even when a run ends with an error
     return report
 
 

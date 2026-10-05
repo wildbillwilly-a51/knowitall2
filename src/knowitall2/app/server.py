@@ -320,10 +320,16 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def _find_route(method: str, path: str) -> tuple[Route, re.Match]:
+    """The handler for this method and path; a path known only for other methods is a 405 (one path, such as
+    the catch-up list and its start, can have a GET and a POST)."""
+
+    other = None
     for route_method, pattern, handler in api.ROUTES:
         match = re.fullmatch(pattern, path)
         if match:
-            if route_method != method:
-                raise RequestError(HTTPStatus.METHOD_NOT_ALLOWED, f"use {route_method}")
-            return handler, match
+            if route_method == method:
+                return handler, match
+            other = other or route_method
+    if other:
+        raise RequestError(HTTPStatus.METHOD_NOT_ALLOWED, f"use {other}")
     raise RequestError(HTTPStatus.NOT_FOUND, "not found")

@@ -153,6 +153,34 @@ class EarlyRefusalTests(SyncServerTestCase):
         self.assertEqual(response.getheader("Connection"), "close")
 
 
+class RequestCostTests(SyncServerTestCase):
+    """Review 2026-10-04, S-3: a caller without a key made the server read and parse up to 8 MiB."""
+
+    def test_an_agents_route_reads_no_body_without_a_key(self) -> None:
+        server = self.start()
+        parsed = []
+        original = web.json.loads
+
+        def counting(data, *arguments, **options):
+            parsed.append(len(data))
+            return original(data, *arguments, **options)
+
+        body = json.dumps({"operations": [{"n": number} for number in range(50_000)]}).encode("utf-8")
+        with mock.patch.object(web.json, "loads", counting):
+            for path in ("/api/v1/push", "/api/v1/usage", "/api/v1/lease"):
+                with self.subTest(path=path):
+                    status, answer_body = self.post(server, path, body)
+                    self.assertIn(status, (401, 413), answer_body)  # no key, or more than the route takes
+        self.assertEqual([], [size for size in parsed if size >= len(body)])
+
+    def test_small_routes_take_small_bodies(self) -> None:
+        server = self.start()
+        for path, size in (("/api/v1/join", web.JOIN_BODY_BYTES + 1), ("/admin/api/sign-in", web.SMALL_BODY_BYTES + 1)):
+            with self.subTest(path=path):
+                status, answer_body = self.post(server, path, b" " * size)
+                self.assertEqual(413, status, answer_body)
+
+
 class AppDeepJsonTests(AppTestCase):
     def test_deeply_nested_json_is_not_valid_json(self) -> None:
         deep = b"[" * 20_000 + b"]" * 20_000  # within the app's smaller body cap
@@ -231,7 +259,7 @@ class AppContentLengthTests(AppTestCase):
 class ErrorMessageTests(SyncServerTestCase):
     def test_deeply_nested_json_is_not_valid_json(self) -> None:
         server = self.start()
-        status, body = self.post(server, "/api/v1/push", DEEP_JSON)
+        status, body = self.post(server, "/admin/api/sign-in", DEEP_JSON)  # a route that needs no key
         self.assertEqual(status, 400)
         self.assertIn(body, DEEP_JSON_ERRORS)
 
@@ -240,8 +268,8 @@ class ErrorMessageTests(SyncServerTestCase):
             raise RuntimeError("cannot open /srv/knowitall2/private-detail")
 
         server = self.start()
-        with mock.patch.dict(web.ROUTES, {("POST", "/api/v1/usage"): broken}):
-            status, body = self.post(server, "/api/v1/usage", b"{}")
+        with mock.patch.dict(web.ROUTES, {("POST", "/api/v1/join"): broken}):
+            status, body = self.post(server, "/api/v1/join", b"{}")
         self.assertEqual(status, 500)
         self.assertNotIn("private-detail", body["error"])
         self.assertIn("could not do that", body["error"])
@@ -254,8 +282,8 @@ class ErrorMessageTests(SyncServerTestCase):
             raise StoreError("the database is locked")
 
         server = self.start()
-        with mock.patch.dict(web.ROUTES, {("POST", "/api/v1/usage"): unavailable}):
-            status, body = self.post(server, "/api/v1/usage", b"{}")
+        with mock.patch.dict(web.ROUTES, {("POST", "/api/v1/join"): unavailable}):
+            status, body = self.post(server, "/api/v1/join", b"{}")
         self.assertEqual((status, body), (503, {"error": "the server's store failed: the database is locked"}))
 
 

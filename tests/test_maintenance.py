@@ -268,7 +268,11 @@ class RestoreTests(MaintenanceTestCase):
         self.memory.forget(record.id, reason="wrong")
         self.assertIn("retired (wrong)", self.memory.history())
         self.assertIn("Restored", self.memory.restore(f"[{record.id}]"))
-        self.assertEqual("No memory has been retired or replaced yet.", Memory(Store.in_memory()).history())
+        empty = Store.in_memory()   # closed here: left open, Python 3.14 warns at a random later test
+        try:
+            self.assertEqual("No memory has been retired or replaced yet.", Memory(empty).history())
+        finally:
+            empty.close()
 
 
 class ReviewerTests(unittest.TestCase):

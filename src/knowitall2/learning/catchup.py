@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .dossier import build_dossiers
+from .learner import LEARN_TO, RESUME_AT
 from .state import LearnerState, learner_lock
 from .transcripts import read_session, session_folder, session_logs
 
@@ -90,11 +91,19 @@ def estimate(folder: str, *, since: str | None = None) -> dict[str, int]:
     """How many sessions under ``folder`` would be learned, and about how many model calls that takes."""
 
     sessions = calls = 0
-    for log in _matching(folder, since=since):
-        session, _ = read_session(log)
+    state = LearnerState()
+    for log in _matching(folder, since=since, state=state):
+        session, _ = read_session(log, stop=_set_aside_end(state.entry(log)))
         sessions += 1
         calls += len(build_dossiers(session))
     return {"sessions": sessions, "calls": calls}
+
+
+def _set_aside_end(entry: dict[str, Any]) -> int | None:
+    """Where the part to catch up ends, when learning went on past it; None for the whole log."""
+
+    bound = int(entry.get(SET_ASIDE_TO) or 0)
+    return bound if bound and int(entry.get("offset") or 0) > bound else None
 
 
 def catch_up(folder: str, *, since: str | None = None, max_calls: int | None = None) -> int:
@@ -109,13 +118,17 @@ def catch_up(folder: str, *, since: str | None = None, max_calls: int | None = N
         marked = calls = 0
         for log in _matching(folder, since=since, state=state):
             if max_calls is not None:
-                session, _ = read_session(log)
+                session, _ = read_session(log, stop=_set_aside_end(state.entry(log)))
                 needed = len(build_dossiers(session))
                 if calls and calls + needed > max_calls:
                     continue
                 calls += needed
-            state.entry(log).update({"offset": 0, "status": "new", "failures": 0, "updated_at": moment,
-                                     "caught_up_at": moment})
+            entry = state.entry(log)
+            resume, bound = int(entry.get("offset") or 0), int(entry.get(SET_ASIDE_TO) or 0)
+            entry.update({"offset": 0, "status": "new", "failures": 0, "updated_at": moment, "caught_up_at": moment})
+            if bound and resume > bound:
+                # Learning went on past the set-aside part: read only that part, then carry on from there.
+                entry.update({LEARN_TO: bound, RESUME_AT: resume})
             marked += 1
         state.save()
     return marked

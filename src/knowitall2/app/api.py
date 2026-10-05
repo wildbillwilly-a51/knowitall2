@@ -367,6 +367,15 @@ def learning_settings(query, body, match) -> dict[str, Any]:
     elif enable is False and settings.enabled:
         configure_learning(settings, enable=False, agent=APP_AGENT)
     else:
+        # Learning stays off: the engine chosen is kept for when it is turned on.
+        from ..learning.command import _default_model, _engine_path
+
+        if backend and backend != settings.backend:
+            settings.backend = backend
+            if not model:
+                settings.model = _default_model(backend, _engine_path(backend))
+        if model:
+            settings.model = model
         save_settings(settings)
     changed = [name.replace("_", " ") for name in ("max_calls_per_run", "max_calls_per_day", "idle_minutes")
                if before[name] != getattr(settings, name)]
@@ -559,7 +568,7 @@ def knowledge_ask(query, body, match) -> dict[str, Any]:
     """Ask agents to find out a missing part of a system's profile."""
 
     facet = _text(body, "facet").strip()
-    label = catalog.FACETS.get(facet) or _text(body, "label", required=False) or ""
+    label = catalog.FACETS.get(facet) or " ".join(_text(body, "label", required=False).split())[:120]
     if facet not in catalog.FACETS and not label:
         raise MemoryInputError("Say what agents should find out.")
     with open_store() as store:
@@ -596,8 +605,13 @@ def catch_up_start(query, body, match) -> dict[str, Any]:
 
     from ..learning import catchup
 
+    from ..learning.state import LockBusy
+
     folder, since = _text(body, "folder"), _body_date(body)
-    marked = catchup.catch_up(folder, since=since)
+    try:
+        marked = catchup.catch_up(folder, since=since)
+    except LockBusy:
+        raise MemoryInputError("A learning run is in progress; try again when it finishes.") from None
     _catch_up_cache.clear()
     _waiting_cache.clear()
     journal.record_standalone("settings", f"Catching up on {marked} past sessions in {folder}", outcome="catch up",

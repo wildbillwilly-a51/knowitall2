@@ -48,6 +48,12 @@ from . import API_VERSION, accounts, admin, backups, exchange, open_store
 
 DEFAULT_PORT = 4191
 MAX_BODY_BYTES = 8 * 1024 * 1024
+# What each route reads at most: only an agent that has shown its key sends a large body (its changes).
+SMALL_BODY_BYTES = 256 * 1024
+JOIN_BODY_BYTES = 16 * 1024
+BODY_LIMITS = {"/api/v1/push": MAX_BODY_BYTES, "/api/v1/usage": MAX_BODY_BYTES, "/api/v1/join": JOIN_BODY_BYTES}
+# Routes that need an agent's key: it is checked before the body is read.
+KEY_ROUTES = frozenset({"/api/v1/push", "/api/v1/usage", "/api/v1/lease"})
 # Of a body too large to take, this much is read and dropped before the connection closes, so a caller
 # that sends the whole body before reading the answer still gets its 413.
 DROP_AT_MOST_BYTES = 4 * MAX_BODY_BYTES
@@ -179,6 +185,7 @@ class KnowItAll2Server(ThreadingHTTPServer):
             self.admin_was_reset = admin.reset_from_setting(store, reset_value, now=clock())
             # With no admin, setting one up needs this code, which ``run`` prints to the server's log.
             self.setup_code = admin.new_setup_code() if admin.admin(store) is None else None
+            self.epoch = exchange.begin_run(store, home)
         finally:
             store.close()
         # While the reset setting is present, the page reminds the user to delete it.
@@ -320,7 +327,7 @@ class ServerHandler(BaseHTTPRequestHandler):
                 known = any(path == parts.path for _, path in ROUTES)
                 raise RequestError(HTTPStatus.METHOD_NOT_ALLOWED if known else HTTPStatus.NOT_FOUND,
                                    "use another method" if known else "not found")
-            body = self._read_json() if method == "POST" else {}
+            body = self._read_json(parts.path) if method == "POST" else {}
             route(self, parse_qs(parts.query), body)
         except RequestError as exc:
             self._send_json(exc.status, {"error": str(exc)})
@@ -353,7 +360,10 @@ class ServerHandler(BaseHTTPRequestHandler):
             self.server.note_untrusted_proxy(direct)
         return direct
 
-    def _read_json(self) -> dict[str, Any]:
+    def _read_json(self, path: str = "") -> dict[str, Any]:
+        """The request's JSON body, read only when its route takes one that large and, if the route needs an
+        agent's key, after the key is checked: no caller without a key makes the server read much."""
+
         if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
             raise RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "send JSON")
         try:
@@ -364,8 +374,14 @@ class ServerHandler(BaseHTTPRequestHandler):
             # Where this request ends, and so where the next one on the connection starts, is unknown.
             self.close_connection = True
             raise RequestError(HTTPStatus.BAD_REQUEST, "bad Content-Length")
-        if length > MAX_BODY_BYTES:
+        if length > BODY_LIMITS.get(path, SMALL_BODY_BYTES):
             raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request too large; send fewer changes at once")
+        if path in KEY_ROUTES:
+            store = self.server.open()
+            try:
+                self.authenticated(store)
+            finally:
+                store.close()
         self._body_read = True  # from here on, even a read cut short by the timeout is not tried again
         raw = self.rfile.read(length) if length else b""
         try:
@@ -486,8 +502,9 @@ def _join(handler: ServerHandler, query: dict[str, list[str]], body: dict[str, A
         except accounts.AccountError:
             failed = True
             raise
+        found = exchange.summary(store)
         return {"key": key, "connection": connection, "version": __version__, "api": API_VERSION,
-                "latest": exchange.summary(store)["latest"]}
+                "latest": found["latest"], "epoch": found["epoch"]}
 
     try:
         _with_store(handler, work)
@@ -500,7 +517,7 @@ def _hello(handler: ServerHandler, query: dict[str, list[str]], body: dict[str, 
         connection = handler.authenticated(store)
         found = exchange.summary(store)
         return {"connection": connection, "version": __version__, "api": API_VERSION, "latest": found["latest"],
-                "memories": found["memories"], "columns": found["columns"]}
+                "memories": found["memories"], "columns": found["columns"], "epoch": found["epoch"]}
 
     _with_store(handler, work)
 

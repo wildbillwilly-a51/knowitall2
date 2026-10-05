@@ -27,6 +27,16 @@ _DOCUMENT_SEARCH = re.compile(
     r"\.(?:md|markdown|txt|rst|adoc)\b", re.IGNORECASE)
 # Tools whose output is what a command printed: Claude Code's shells, and Codex's (see transcripts).
 _COMMAND_TOOLS = frozenset({"Bash", "PowerShell", "shell"})
+# A command that fetches from the network, or shows what a repository's authors wrote (commits, diffs).
+_FETCHES = re.compile(
+    r"https?://|\b(?:curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm|Start-BitsTransfer)\b"
+    r"|\bgh\s+api\b|\bgit\s+(?:show|log|diff|blame|cat-file)\b", re.IGNORECASE)
+# A command that prints files, and the rest of its part of the command line (its arguments). PowerShell's names
+# in any case; the Unix ones as they are typed, so ``git rev-parse HEAD`` is not ``head``.
+_PRINTS = re.compile(
+    r"(?:^|[\s;&|(`'\"])(?:(?i:type|Get-Content|gc)|cat|head|tail|less|more|bat|tac|nl|sed\s+-n)\s+([^|;&\n]*)")
+_ABSOLUTE = re.compile(r"^(?:/|~|\$HOME\b|\$env:|[A-Za-z]:[\\/]|\\\\)")
+_SED_SCRIPT = re.compile(r"[\d,$]+[pd]?")
 
 
 @dataclass
@@ -87,7 +97,7 @@ def build_dossiers(
             current.user_texts.append(user_text)
         if output:
             current.tool_outputs.append(output)
-            if _trusted_output(event):
+            if _trusted_output(event, session.cwd):
                 current.trusted_outputs.append(output)
         if event.kind == "tool":
             current.tool_inputs += [part for part in (event.text, event.cwd) if part]
@@ -170,18 +180,52 @@ def _reads_document(event: Event) -> bool:
     return bool(_DOCUMENT_COMMAND.search(event.text or ""))
 
 
-def _trusted_output(event: Event) -> bool:
+def _trusted_output(event: Event, folder: str | None = None) -> bool:
     """Whether a tool call's output shows what a command printed, not what someone wrote.
 
     A document the agent read (with Read or a shell command), a search of
     files or documents, an MCP tool's answer, and a helper agent's report hold
     what a repository's authors or another model wrote, which may be wrong or
-    planted, so a memory resting on them stays unverified.
+    planted, so a memory resting on them stays unverified. So does anything
+    fetched from the network, and any file printed from the session's folder
+    (a cloned repository's settings files, say). A file printed by its
+    absolute path outside that folder, such as a system's own settings
+    (``cat /etc/openwrt_release``), is what that system holds, and counts.
     """
 
     if event.tool not in _COMMAND_TOOLS:
         return False
-    return not _reads_document(event) and not _DOCUMENT_SEARCH.search(event.text or "")
+    command = event.text or ""
+    if _reads_document(event) or _DOCUMENT_SEARCH.search(command) or _FETCHES.search(command):
+        return False
+    return not _prints_a_project_file(command, event.cwd or folder)
+
+
+def _prints_a_project_file(command: str, folder: str | None) -> bool:
+    """Whether ``command`` prints a file by a relative path, or by a path inside ``folder``."""
+
+    inside = _comparable(folder) if folder else None
+    for match in _PRINTS.finditer(command):
+        for argument in match.group(1).split():
+            argument = argument.strip("'\"`()")
+            if (not argument or argument.startswith("-") or not re.search(r"[./\\]", argument)
+                    or _SED_SCRIPT.fullmatch(argument)):
+                continue  # options, line counts, and words such as a sed script's ``1,80p``
+            if not _ABSOLUTE.match(argument):
+                return True
+            if inside and (_comparable(argument) + "/").startswith(inside + "/"):
+                return True
+    return False
+
+
+def _comparable(path: str) -> str:
+    """A path in one spelling for prefix checks: forward slashes, lower case, ``/mnt/c/`` and ``/c/`` as ``c:/``."""
+
+    text = path.replace("\\", "/").rstrip("/").lower()
+    found = re.match(r"^/(?:mnt/)?([a-z])(?=/|$)", text)
+    if found:
+        text = f"{found.group(1)}:" + text[found.end():]
+    return text
 
 
 def _excerpt(text: str, limit: int) -> str:

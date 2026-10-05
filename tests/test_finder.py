@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -249,8 +250,32 @@ class StartTests(FinderTestCase):
 
 
 class EngineCommandTests(unittest.TestCase):
+    def test_claude_reads_only_inside_the_folder_where_it_can_be_confined(self) -> None:
+        # Review 2026-10-04, L-M4: Read, Grep, and Glob read anywhere unless Claude Code is in restricted mode.
+        from knowitall2.learning import extractor
+
+        for offered in (True, False):
+            with self.subTest(offered=offered), mock.patch.object(extractor, "offers_restricted_mode",
+                                                                  return_value=offered):
+                command = ClaudeCliExtractor(Path("claude.exe")).explore_command(schema=finder.FIND_SCHEMA,
+                                                                                 system_prompt="x")
+                self.assertEqual(offered, "--restricted" in command)
+
+    def test_whether_claude_offers_restricted_mode_comes_from_its_help(self) -> None:
+        from knowitall2.learning import extractor
+
+        for help_text, offered in ((b"  --restricted   Restricted mode", True), (b"  --safe-mode", False)):
+            with self.subTest(offered=offered), mock.patch.dict(extractor._RESTRICTED_SUPPORT, clear=True), \
+                    mock.patch.object(extractor, "run_bounded",
+                                      return_value=subprocess.CompletedProcess([], 0, help_text, b"")):
+                self.assertEqual(offered, extractor.offers_restricted_mode(Path("claude.exe")))
+
     def test_claude_gets_only_the_tools_that_read_files(self) -> None:
-        command = ClaudeCliExtractor(Path("claude.exe")).explore_command(schema=finder.FIND_SCHEMA, system_prompt="x")
+        from knowitall2.learning import extractor
+
+        with mock.patch.object(extractor, "offers_restricted_mode", return_value=True):
+            command = ClaudeCliExtractor(Path("claude.exe")).explore_command(schema=finder.FIND_SCHEMA,
+                                                                             system_prompt="x")
         self.assertEqual("Read,Grep,Glob", command[command.index("--tools") + 1])
         self.assertEqual("Read,Grep,Glob", command[command.index("--allowedTools") + 1])
         self.assertEqual("dontAsk", command[command.index("--permission-mode") + 1])

@@ -155,7 +155,10 @@ def connections(store: Store) -> list[dict[str, Any]]:
 def remove(store: Store, connection_id: str, *, now: str) -> bool:
     """Stop a connection's key working, at once."""
 
-    cursor = store.connection.execute(
-        "UPDATE server_connections SET removed_at = ? WHERE id = ? AND removed_at IS NULL", (now, connection_id),
-    )
+    with store.transaction():
+        cursor = store.connection.execute(
+            "UPDATE server_connections SET removed_at = ? WHERE id = ? AND removed_at IS NULL", (now, connection_id),
+        )
+        # A turn it held (the maintenance lease) is given up with it, so other computers need not wait it out.
+        store.connection.execute("DELETE FROM server_leases WHERE connection_id = ?", (connection_id,))
     return cursor.rowcount == 1

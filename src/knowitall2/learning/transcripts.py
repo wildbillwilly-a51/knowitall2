@@ -29,6 +29,9 @@ _HARNESS_MARKERS = (
     "Caveat: The messages below were generated",
 )
 _AGENT_REPORT_MARKERS = ("[Subagent hand-back]", "<agent-message", "Another Claude session sent a message")
+# A block the app wrapped in a tag of its own, such as <pasted_content id=...>...</pasted_content>.
+_TAGGED = re.compile(r"<([a-z][a-z0-9_-]*)(?:\s[^<>]*)?>.*?</\1>", re.DOTALL)
+_INTERRUPTED = re.compile(r"\[Request interrupted by user[^\]\n]*\]")
 # A compacted chat goes on from a summary written as a user message. The summary can repeat anything the chat
 # read, so it is never the user's own words; what it summarizes is earlier in the same log.
 _COMPACTION_SUMMARY = "This session is being continued from a previous conversation"
@@ -148,9 +151,11 @@ def is_codex_log(path: Path) -> bool:
     return path.name.startswith("rollout-")
 
 
-def read_session(path: Path, *, start: int = 0) -> tuple[Session, int]:
+def read_session(path: Path, *, start: int = 0, stop: int | None = None) -> tuple[Session, int]:
+    """Read a session log from byte offset ``start``, and no further than the line that reaches ``stop``."""
+
     reader = read_codex_session if is_codex_log(path) else read_claude_code_session
-    return reader(path, start=start)
+    return reader(path, start=start, stop=stop)
 
 
 def _is_claude_code_log(name: str) -> bool:
@@ -190,7 +195,7 @@ def _newest_first(found: list[tuple[float, Path]]) -> list[tuple[float, Path]]:
     return sorted(found, key=lambda item: item[0], reverse=True)
 
 
-def read_claude_code_session(path: Path, *, start: int = 0) -> tuple[Session, int]:
+def read_claude_code_session(path: Path, *, start: int = 0, stop: int | None = None) -> tuple[Session, int]:
     """Parse ``path`` from byte offset ``start``; return the session and the offset read to.
 
     A trailing line without a newline may still be being written, so it is
@@ -203,7 +208,7 @@ def read_claude_code_session(path: Path, *, start: int = 0) -> tuple[Session, in
     with path.open("rb") as stream:
         stream.seek(start)
         for raw in stream:
-            if not raw.endswith(b"\n"):
+            if not raw.endswith(b"\n") or (stop is not None and offset >= stop):
                 break
             offset += len(raw)
             try:
@@ -270,7 +275,12 @@ def _add_user_text(session: Session, value: object) -> None:
     if any(marker in text for marker in _AGENT_REPORT_MARKERS):
         session.events.append(Event("agent_report", text))
         return
-    session.events.append(Event("user", text))
+    # What the app wraps in tags (pasted text, which may hold words the user did not write; a page or file the
+    # user had open; a shell command's output) and its interrupt notices are not the user's words; what the
+    # user typed around them is.
+    text = _INTERRUPTED.sub("", _TAGGED.sub("", text)).strip()
+    if text:
+        session.events.append(Event("user", text))
 
 
 def _tool_event(name: str, arguments: dict[str, Any], output: str) -> Event | None:
@@ -321,7 +331,7 @@ _CODEX_SHELL_FLAGS = frozenset({"-Command", "-command", "-c", "-lc", "/C", "/c"}
 _CODEX_META_LINES = 20
 
 
-def read_codex_session(path: Path, *, start: int = 0) -> tuple[Session, int]:
+def read_codex_session(path: Path, *, start: int = 0, stop: int | None = None) -> tuple[Session, int]:
     """Parse a Codex rollout from byte offset ``start``; return the session and the offset read to.
 
     Codex records each finished step as an ``item_completed`` event, which is
@@ -342,7 +352,7 @@ def read_codex_session(path: Path, *, start: int = 0) -> tuple[Session, int]:
     with path.open("rb") as stream:
         stream.seek(start)
         for raw in stream:
-            if not raw.endswith(b"\n"):
+            if not raw.endswith(b"\n") or (stop is not None and offset >= stop):
                 break
             offset += len(raw)
             if not learnable or (b'"item_completed"' not in raw and b'"turn_context"' not in raw):

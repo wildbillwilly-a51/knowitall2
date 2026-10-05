@@ -17,6 +17,24 @@ KEEP_DAYS = 7
 KEEP_NEWEST = 3
 EVERY = timedelta(hours=24)
 _PREFIX = "knowitall2-"
+# ``exchange.RUN_KEY``: a copy's run id never matches a running server's, so a copy put back begins a new epoch.
+_RUN_KEY = "server.run"
+COPY_RUN = "copied"
+
+
+def copy_database(database: Path, target: Path) -> None:
+    """A consistent copy of the server's database, marked as a copy (see ``exchange.begin_run``)."""
+
+    origin = sqlite3.connect(str(database), timeout=5.0)
+    copy = sqlite3.connect(str(target))
+    try:
+        origin.backup(copy)
+        copy.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                     (_RUN_KEY, COPY_RUN))
+        copy.commit()
+    finally:
+        copy.close()
+        origin.close()
 
 
 def backups(folder: Path) -> list[Path]:
@@ -63,13 +81,9 @@ def make(database: Path, folder: Path, *, now: datetime) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / f"{_PREFIX}{now.astimezone(timezone.utc):%Y%m%d-%H%M%S}.db"
     partial = target.with_suffix(".partial")
-    origin = sqlite3.connect(str(database), timeout=5.0)
-    copy = sqlite3.connect(str(partial))
-    try:
-        origin.backup(copy)
-    finally:
-        copy.close()
-        origin.close()
+    for left in folder.glob(f"{_PREFIX}*.partial"):  # from a copy cut short (the server stopped part-way)
+        left.unlink(missing_ok=True)
+    copy_database(database, partial)
     partial.replace(target)
     found = backups(folder)
     kept = _kept(found)

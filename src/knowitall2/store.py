@@ -1215,14 +1215,16 @@ class Store:
             (reason_prefix.replace("%", "") + "%", since),
         ).fetchone()[0])
 
-    def count_user_questions(self, *, overdue_before: str) -> int:
-        """Open questions waiting for the user: handed over, or not reviewed since ``overdue_before``."""
+    def count_user_questions(self, *, overdue_before: str, checking_before: str | None = None) -> int:
+        """Open questions waiting for the user: handed over, not reviewed since ``overdue_before``, or asked
+        before ``checking_before`` and still waiting for an agent's check (see ``review.for_user``)."""
 
         return int(self._connection.execute(
             "SELECT COUNT(*) FROM questions q LEFT JOIN question_stages s ON s.question_id = q.id "
             "WHERE q.status = 'open' AND (s.stage = 'ask_user' "
-            "OR (COALESCE(s.stage, 'review') = 'review' AND q.created_at < ?))",
-            (overdue_before,),
+            "OR (COALESCE(s.stage, 'review') = 'review' AND q.created_at < ?) "
+            "OR (s.stage = 'checking' AND q.created_at < ?))",
+            (overdue_before, checking_before or ""),
         ).fetchone()[0])
 
     def count_open_questions(self) -> int:

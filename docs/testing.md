@@ -65,10 +65,11 @@ in your home folder, and sets it up for the agents you choose. Afterwards:
   runs only when you press it, and also while learning is off. It starts one
   agent on the same engine and account in the system's project folder, and
   that agent reads the files itself, so nothing it reads is redacted first.
-  It changes nothing and is asked to stay in that folder, but Codex's
-  read-only sandbox lets it read files anywhere on the computer, and Claude
-  Code's file-reading tools may not be limited to the folder either. What it
-  finds is kept as unverified.
+  It changes nothing and is asked to stay in that folder. On Claude Code
+  2.1 or later it cannot read outside that folder (restricted mode); on an
+  older Claude Code, or on Codex, whose read-only sandbox lets it read
+  files anywhere on the computer, it can. What it finds is kept as
+  unverified.
 - Learning from your work (after a commit, at a session's end, or when you ask)
   happens right away, with no daily limit. Background learning (sessions
   that went quiet, catching up) uses at most 10 calls per run and 60 per day

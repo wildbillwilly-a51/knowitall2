@@ -115,9 +115,25 @@ SECRETS = {
     "prose wrapped across lines": ("The router admin password\nis hunter22 for now.", "hunter22"),
     "dotted value": ("password=Xk9." + "mQ2vL8pR", "mQ2vL8pR"),
     "a password that is the word password": ("The camera's default password is password.", "is password"),
+    "a factory password": ("the default password is admin", "is admin"),
+    "a quoted all-letter password": ("The password is 'abcdefgh'.", "abcdefgh"),
+    # Review 2026-10-04, L-L3.
+    "docker login -p": (f"docker login -u alex -p {PASSWORD} registry.example", PASSWORD),
+    "smbclient user%password": (f"smbclient //nas01/share -U alex%{PASSWORD}", PASSWORD),
 }
 
 REFERENCES = [
+    # How people describe a password, not the password (review 2026-10-04, C-M1).
+    "The password is shared with the team.",
+    "The admin password is different on each node.",
+    "The password is case-sensitive.",
+    "The password was emailed to the new hire.",
+    "The password is twelve characters long.",
+    "The Wi-Fi password is per-user.",
+    "The password was leaked last year, so it was changed.",
+    # Code that gets a value (C-L1, L-L2).
+    "password = getpass()",
+    "Run `pwd = Path.cwd()` to get the folder.",
     # Where a credential is kept, which is what KnowItAll2 stores instead.
     "The vCenter admin password is in Vaultwarden item vcenter-admin.",
     'The vCenter admin password is in Vaultwarden item "vcenter-admin".',

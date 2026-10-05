@@ -256,6 +256,34 @@ class ConcurrentWriteTests(unittest.TestCase):
         self.assertEqual(1, self.first.count_open_questions())
 
 
+class StuckCheckTests(ReviewTestCase):
+    def test_a_check_no_agent_did_reaches_the_user_without_a_learning_run(self) -> None:
+        # Review 2026-10-04, U-M2: only a learning run moved a stale check to the user.
+        older = self.save("The wiki runs on host wiki01.")
+        newer = self.save("The wiki moved to host wiki02.")
+        review.ask_conflict(self.memory, older, newer)
+        [question] = self.store.open_questions(limit=5)
+        review.start_check(self.memory, question, [older, newer], plain=None, labels=None, reason=None)
+        self.assertEqual([], review.for_user(self.store, now=review._parse("2026-09-29T12:00:00Z")))
+        later = "2026-10-27T12:00:00Z"
+        self.assertEqual([question["id"]], [item["id"] for item in review.for_user(self.store,
+                                                                                  now=review._parse(later))])
+        self.clock.value = later
+        self.assertIn("1 question for the user", self.memory.briefing(project_path=self.project))
+        self.assertEqual([], review.in_progress(self.store, now=review._parse(later)))
+
+    def test_a_conflict_with_the_users_own_words_goes_to_the_user(self) -> None:
+        # Review 2026-10-04, U-L4: an unsure model sent it to an agent unless it leaned towards the newer one.
+        from knowitall2.learning.cataloguer import _user_must_decide
+
+        stated, newer, _ = self.conflict()
+        for decision in ("use_new", "keep_mine", "keep_both", None):
+            with self.subTest(decision=decision):
+                self.assertTrue(_user_must_decide([stated, newer], decision))
+        plain = [self.save("The wiki runs on host wiki01."), self.save("The wiki moved to host wiki02.")]
+        self.assertFalse(_user_must_decide(plain, "keep_both"))
+
+
 class NoticeTests(ReviewTestCase):
     def test_the_briefing_mentions_questions_at_most_every_few_days(self) -> None:
         self.conflict()

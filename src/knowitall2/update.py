@@ -31,6 +31,7 @@ from .paths import HOME_ENVIRONMENT_VARIABLE, data_home
 
 LAUNCHER = "update.py"
 VERSION_FILE = "installed-version"
+UPDATE_LOCK = "update-run.lock"
 _VERSION = re.compile(r'__version__ = "([^"]+)"')
 # Set while the update script runs itself again with the Python KnowItAll2 was set up with.
 _RELAUNCHED = "KNOWITALL2_UPDATE_RELAUNCHED"
@@ -110,8 +111,19 @@ def update_command() -> str:
 
 
 def run(*, runner=subprocess.run) -> int:
-    """Download the new version, then finish with its code."""
+    """Download the new version, then finish with its code; one update at a time on this computer."""
 
+    from .learning.state import LockBusy, RunLock
+
+    try:
+        with RunLock(data_home() / UPDATE_LOCK):
+            return _run(runner)
+    except LockBusy:
+        print("Another KnowItAll2 update is running on this computer; let it finish. Nothing was changed.")
+        return 1
+
+
+def _run(runner) -> int:
     root = checkout_root()
     if root is None:
         print("This copy of KnowItAll2 was not installed from a Git clone, so it cannot update itself. "
@@ -150,8 +162,28 @@ def run(*, runner=subprocess.run) -> int:
         finish.append("--unchanged")
     environment["PYTHONPATH"] = str(root / "src") + (os.pathsep + environment["PYTHONPATH"]
                                                      if environment.get("PYTHONPATH") else "")
+    if before != after:
+        # The new code must at least start before every agent is pointed at it; otherwise go back at once
+        # (the folder had no changes of its own, so nothing of the user's is lost).
+        try:
+            started = runner([sys.executable, "-B", "-P", "-m", "knowitall2", "--version"], capture_output=True,
+                             text=True, timeout=120, env=environment)
+            failed = started.returncode != 0
+            detail = _last(started.stderr) or _last(started.stdout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            failed, detail = True, str(exc)
+        if failed:
+            git("reset", "--hard", before)
+            print(f"KnowItAll2 downloaded a new version that does not start ({detail}), so it went back to the "
+                  "version you had. Nothing else was changed.")
+            journal.problem("update", f"the new version did not start, so the update was undone: {detail}")
+            return 1
     environment.pop("GIT_TERMINAL_PROMPT", None)
-    return runner(finish, env=environment).returncode
+    code = runner(finish, env=environment).returncode
+    if code != 0 and before != after:
+        print(f"The update did not finish. To go back to the version you had, run: git -C \"{root}\" reset "
+              f"--hard {before}")
+    return code
 
 
 def finish(*, previous: str, unchanged: bool, codex_running=None) -> int:
@@ -253,7 +285,10 @@ def finish(*, previous: str, unchanged: bool, codex_running=None) -> int:
                 store.close()
         except Exception as exc:
             repaired = 0
-            journal.problem("update", f"skipped past sessions could not be checked: {exc}")
+            from .learning.state import LockBusy
+
+            if not isinstance(exc, LockBusy):  # a learning run holds the lock: checked at the next update
+                journal.problem("update", f"skipped past sessions could not be checked: {exc}")
         if repaired:
             lines.append(f"- Learning: {repaired} past sessions that were never learned are listed again under "
                          "catching up.")

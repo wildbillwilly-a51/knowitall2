@@ -162,43 +162,45 @@ def maintain(
     if reviewer is None:
         raise ExtractionError("no reviewer is configured")
     store = memory.store
-    busy = store.open_question_record_ids()
-    for group, status in report.plan:
-        if status != "review":
-            continue
-        if budget <= 0:
-            report.deferred += 1
-            continue
-        try:
-            findings = reviewer.review(render_group(group))
-        except ExtractionError as exc:
+    try:
+        busy = store.open_question_record_ids()
+        for group, status in report.plan:
+            if status != "review":
+                continue
+            if budget <= 0:
+                report.deferred += 1
+                continue
+            try:
+                findings = reviewer.review(render_group(group))
+            except ExtractionError as exc:
+                report.usage.update(getattr(reviewer, "last_usage", None) or {})
+                if exc.blocking:
+                    report.blocked = str(exc)
+                    break
+                journal.problem("maintenance", f"a review call failed for {group.label}: {exc}")
+                budget -= 1
+                report.calls += 1
+                report.failed += 1
+                _record_call(state, "failed")
+                store.record_review(group.fingerprint, scope_key=group.scope_key, outcome="failed", now=memory.now())
+                continue
             report.usage.update(getattr(reviewer, "last_usage", None) or {})
-            if exc.blocking:
-                report.blocked = str(exc)
-                break
-            journal.problem("maintenance", f"a review call failed for {group.label}: {exc}")
             budget -= 1
             report.calls += 1
-            report.failed += 1
-            _record_call(state, "failed")
-            store.record_review(group.fingerprint, scope_key=group.scope_key, outcome="failed", now=memory.now())
-            continue
-        report.usage.update(getattr(reviewer, "last_usage", None) or {})
-        budget -= 1
-        report.calls += 1
-        _record_call(state, "ok")
-        with store.transaction():
-            for finding in findings:
-                report.changes.update(apply_finding(memory, finding, group, busy, run=run))
-            # The group as it now stands is reviewed too, so its changes cost no second look.
-            remaining = [record for record in (store.get(item.id) for item in group.members)
-                         if record is not None and record.status == "active"]
-            for fingerprint in {group.fingerprint, group_fingerprint(group.scope_key, remaining)}:
-                store.record_review(fingerprint, scope_key=group.scope_key, outcome="reviewed", now=memory.now())
-    cutoff = _parse_time(memory.now()) - timedelta(days=REVIEWS_KEPT_DAYS)
-    store.prune_reviews(before=cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
-    if state is not None:
-        state.save()
+            _record_call(state, "ok")
+            with store.transaction():
+                for finding in findings:
+                    report.changes.update(apply_finding(memory, finding, group, busy, run=run))
+                # The group as it now stands is reviewed too, so its changes cost no second look.
+                remaining = [record for record in (store.get(item.id) for item in group.members)
+                             if record is not None and record.status == "active"]
+                for fingerprint in {group.fingerprint, group_fingerprint(group.scope_key, remaining)}:
+                    store.record_review(fingerprint, scope_key=group.scope_key, outcome="reviewed", now=memory.now())
+        cutoff = _parse_time(memory.now()) - timedelta(days=REVIEWS_KEPT_DAYS)
+        store.prune_reviews(before=cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    finally:
+        if state is not None:  # the calls made, even when a run ends with an error
+            state.save()
     return report
 
 

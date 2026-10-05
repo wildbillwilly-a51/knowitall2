@@ -124,6 +124,23 @@ class Extractor(Protocol):
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
+_RESTRICTED_SUPPORT: dict[str, bool] = {}
+
+
+def offers_restricted_mode(executable: Path | str) -> bool:
+    """Whether this Claude Code offers ``--restricted`` (asked once per program, from its help)."""
+
+    key = str(executable)
+    if key not in _RESTRICTED_SUPPORT:
+        try:
+            shown = run_bounded([*engine_command(Path(executable)), "--help"], timeout=60)
+            text = (shown.stdout or b"") + (shown.stderr or b"")
+            _RESTRICTED_SUPPORT[key] = b"--restricted" in (text if isinstance(text, bytes) else text.encode())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            _RESTRICTED_SUPPORT[key] = False
+    return _RESTRICTED_SUPPORT[key]
+
+
 # A call that looks things up in a project folder: it may read and search files there, nothing more.
 EXPLORE_TOOLS = "Read,Grep,Glob"
 EXPLORE_TIMEOUT = 600.0
@@ -182,8 +199,11 @@ class ClaudeCliExtractor:
         """Like ``command``, with only the tools that read files, allowed without asking; nothing else can run."""
 
         start = engine_command(self.executable)
+        # Restricted mode confines the file tools to the folder (they read anywhere otherwise); offered by
+        # Claude Code 2.1 and later, so it is asked for only where the installed one offers it.
+        confined = ["--restricted"] if self._runner is run_bounded and offers_restricted_mode(self.executable) else []
         return [
-            *start, "-p", "--safe-mode", "--tools", EXPLORE_TOOLS, "--allowedTools", EXPLORE_TOOLS,
+            *start, "-p", "--safe-mode", *confined, "--tools", EXPLORE_TOOLS, "--allowedTools", EXPLORE_TOOLS,
             "--permission-mode", "dontAsk", "--no-session-persistence",
             "--output-format", "json", "--json-schema", json.dumps(schema, separators=(",", ":")),
             "--model", self.model, *prompt_arguments(start, system_prompt, scratch), *self._effort(),
@@ -303,7 +323,10 @@ class CodexCliExtractor:
         if completed.returncode != 0 or not answer.strip():
             detail = (_last_line(completed.stderr) or _last_line(completed.stdout)
                       or f"exit code {completed.returncode}")[:200]
-            blocking = any(marker in detail.casefold() for marker in _CODEX_BLOCKING_MARKERS)
+            # Only Codex's own complaint stops learning: a failed run's error output. A run that ended with
+            # no answer may have printed the model's prose, which can mention a login or a 403 it saw.
+            complaint = _last_line(completed.stderr) if completed.returncode != 0 else ""
+            blocking = any(marker in complaint.casefold() for marker in _CODEX_BLOCKING_MARKERS)
             raise ExtractionError(f"the Codex CLI reported: {detail}", blocking=blocking)
         try:
             payload = json.loads(answer)

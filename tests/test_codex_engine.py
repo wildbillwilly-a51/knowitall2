@@ -24,7 +24,8 @@ from knowitall2.learning.extractor import (
 from knowitall2.learning.state import LearnerSettings, load_settings, save_settings
 
 
-def answering(payload: object, *, returncode: int = 0, stderr: bytes = b"", calls: list | None = None):
+def answering(payload: object, *, returncode: int = 0, stderr: bytes = b"", stdout: bytes = b"",
+              calls: list | None = None):
     """A fake runner that writes ``payload`` where ``codex exec -o`` would, and records the call."""
 
     def runner(command, **options):
@@ -34,7 +35,7 @@ def answering(payload: object, *, returncode: int = 0, stderr: bytes = b"", call
             Path(command[command.index("-o") + 1]).write_text(
                 payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8",
             )
-        return subprocess.CompletedProcess(command, returncode, b"", stderr)
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
     return runner
 
@@ -69,6 +70,9 @@ class CodexEngineTests(unittest.TestCase):
             (answering(None, returncode=1, stderr=b"stream disconnected"), False),
             (answering("not json"), False),
             (answering(None), False),
+            # The model's own prose, printed by a run that left no answer, is no complaint of Codex's
+            # (review 2026-10-04, L-L5).
+            (answering(None, stdout=b"The user should log in to vCenter first; it answered 403."), False),
         ]
         for runner, blocking in cases:
             with self.subTest(blocking=blocking), self.assertRaises(ExtractionError) as caught:

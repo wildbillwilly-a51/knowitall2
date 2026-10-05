@@ -24,7 +24,7 @@ def run_checks(*, agents: Iterable[str] | None = None, user_home: Path | None = 
 
     launch = server_launch()
     checks = [_python_check(), _fts5_check(), _location_check(), *_store_checks(), _sharing_check(),
-              _engine_check(), probe_server(launch)]
+              _engine_check(), _known_files_check(), probe_server(launch)]
     for name in agents or AGENT_NAMES:
         adapter = adapter_for(name, user_home=user_home)
         if agents is None and adapter.installed() and not was_set_up(adapter):
@@ -83,6 +83,28 @@ def _sharing_check() -> Check:
            else "Check that the KnowItAll2 server is running and reachable; memories saved here are sent when it "
                 "is back.")
     return Check("shared memory", False, detail, fix)
+
+
+def _known_files_check() -> Check:
+    """The knowledge files in projects: on or off, where written, and any project where search may not see them."""
+
+    from . import known
+
+    name = "knowledge files"
+    if not known.enabled():
+        return Check(name, True, "off; `knowitall2 known --on` writes them into each project again")
+    status = known.read_status()
+    if not status.get("at"):
+        return Check(name, True, "not written yet; they are written after the next change to memories",
+                     f"Run: {cli_command('known')} to write them now")
+    folders = status.get("folders") or []
+    detail = f"in {len(folders)} project folders ({known.FOLDER}/), last written {status['at']}"
+    problems = [*status.get("problems", []), *status.get("notes", [])]
+    if problems:
+        return Check(name, True, detail + "; " + "; ".join(problems[:3]) +
+                     (f"; and {len(problems) - 3} more" if len(problems) > 3 else ""),
+                     f"See the notes above; then run: {cli_command('known')}")
+    return Check(name, True, detail)
 
 
 def _python_check() -> Check:

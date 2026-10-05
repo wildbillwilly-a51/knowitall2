@@ -38,7 +38,10 @@ INSTRUCTIONS = (
     "with project_path set to the workspace root, unless a KnowItAll2 briefing is already in your context. "
     "Before rediscovering anything that may have been learned "
     "before (a host, service, route, credential location, procedure, or past decision), call `recall` with a "
-    "few keywords. When you establish a durable fact that would help a future session, or the user tells you "
+    "few keywords. Everything KnowItAll2 knows is also in the `knowitall2-known/` folder at the project's root "
+    "(its README.md lists the files): search it like any project file, read a file KnowItAll2 points you to, "
+    "and do not edit it. "
+    "When you establish a durable fact that would help a future session, or the user tells you "
     "one (a system, a method, a rule), call `remember` right away and tell the user in one short line what was "
     "saved; set source to 'user' only for the user's own words. Never save secrets; save where a credential is "
     "kept instead. When the user asks KnowItAll2 to learn from the session, or once when a task the user gave you "
@@ -545,6 +548,9 @@ def handle_once(request: dict[str, Any]) -> dict[str, Any]:
 
                 nudge(server._agent, store=server._memory.store)
             server._memory.store.close()
+            from .known import nudge as refresh_known_files
+
+            refresh_known_files()
 
 
 def run_once() -> int:
