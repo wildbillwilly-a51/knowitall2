@@ -226,6 +226,60 @@ class ProfileTests(CatalogTestCase):
         self.assertEqual(catalog.profile_fingerprint(self.store.system_records(system["id"])), described["profiled"])
         self.assertEqual(0, self.run_catalog(FakeEngine()).calls)
 
+    def test_a_memory_filed_elsewhere_that_names_a_system_counts_in_its_profile(self) -> None:
+        # 2026-10-05: the iDRAC addresses were filed under the homelab, so the iDRAC's profile said its address was
+        # not known while a host's hardware was failing.
+        idrac = self.file(self.save("Use the read-only iDRAC helper on the jump host as hermes."), "access",
+                          system="Dell iDRAC", kind="device")
+        self.store.upsert_system(system_id=idrac["id"], name="Dell iDRAC", area="Servers and virtual machines",
+                                 kind="device", aliases=["iDRAC", "Redfish"], now=self.clock())
+        addresses = self.save("Homelab iDRAC endpoints: vhost1-mgmt 10.9.15.19 (helper profile vhost1-mgmt).")
+        self.file(addresses, "where", system="Homelab", kind="project")
+        unrelated = self.save("The homelab printer is on the second floor.")
+        self.file(unrelated, "where", system="Homelab", kind="project")
+        in_a_path = self.save("Its notes are in the Homelab repository under docs/idrac/.")
+        self.file(in_a_path, "about", system="Homelab", kind="project")
+        before = catalog.profile_fingerprint(self.store.system_records(idrac["id"]))
+        shown = catalog.profile(self.store, self.store.system(idrac["id"]))
+        self.assertEqual([addresses.id], [item["id"] for item in shown["elsewhere"]])
+        self.assertEqual(["Where the sign-in is kept"], [item["label"] for item in shown["missing"]])
+        # The homelab is named by none of the iDRAC's memories, so nothing is listed the other way.
+        homelab = self.store.system(catalog.system_id_for("Homelab"))
+        self.assertEqual([], catalog.profile(self.store, homelab)["elsewhere"])
+
+        # The iDRAC is described again, now with the memory that names it, and is not reported missing its address.
+        engine = FakeEngine(profile=[{"systems": [{"id": idrac["id"], "summary": "Remote management of the Dell hosts.",
+                                                   "gaps": [], "aliases": ["iDRAC", "Redfish"]}]}])
+        self.run_catalog(engine)
+        [profile_input] = [text for step, text in engine.inputs if step == "profile"]
+        self.assertIn("Memories filed under something else that name it (1):", profile_input)
+        self.assertIn("10.9.15.19", profile_input)
+        described = self.store.system(idrac["id"])
+        self.assertNotEqual(before, described["profiled"])
+        again = FakeEngine()
+        self.run_catalog(again)   # not again until something changes (the homelab, left out above, is)
+        self.assertNotIn(idrac["id"], "".join(text for step, text in again.inputs if step == "profile"))
+        self.file(self.save("Redfish on vhost1-mgmt needs TLS 1.2."), "lesson", system="Homelab", kind="project")
+        later = FakeEngine()
+        self.run_catalog(later)   # a new memory that names it: described again
+        self.assertIn(idrac["id"], "".join(text for step, text in later.inputs if step == "profile"))
+
+    def test_describing_a_system_corrects_its_aliases(self) -> None:
+        # 2026-10-05: aliases could only be added, so "workstation" kept pointing every workstation to one computer.
+        self.file(self.save("Saltbox is the media server.", source="observed"), "about", system="Saltbox", kind="server")
+        vm = self.file(self.save("LAB-WIN10VM is at 10.9.15.28.", source="observed"), "where", system="LAB-WIN10VM",
+                       kind="server")
+        self.store.upsert_system(system_id=vm["id"], name="LAB-WIN10VM", area=vm["area"], kind="server",
+                                 aliases=["workstation", "lab-win10vm"], now=self.clock())
+        engine = FakeEngine(profile=[{"systems": [{"id": vm["id"], "summary": "The Windows VM agents run on.", "gaps": [],
+                                                   "aliases": ["lab-win10vm", "10.9.15.28", "Saltbox", "LAB WIN10VM",
+                                                               "homelab"]}]}])
+        self.run_catalog(engine)
+        [profile_input] = [text for step, text in engine.inputs if step == "profile" and vm["id"] in text]
+        self.assertIn("Its aliases now: workstation, lab-win10vm", profile_input)
+        # Replaced, not added to; another system's or a project's name, or its own in any spelling, is never an alias.
+        self.assertEqual(["10.9.15.28"], self.store.system(vm["id"])["aliases"])
+
     def test_projects_have_no_readiness_and_the_user_can_fill_a_gap(self) -> None:
         system = self.file(self.save("Releases are cut from main.", kind="decision"), "decision", system="Homelab",
                            kind="project")
@@ -321,6 +375,27 @@ class QuestionFlowTests(CatalogTestCase):
         review.ask_conflict(self.memory, stale, other)
         later = datetime(2026, 10, 5, tzinfo=timezone.utc)
         self.assertEqual(2, len(review.for_user(self.store, now=later)))
+
+    def test_questions_are_reviewed_even_when_filing_always_has_work(self) -> None:
+        # From 2026-09-28 to 10-08 every run spent its two calls filing and describing, and the review never ran.
+        older, newer, question = self.conflict()
+        engine = FakeEngine(review=[self.decide(question, "use_new", certain=True)])
+        with mock.patch.object(cataloguer, "FILE_BATCH", 1):  # the two unfiled memories alone fill the budget
+            report = self.run_catalog(engine, budget=2)
+        self.assertEqual({"settled": 1}, dict(report.questions))
+        self.assertEqual(["review", "file"], [step for step, _ in engine.inputs])
+
+    def test_listed_questions_say_what_was_found_and_which_were_never_looked_into(self) -> None:
+        older, newer, question = self.conflict(older_source="user")
+        self.run_catalog(FakeEngine(review=[self.decide(question, "use_new", certain=True)]))
+        stale = self.save("Backups run nightly at 02:00.")
+        review.ask_conflict(self.memory, stale, self.save("Backups run nightly at 04:00."))
+        self.clock.value = "2026-10-05T12:00:00Z"
+        listed = review.list_questions(self.memory)
+        self.assertIn("KnowItAll2 looked: The newer note records a later test.", listed)
+        self.assertEqual(1, listed.count("No one has looked into this one yet"))
+        self.assertIn("look into each question yourself", listed)
+        self.assertIn("recommend", listed)
 
     def test_without_learning_questions_go_straight_to_the_user(self) -> None:
         save_settings(LearnerSettings(enabled=False))
@@ -468,9 +543,11 @@ class CatchUpTests(unittest.TestCase):
                 state.save()
                 self.assertEqual(1, catchup.catch_up(str(folder)))
                 extractor = FakeExtractorForCatchUp()
+                # Closed here: left to the garbage collector, its ResourceWarning landed in a later test's stderr.
+                store = Store.in_memory()
+                self.addCleanup(store.close)
                 learn(logs=[log], state=LearnerState(), settings=LearnerSettings(enabled=True),
-                      memory_factory=lambda: Memory(Store.in_memory(), agent="learner"), extractor=extractor,
-                      dry_run=False)
+                      memory_factory=lambda: Memory(store, agent="learner"), extractor=extractor, dry_run=False)
                 sent = "".join(dossier.text for dossier in extractor.dossiers)
                 self.assertIn("Old part 4", sent)
                 self.assertNotIn("New part", sent)

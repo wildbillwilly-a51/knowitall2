@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.10.2 (2026-10-08)
+
+- **KnowItAll2 looks into its questions before you see them.** From
+  2026-09-28 the background catalog spent every run's calls on filing
+  memories and describing systems, so its review of questions never ran:
+  all 39 open questions reached you unreviewed, after the 3-day wait. Each
+  run now reviews one batch of questions first. The questions list says
+  what was found, marks a question no one has looked into yet, and asks
+  agents to look into each one and recommend an answer before asking you.
+- **A system's file has every memory that names it.** A memory is filed
+  under the one system it is mainly about, and 60% of memories name another
+  system too; those were missing from the other system's file and profile.
+  On 2026-10-05 the iDRAC address of a failing host was filed under the
+  homelab, so the iDRAC's file and profile said it was not known, and the
+  agent tried the wrong iDRAC. Each file now lists, last, the memories filed
+  elsewhere that name it, with where they are filed; a system's profile in
+  the app shows them and counts them toward what is known, and the catalog
+  sees them when it writes what is missing.
+- **The catalog corrects wrong aliases.** Aliases could only be added, so
+  words like "workstation" and "Docker" kept pointing to one system. When
+  the catalog describes a system it now gives the complete list of names
+  that mean that system and nothing else, which replaces the old list; an
+  alias that is another system's or a project's name is never kept. Every
+  system is described once more after the update, which cleans up the
+  existing aliases.
+- Finding names in text is faster (word by word instead of one large
+  pattern).
+
 ## 0.10.1 (2026-10-05)
 
 - **Fewer pointers, to files worth reading.** In the first day of 0.10.0

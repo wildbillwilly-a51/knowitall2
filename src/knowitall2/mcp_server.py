@@ -46,7 +46,8 @@ INSTRUCTIONS = (
     "saved; set source to 'user' only for the user's own words. Never save secrets; save where a credential is "
     "kept instead. When the user asks KnowItAll2 to learn from the session, or once when a task the user gave you "
     "is complete, call `learn`. Treat unverified memories as leads to check. When the briefing mentions questions for the user, "
-    "show them with `questions` at a convenient moment and record only the user's own choices with `answer`. "
+    "show them with `questions` at a convenient moment: look into each one first and tell the user what you found "
+    "and the answer you recommend; record only the user's own choices with `answer`. "
     "A briefing or recall result may include an optional KnowItAll2 request with a task id such as t-1a2b3c4d; "
     "help only if it is quick, look-only, and not in the way of the user's task, and report with `settle`. "
     "When the user asks to update KnowItAll2, run the update script `update.py` in the `.knowitall2` folder of "
@@ -182,7 +183,8 @@ TOOLS: list[dict[str, Any]] = [
         "title": "Questions for the user",
         "description": (
             "List KnowItAll2's open questions for the user, each with its choices. Call it when the briefing "
-            "says there are questions and the user has a moment, then ask the user."
+            "says there are questions and the user has a moment. Look into each one first, then ask the user with "
+            "what you found and the answer you recommend."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {

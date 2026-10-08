@@ -165,6 +165,7 @@ def render(system: dict[str, Any], shown: dict[str, Any], items: list[dict[str, 
         lines.append(f"Summary: {system['summary']}")
     known = [memory.get("headline") or memory.get("text") for facet in shown.get("facets") or []
              for memory in facet["memories"]][:KNOWN_SHOWN]
+    known += [memory.get("headline") or memory.get("text") for memory in shown.get("elsewhere") or []][:KNOWN_SHOWN]
     if known:
         lines += ["", "Already known:"] + [f"- {item}" for item in known]
     lines += ["", "Find these missing parts (key: what):"]

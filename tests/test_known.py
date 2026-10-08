@@ -81,6 +81,41 @@ class RenderTests(KnownTestCase):
         for record in (route, local, loose):
             self.assertEqual(1, sum(record.id in text for name, text in files.items() if name != known.INDEX))
 
+    def test_a_memory_is_also_listed_in_the_files_of_the_systems_it_names(self) -> None:
+        # 2026-10-05: the iDRAC addresses were filed under the homelab and missing from the iDRAC's file.
+        helper = self.remember("The read-only iDRAC helper runs on the jump host as hermes.", scope="global")
+        self.file(helper.id, "Dell iDRAC", aliases=["iDRAC", "Redfish"])
+        addresses = self.remember("Homelab iDRAC endpoints: vhost1-mgmt 10.9.15.19 (helper profile vhost1-mgmt).",
+                                  scope="global")
+        self.file(addresses.id, "Homelab", facet="where")
+        path_only = self.remember("Homelab runbooks are in docs/idrac/ of the repository.", scope="global")
+        self.file(path_only.id, "Homelab", facet="about")
+        nowhere = self.remember("The Grafana dashboards are on the Homelab wiki.", scope="global")
+        self.file(nowhere.id, "Homelab", facet="about")
+        files = known.render(self.connection)
+        idrac = files["dell-idrac.md"]
+        self.assertIn("1 memories, newest first.\n1 more, filed in other files, name it; they are listed last.", idrac)
+        own, listed = idrac.split(f"## {known.ELSEWHERE}\n")
+        self.assertIn(helper.id, own)
+        self.assertIn(f"[{addresses.id}] fact, saved", listed)
+        self.assertIn("filed in homelab.md: Homelab iDRAC endpoints: vhost1-mgmt 10.9.15.19", listed)
+        self.assertNotIn(path_only.id, idrac)   # a folder in a path is not a mention
+        # Filed in one file only; a name with no file of its own (Grafana) makes none.
+        self.assertIn(addresses.id, files["homelab.md"])
+        self.assertNotIn(known.ELSEWHERE, files["homelab.md"])
+        self.assertNotIn("grafana.md", files)
+        self.assertIn("- dell-idrac.md: Dell iDRAC (also iDRAC, Redfish), 1 memories, and 1 filed elsewhere that name it",
+                      files[known.INDEX])
+
+    def test_named_finds_the_longest_name_in_order_and_skips_parts_of_paths_and_logins(self) -> None:
+        table = {("lab", "vhost1"): "vhost1", ("lab", "vhost1", "mgmt"): "idrac", ("saltbox",): "saltbox",
+                 ("codex",): "codex"}
+        self.assertEqual(["saltbox", "vhost1", "idrac"],
+                         known.named("Saltbox runs on Lab-vhost1; its iDRAC is lab_vhost1-mgmt. lab-vhost1 again.", table))
+        self.assertEqual([], known.named("ssh codex@host; see C:\\Projects\\saltbox\\ and https://x/.codex", table))
+        self.assertEqual(["saltbox"], known.named("saltbox/docs is a host path", table))
+        self.assertEqual([], known.named("", {}))
+
     def test_a_system_and_a_project_with_one_name_share_a_file(self) -> None:
         # Two writes to one file name used to overwrite each other and lose memories.
         project_memory = self.remember("Alpha's tests run with make check.", scope="project")

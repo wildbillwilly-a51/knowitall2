@@ -680,6 +680,10 @@ async function systemProfile(id, { keep = null } = {}) {
           <dd><ul class="plain-list">${facet.memories.map((item, index) => html`
             <li>${headlineOf(item)} ${details(`m-${item.id}-${index}`, memoryDetails(item), { show: 'details' })}</li>`)}</ul></dd>`)}
         ${missing.map((item) => html`<dt>${item.label}</dt><dd class="unknown">Not known</dd>`)}
+        ${data.elsewhere.length ? html`
+          <dt>Filed under something else, and names it</dt>
+          <dd><ul class="plain-list">${data.elsewhere.map((item, index) => html`
+            <li>${headlineOf(item)} ${details(`e-${item.id}-${index}`, memoryDetails(item), { show: 'details' })}</li>`)}</ul></dd>` : ''}
       </dl>
     </section>
     ${(missing.length || data.gaps.length || data.finding) ? html`

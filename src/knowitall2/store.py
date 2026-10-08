@@ -903,6 +903,14 @@ class Store:
             (system_id, name, area, kind, json.dumps(merged), now, now),
         )
 
+    def set_system_aliases(self, system_id: str, *, aliases: Sequence[str], now: str) -> None:
+        """Replace a system's aliases, such as after the catalog corrected them."""
+
+        self._connection.execute(
+            "UPDATE systems SET aliases = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(list(dict.fromkeys(aliases))), now, system_id),
+        )
+
     def set_system_profile(self, system_id: str, *, summary: str, gaps: Sequence[str], profiled: str, now: str) -> None:
         self._connection.execute(
             "UPDATE systems SET summary = ?, gaps = ?, profiled = ?, updated_at = ? WHERE id = ?",
@@ -976,6 +984,20 @@ class Store:
             "SELECT COUNT(*) FROM records r WHERE r.status = 'active' "
             "AND NOT EXISTS (SELECT 1 FROM record_notes n WHERE n.record_id = r.id)",
         ).fetchone()[0])
+
+    def noted_records(self) -> list[dict[str, Any]]:
+        """Every active memory that has a note, with the note (``headline``, ``facet``, ``system_id``)."""
+
+        rows = self._connection.execute(
+            f"SELECT {_COLUMNS}, r.recall_count, r.last_used_at, n.headline, n.facet, n.system_id {_FROM} "
+            "JOIN record_notes n ON n.record_id = r.id WHERE r.status = 'active' ORDER BY r.seq",
+        ).fetchall()
+        found = []
+        for row in rows:
+            item = _record_dict(row)
+            item["headline"], item["facet"], item["system_id"] = row["headline"], row["facet"], row["system_id"]
+            found.append(item)
+        return found
 
     def system_records(self, system_id: str | None) -> list[dict[str, Any]]:
         """The active memories filed under a system (None: filed under no system), with their notes."""

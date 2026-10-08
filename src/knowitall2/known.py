@@ -75,7 +75,9 @@ def render(connection: sqlite3.Connection) -> dict[str, str]:
     projects = dict(connection.execute("SELECT id, name FROM projects"))
     notes = dict(connection.execute("SELECT record_id, system_id FROM record_notes WHERE system_id IS NOT NULL"))
     facets = dict(connection.execute("SELECT record_id, facet FROM record_notes"))
+    table = name_table(connection)
     groups: dict[str, dict[str, Any]] = {}
+    elsewhere: list[tuple[list[str], str]] = []   # the files a memory names besides its own, and its entry there
     rows = connection.execute(
         "SELECT id, kind, text, scope, project_id, verification, created_at FROM records "
         "WHERE status = 'active' ORDER BY created_at DESC, seq DESC"
@@ -88,7 +90,7 @@ def render(connection: sqlite3.Connection) -> dict[str, str]:
             name, aliases = projects[project_id], []
         else:
             name, aliases = GENERAL, []
-        group = groups.setdefault(file_name(name), {"names": [], "aliases": [], "entries": [],
+        group = groups.setdefault(file_name(name), {"names": [], "aliases": [], "entries": [], "elsewhere": [],
                                                     "sections": {key: [] for key, _ in SECTIONS}})
         if name not in group["names"]:
             group["names"].append(name)
@@ -96,10 +98,17 @@ def render(connection: sqlite3.Connection) -> dict[str, str]:
         where = f", project {projects[project_id]}" if scope == "project" and projects.get(project_id) else ""
         unverified = " (unverified: check before relying on it)" if verification == "unverified" else ""
         body = secrets.redact(" ".join(str(text).split()))
-        entry = f"- [{record_id}] {kind}, saved {str(created_at)[:10]}{where}{unverified}: {body}"
-        wrapped = "\n  ".join(textwrap.wrap(entry, LINE_WIDTH, break_long_words=False, break_on_hyphens=False))
-        group["entries"].append(wrapped)
-        group["sections"][_section(facets.get(record_id), kind)].append(wrapped)
+        saved = f"[{record_id}] {kind}, saved {str(created_at)[:10]}{where}{unverified}"
+        group["entries"].append(_wrap(f"- {saved}: {body}"))
+        group["sections"][_section(facets.get(record_id), kind)].append(group["entries"][-1])
+        home = file_name(name)
+        others = [target for target in named(str(text), table) if target != home]
+        if others:
+            elsewhere.append((others, _wrap(f"- {saved}, filed in {home}: {body}")))
+    for others, entry in elsewhere:   # only into files that exist: a name alone makes no file
+        for target in others:
+            if target in groups:
+                groups[target]["elsewhere"].append(entry)
     files: dict[str, str] = {}
     index_lines = []
     for name in sorted(groups, key=lambda item: (" / ".join(groups[item]["names"]).casefold(), item)):
@@ -109,22 +118,29 @@ def render(connection: sqlite3.Connection) -> dict[str, str]:
         if group["aliases"]:
             head.append(f"Also called: {', '.join(group['aliases'])}")
         head.append(f"{len(group['entries'])} memories, newest first.")
+        if group["elsewhere"]:
+            head.append(f"{len(group['elsewhere'])} more, filed in other files, name it; they are listed last.")
         filled = [(title, group["sections"][key]) for key, title in SECTIONS if group["sections"][key]]
+        if group["elsewhere"]:
+            filled.append((ELSEWHERE, group["elsewhere"]))
         if len(filled) == 1:
             body = "\n".join(filled[0][1])
         else:   # how to reach it and the how-tos first, so even a partial read gets them
             body = "\n\n".join(f"## {title}\n\n" + "\n".join(entries) for title, entries in filled)
         files[name] = "\n".join(head) + "\n\n" + body + "\n"
         called = f" (also {', '.join(group['aliases'][:4])})" if group["aliases"] else ""
-        index_lines.append(f"- {name}: {title}{called}, {len(group['entries'])} memories")
+        more = f", and {len(group['elsewhere'])} filed elsewhere that name it" if group["elsewhere"] else ""
+        index_lines.append(f"- {name}: {title}{called}, {len(group['entries'])} memories{more}")
     files[INDEX] = "\n".join([
         MARKER,
         "# What KnowItAll2 knows",
         "",
         "Everything KnowItAll2 remembers from coding sessions on this computer and the computers it shares",
         "memory with: one file per system or project, newest first. Search it like any project file. A",
-        "memory marked unverified is a lead to check. These files are rewritten whenever memories change;",
-        "to correct one, use KnowItAll2's remember or forget, not an edit here.",
+        "memory is filed under what it is mainly about and listed again at the end of the file of each other",
+        "system it names, so one system's file has everything that names it. A memory marked unverified is",
+        "a lead to check. These files are rewritten whenever memories change; to correct one, use",
+        "KnowItAll2's remember or forget, not an edit here.",
         "",
         *index_lines,
     ]) + "\n"
@@ -137,6 +153,11 @@ SECTIONS = (
     ("rest", "Everything else"),
 )
 _REACH_FACETS = {"access", "signin", "where"}
+ELSEWHERE = "Named in memories filed elsewhere"
+
+
+def _wrap(entry: str) -> str:
+    return "\n  ".join(textwrap.wrap(entry, LINE_WIDTH, break_long_words=False, break_on_hyphens=False))
 
 
 def _section(facet: str | None, kind: str) -> str:
@@ -433,15 +454,48 @@ def name_table(connection: sqlite3.Connection) -> dict[tuple[str, ...], str]:
     never count.
     """
 
+    systems = [(file_name(name), name, _aliases(raw)) for _, name, raw in connection.execute(
+        "SELECT id, name, aliases FROM systems")]
+    projects = [(file_name(str(name)), str(name), []) for (name,) in connection.execute("SELECT name FROM projects")]
+    return _word_table(systems + projects)
+
+
+def system_table(connection: sqlite3.Connection) -> dict[tuple[str, ...], str]:
+    """Each name of a catalogued system, as words, and the system's id, by the rules of ``name_table``."""
+
+    return _word_table([(system_id, name, _aliases(raw)) for system_id, name, raw in connection.execute(
+        "SELECT id, name, aliases FROM systems")])
+
+
+def named(text: str, table: dict[tuple[str, ...], str]) -> list[str]:
+    """The targets of ``table`` that ``text`` names, in the order first named; the longest name wins."""
+
+    folded = str(text).casefold()
+    words = [(match.group(0), match.start(), match.end()) for match in _WORD.finditer(folded)]
+    longest = max((len(key) for key in table), default=0)
+    found: list[str] = []
+    index = 0
+    while index < len(words):
+        for size in range(min(longest, len(words) - index), 0, -1):
+            target = table.get(tuple(word for word, _, _ in words[index:index + size]))
+            if target is not None:
+                break
+        else:
+            index += 1
+            continue
+        if not _not_a_mention(folded, words[index][1], words[index + size - 1][2]) and target not in found:
+            found.append(target)
+        index += size
+    return found
+
+
+def _word_table(entries: Sequence[tuple[str, str, Sequence[str]]]) -> dict[tuple[str, ...], str]:
     names: dict[tuple[str, ...], set[str]] = {}
     aliases: dict[tuple[str, ...], set[str]] = {}
-    for _, name, raw in connection.execute("SELECT id, name, aliases FROM systems"):
-        target = file_name(name)
+    for target, name, others in entries:
         names.setdefault(tuple(_WORD.findall(name.casefold())), set()).add(target)
-        for alias in _aliases(raw):
+        for alias in others:
             aliases.setdefault(tuple(_WORD.findall(alias.casefold())), set()).add(target)
-    for (name,) in connection.execute("SELECT name FROM projects"):
-        names.setdefault(tuple(_WORD.findall(str(name).casefold())), set()).add(file_name(str(name)))
     table: dict[tuple[str, ...], str] = {}
     for words, targets in names.items():
         if len(targets) == 1 and len("".join(words)) >= POINTER_MINIMUM_CHARACTERS:
@@ -461,16 +515,11 @@ def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: 
     table = name_table(connection)
     if not table:
         return []
-    alternatives = sorted((r"[\W_]+".join(map(re.escape, words)) for words in table if words), key=len, reverse=True)
-    pattern = re.compile(r"(?<![^\W_])(?:" + "|".join(alternatives) + r")(?![^\W_])")
-    text = "\n".join(str(item)[:POINTER_TEXT_LIMIT] for item in texts if item).casefold()
+    text = "\n".join(str(item)[:POINTER_TEXT_LIMIT] for item in texts if item)
     found: list[tuple[str, str, int]] = []
     rejected: set[str] = set()
-    for match in pattern.finditer(text):
-        if _not_a_mention(text, match.start(), match.end()):
-            continue
-        target = table.get(tuple(_WORD.findall(match.group(0))))
-        if not target or target in shown or target in rejected or any(target == item[0] for item in found):
+    for target in named(text, table):
+        if target in shown or target in rejected:
             continue
         try:
             head = read_text(folder / target).splitlines()[:3]

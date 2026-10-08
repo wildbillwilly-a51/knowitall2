@@ -6,6 +6,11 @@ most one system, in one part of its profile (a facet). The background catalog
 pass (``learning.cataloguer``) files memories and writes each system's plain
 summary and what is missing. This module turns that into profiles, without
 any model calls.
+
+A memory often names more than the one system it is filed under (the iDRAC
+addresses of several hosts, filed under the homelab). A profile also counts the
+memories filed elsewhere that name the system by its name or one of its own
+aliases, so a part known only from such a memory is not reported missing.
 """
 
 from __future__ import annotations
@@ -74,23 +79,47 @@ def find_system(systems: list[dict[str, Any]], name: str) -> dict[str, Any] | No
     return None
 
 
-def profile_fingerprint(records: list[dict[str, Any]]) -> str:
+def profile_fingerprint(records: list[dict[str, Any]], elsewhere: list[dict[str, Any]] = ()) -> str:
     """Identifies which memories a system's summary was written from, so it is rewritten only after changes."""
 
     body = "\n".join(sorted(f"{item['id']}:{item['facet']}" for item in records))
+    if elsewhere:   # an empty list keeps the fingerprint of a profile written before memories named elsewhere counted
+        body += "\nnamed:" + ",".join(sorted(f"{item['id']}:{item['facet']}" for item in elsewhere))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def profile(store: Store, system: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
-    """One system's profile: its memories by part, what is missing, its status, and when it was last seen working."""
+def named_elsewhere(store: Store) -> dict[str, list[dict[str, Any]]]:
+    """For each system, the active memories filed under something else (another system, a project, or nothing)
+    that name it by its name or one of its own aliases, oldest first, with their notes."""
+
+    from . import known
+
+    table = known.system_table(store.connection)
+    found: dict[str, list[dict[str, Any]]] = {}
+    if not table:
+        return found
+    for item in store.noted_records():
+        for system_id in known.named(item["text"], table):
+            if system_id != item["system_id"]:
+                found.setdefault(system_id, []).append(item)
+    return found
+
+
+def profile(store: Store, system: dict[str, Any], *, now: datetime | None = None,
+            elsewhere: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+    """One system's profile: its memories by part, what is missing, its status, and when it was last seen working.
+
+    ``elsewhere`` is ``named_elsewhere(store)``, worked out once when profiling many systems."""
 
     moment = now or datetime.now(timezone.utc)
     records = store.system_records(system["id"])
+    named = (named_elsewhere(store) if elsewhere is None else elsewhere).get(system["id"], [])
     by_facet: dict[str, list[dict[str, Any]]] = {}
     for item in records:
         by_facet.setdefault(item["facet"] if item["facet"] in FACETS else "other", []).append(item)
     infrastructure = system["kind"] in INFRASTRUCTURE_KINDS
-    missing = [facet for facet in ESSENTIAL_FACETS if infrastructure and facet not in by_facet]
+    known_parts = set(by_facet) | {item["facet"] for item in named}
+    missing = [facet for facet in ESSENTIAL_FACETS if infrastructure and facet not in known_parts]
     seen = max(
         (item["confirmed_at"] or item["created_at"] for item in records
          if item["verification"] == "observed" and item["facet"] in WORKING_FACETS),
@@ -107,6 +136,7 @@ def profile(store: Store, system: dict[str, Any], *, now: datetime | None = None
             {"facet": facet, "label": label, "memories": [_brief(item) for item in by_facet[facet]]}
             for facet, label in FACETS.items() if facet in by_facet
         ],
+        "elsewhere": [_brief(item) for item in reversed(named)],
         "missing": [{"facet": facet, "label": FACETS[facet]} for facet in missing],
         "last_seen_working": seen,
         "status": status_of(system["kind"], missing, seen, len(records), moment),
@@ -131,11 +161,12 @@ def overview(store: Store, *, now: datetime | None = None) -> dict[str, Any]:
     """Every system, grouped by area, with its status and how much is known and missing."""
 
     counts = store.system_memory_counts()
+    elsewhere = named_elsewhere(store)
     areas: dict[str, list[dict[str, Any]]] = {}
     for system in store.systems_list():
         if not counts.get(system["id"]):
             continue
-        item = profile(store, system, now=now)
+        item = profile(store, system, now=now, elsewhere=elsewhere)
         areas.setdefault(area_for(system["kind"], system["area"]), []).append({
             "id": item["id"], "name": item["name"], "kind": item["kind"], "summary": item["summary"],
             "status": item["status"], "memories": item["memories"],

@@ -136,7 +136,7 @@ def for_user(store: Store, *, limit: int = 100, now: datetime | None = None) -> 
         overdue = (current == "review" and created < moment - timedelta(days=REVIEW_DAYS)) or (
             current == "checking" and created < moment - timedelta(days=REVIEW_DAYS + CHECK_DAYS))
         if current == "ask_user" or overdue:
-            waiting.append(with_plain(question, row, store))
+            waiting.append({**with_plain(question, row, store), "stage": current})
     return waiting[:limit]
 
 
@@ -225,12 +225,19 @@ def list_questions(memory: Memory, *, limit: int = LIST_LIMIT, how_to_answer: st
     memory.store.set_meta(QUESTIONS_SHOWN_KEY, memory.now())
     if not questions:
         return "KnowItAll2 has no questions for the user."
-    guidance = how_to_answer or "Ask the user, then record each choice with the answer tool."
+    guidance = how_to_answer or (
+        "Before asking the user, look into each question yourself: recall its memories and check the files they "
+        "name. Then tell the user what you found and the answer you recommend, and record each choice with the "
+        "answer tool once the user makes it.")
     lines = [f"KnowItAll2 has {len(questions)} question(s) for the user. {guidance}"]
     for question in questions[:limit]:
         lines.append(f"[{question['id']}] {question['plain']}")
         if question.get("context"):
             lines.append(f"   ({question['context']} Tell the user this, so they know what it is about.)")
+        lines.extend(f"   Found: {finding}" for finding in question.get("findings") or [])
+        if question.get("stage") == "review" and not question.get("findings"):
+            # Overdue before any review reached it (learning off, no engine, or a run that never got to it).
+            lines.append("   (No one has looked into this one yet.)")
         lines.extend(f"   - {option['key']}: {option['label']}" for option in question["labels"])
         if question["not_sure"]:
             lines.append(f"   (If the user is not sure: {question['not_sure']}.)")
