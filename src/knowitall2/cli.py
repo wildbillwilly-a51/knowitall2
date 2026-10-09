@@ -241,10 +241,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return serve_http(arguments.host, arguments.port)
     if arguments.command == "server-join-code":
         return _server_join_code(arguments.name)
-    if arguments.command == "sync":
-        from .connected import run_command as run_sync
+    if arguments.command in _MEMORY_WORK:
+        try:
+            return _run_memory_work(arguments)
+        finally:
+            # This work runs on its own, mostly in a detached process after the hook that started it has
+            # checked the knowledge files: so it rewrites them itself when it changed memories.
+            from .known import nudge as refresh_known_files
 
-        return run_sync(arguments)
+            refresh_known_files()
     if arguments.command == "known":
         from .known import run_command as run_known
 
@@ -253,24 +258,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_agent_command(arguments)
     if arguments.command == "server":
         return _run_server_command(arguments)
-    if arguments.command == "learn":
-        from .learning.command import run_learn
-
-        return run_learn(arguments)
-    if arguments.command == "maintain":
-        from .learning.command import run_maintain
-
-        return run_maintain(arguments)
-    if arguments.command == "catalog":
-        from .learning.command import run_catalog_command
-
-        return run_catalog_command(arguments)
-    if arguments.command == "find-out":
-        from .learning import finder
-
-        result = finder.run(arguments.system)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        return 0 if result.get("status") == "done" else 1
     if arguments.command == "app":
         return _run_app(arguments)
     if arguments.command == "update":
@@ -301,6 +288,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         store.close()
+
+
+# Commands that change memories without a tool call or a hook around them: syncing, learning, upkeep.
+_MEMORY_WORK = frozenset({"sync", "learn", "maintain", "catalog", "find-out"})
+
+
+def _run_memory_work(arguments: argparse.Namespace) -> int:
+    if arguments.command == "sync":
+        from .connected import run_command as run_sync
+
+        return run_sync(arguments)
+    if arguments.command == "learn":
+        from .learning.command import run_learn
+
+        return run_learn(arguments)
+    if arguments.command == "maintain":
+        from .learning.command import run_maintain
+
+        return run_maintain(arguments)
+    if arguments.command == "catalog":
+        from .learning.command import run_catalog_command
+
+        return run_catalog_command(arguments)
+    from .learning import finder
+
+    result = finder.run(arguments.system)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("status") == "done" else 1
 
 
 def _server_join_code(name: str) -> int:

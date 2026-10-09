@@ -5,7 +5,8 @@ missing server never holds an agent up for long. Errors come back as
 :class:`RemoteError` with the server's own plain message when it sent one;
 a proxy answering 502, 503, or 504 for a stopped server reads as unreachable.
 A server on this computer or its own network is reached directly, never
-through the system proxy, which is for the internet.
+through the system proxy, which is for the internet. A redirect is refused,
+never followed, so the key is sent only to the address the computer joined.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import platform
 import urllib.error
 import urllib.request
 from typing import Any, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from . import __version__
 
@@ -46,7 +47,7 @@ class RemoteClient:
         self.computer = computer if computer is not None else platform.node()
         self.timeout = timeout
         host = urlsplit(self.address).hostname or ""
-        self._open = direct_opener().open if bypasses_proxy(host) else urllib.request.urlopen
+        self._open = (direct_opener() if bypasses_proxy(host) else urllib.request.build_opener(NoRedirects())).open
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> tuple[bytes, dict[str, str]]:
         headers = {"X-KnowItAll2-Version": __version__, "Accept": "application/json"}
@@ -63,6 +64,14 @@ class RemoteClient:
             with self._open(request, timeout=self.timeout) as response:
                 return response.read(), {name.lower(): value for name, value in response.headers.items()}
         except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                exc.close()
+                location = urlsplit(urljoin(request.full_url, (exc.headers or {}).get("Location") or ""))
+                where = f" to {location.scheme}://{location.netloc}" if location.netloc else ""
+                raise RemoteError(f"the KnowItAll2 server at {self.address} answered with a redirect{where} "
+                                  f"({exc.code}). KnowItAll2 never follows one, so this computer's key is not sent "
+                                  "anywhere else; if that is the server's own address, connect with it instead",
+                                  status=exc.code) from None
             try:
                 found = json.loads(exc.read())
                 message = found.get("error") if isinstance(found, dict) else None
@@ -125,10 +134,20 @@ class RemoteClient:
         return data, int(headers.get("x-knowitall2-changes", "0"))
 
 
-def direct_opener() -> urllib.request.OpenerDirector:
-    """An opener that never uses a proxy, for this computer and its own network."""
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect: urllib sends a request's headers, its key among them, wherever one points.
 
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    A redirect then arrives as an ``HTTPError`` with its 3xx status.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+def direct_opener() -> urllib.request.OpenerDirector:
+    """An opener that never uses a proxy, for this computer and its own network, and never follows a redirect."""
+
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirects())
 
 
 def bypasses_proxy(host: str) -> bool:

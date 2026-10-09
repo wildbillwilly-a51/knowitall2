@@ -278,7 +278,7 @@ def news_entry(report: LearnReport, settings: LearnerSettings, *, reason: str, r
             turned_down.append({"text": item["text"], "reason": outcome[len("rejected ("):-1]})
     if report.blocked:
         status = "stopped"
-    elif report.ready and not report.calls and report.deferred:
+    elif not report.calls and report.deferred:
         status = "limit"
     elif report.failed or report.skipped:
         status = "stopped"
@@ -329,17 +329,19 @@ def record_learning_run(store, run: str, report: LearnReport, upkeep: Maintenanc
     if report.blocked:
         outcome, summary = "stopped", f"Learning stopped: {report.blocked}"
         journal.problem("learning", f"learning stopped: {report.blocked}")
-    elif not sessions:
+    elif not sessions and not report.deferred:
         outcome = "nothing new"
         summary = f"Nothing new to learn from ({report.logs} session logs, {report.active} still active)"
     elif not report.calls and report.deferred:
         outcome = "waiting for budget"
-        summary = f"{sessions} session(s) ready, waiting for the call budget to allow more calls"
+        summary = f"{report.deferred} session(s) ready, waiting for the call budget to allow more calls"
     else:
         outcome = "partly failed" if report.failed or report.skipped else "ok"
         noun = "session" if sessions == 1 else "sessions"
         summary = (f"Learned from {sessions} {noun}: {report.calls} model calls, {kept} memories kept, "
                    f"{rejected} candidates rejected")
+        if report.deferred:
+            summary += f"; {report.deferred} waiting for the call budget"
     details = {
         "logs": report.logs, "active": report.active, "calls": report.calls, "deferred": report.deferred,
         "sessions": [{"session": item.session_id, "dossiers": item.dossiers, "characters": item.characters}

@@ -114,8 +114,9 @@ class RememberResult:
 
     def describe(self) -> str:
         if self.status == "already_known":
-            return f"Already known as [{self.record.id}]; marked as confirmed."
-        text = f"Saved [{self.record.id}] ({self.record.kind}, {_scope_label(self.record, None)})."
+            text = f"Already known as [{self.record.id}]; marked as confirmed."
+        else:
+            text = f"Saved [{self.record.id}] ({self.record.kind}, {_scope_label(self.record, None)})."
         if self.replaced is not None:
             text += f" It replaces [{self.replaced.id}]."
         if self.kept is not None and self.kept.verification == "user_stated":
@@ -281,24 +282,26 @@ class Memory:
                 # Saying it again with new tags adds them; only the user's own words change a rule.
                 if added and (existing.kind != "rule" or source == "user"):
                     self.store.set_tags(existing.id, [*existing.tags, *added], now=now)
-                known = RememberResult("already_known", self.store.get(existing.id) or existing)
+                # Replacing another memory with what is already known: the known memory takes its place.
+                replaced, kept = self._to_replace(replaces, verification, keeping=existing.id)
+                if replaced is not None:
+                    self.store.supersede(replaced.id, existing.id, now=now)
+                known = RememberResult("already_known", self.store.get(existing.id) or existing, replaced, kept)
                 # The journal notes the project the agent worked in, even for a global memory.
                 self.record_event(
-                    "remember", body, outcome="already known", project_id=project.id if project else None,
-                    record_ids=[existing.id], details={"kind": kind, "source": source},
+                    "remember", body, outcome="updated" if replaced else "already known",
+                    project_id=project.id if project else None,
+                    record_ids=[existing.id, *([replaced.id] if replaced else [])],
+                    details={"kind": kind, "source": source},
                 )
+                if kept is not None:
+                    from . import review
+
+                    review.ask_conflict(self, kept, known.record)
                 return known
             if recorded_at is not None:
                 now = recorded_at
-            replaced = kept = None
-            if replaces:
-                replaced = self.store.get(replaces.strip().strip("[]"))
-                if replaced is None:
-                    raise MemoryInputError(f"Not saved: there is no memory [{replaces}] to replace.")
-                if replaced.status != "active":
-                    raise MemoryInputError(f"Not saved: [{replaced.id}] is already {replaced.status}.")
-                if not may_supersede(replaced.verification, verification):
-                    kept, replaced = replaced, None
+            replaced, kept = self._to_replace(replaces, verification)
             record_id = self._new_id()
             self.store.insert_record(
                 record_id=record_id,
@@ -329,6 +332,29 @@ class Memory:
 
                 review.ask_conflict(self, kept, record)
         return RememberResult("saved", record, replaced, kept)
+
+    def _to_replace(
+        self, replaces: str | None, verification: str, *, keeping: str | None = None,
+    ) -> tuple[RecordRow | None, RecordRow | None]:
+        """The memory ``replaces`` names, as (replaced, kept): kept when this evidence is too weak to replace it.
+
+        Nothing when ``replaces`` is empty or names ``keeping``, the memory that would take its place, or one
+        ``keeping`` already replaced (the same call made again).
+        """
+
+        identifier = (replaces or "").strip().strip("[]")
+        if not identifier or identifier == keeping:
+            return None, None
+        found = self.store.get(identifier)
+        if found is not None and keeping is not None and found.superseded_by == keeping:
+            return None, None
+        if found is None:
+            raise MemoryInputError(f"Not saved: there is no memory [{replaces}] to replace.")
+        if found.status != "active":
+            raise MemoryInputError(f"Not saved: [{found.id}] is already {found.status}.")
+        if not may_supersede(found.verification, verification):
+            return None, found
+        return found, None
 
     def recall(
         self,
@@ -481,7 +507,7 @@ class Memory:
             text, kind=record.kind, subjects=record.subjects, tags=record.tags, scope=record.scope, source="user",
             replaces=record.id, project=project, detect_project=False,
         )
-        if result.status == "already_known":
+        if result.status == "already_known" and result.replaced is None:
             raise MemoryInputError("That is exactly what the memory already says.")
         return result
 

@@ -289,6 +289,35 @@ def _change_triggers() -> str:
     return "\n".join(statements)
 
 
+# What the knowledge files show (``known.render``): every change to one of these columns counts in
+# KNOWN_GENERATION, so the files' change marker sees it, even a change from the server that carries an
+# older time than the newest one here. Use counts are left out: a recall changes nothing shown. These are
+# created if missing and never rebuilt, so a changed definition needs new trigger names.
+KNOWN_GENERATION = "known.generation"
+_SHOWN_COLUMNS = {
+    "records": "id, kind, text, scope, project_id, status, verification, created_at",
+    "record_notes": "record_id, system_id, facet",
+    "systems": "id, name, aliases",
+    "projects": "id, name",
+    "project_paths": "project_id, path",
+}
+
+
+def _known_triggers() -> str:
+    count = (f"INSERT INTO meta (key, value) VALUES ('{KNOWN_GENERATION}', '1') "
+             "ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) + 1")
+    statements = []
+    for table, columns in _SHOWN_COLUMNS.items():
+        changed = " OR ".join(f"old.{column} IS NOT new.{column}" for column in columns.split(", "))
+        for event, condition in (("INSERT", ""), ("DELETE", ""), ("UPDATE", f" WHEN {changed}")):
+            statements.append(f"CREATE TRIGGER IF NOT EXISTS known_{table}_{event.lower()} AFTER {event} ON {table}"
+                              f"{condition} BEGIN {count}; END;")
+    return "\n".join(statements)
+
+
+_KNOWN_TRIGGERS = _known_triggers()
+
+
 # Rule: any change to these triggers (a synced table, or its columns or quiet columns, added, removed or
 # changed) bumps SCHEMA_VERSION with a migration, even an empty one. Each process rebuilds the triggers when
 # their hash differs from the one in the database, so without the bump an older process (a learner or an app
@@ -501,7 +530,7 @@ class Store:
             self._connection.execute("PRAGMA foreign_keys = ON")
             if file_backed:
                 self._use_wal()
-            self._connection.executescript(_SCHEMA)
+            self._connection.executescript(_SCHEMA + _KNOWN_TRIGGERS)
             row = self._connection.execute(read_version).fetchone()
             if row is None:
                 # Several processes may create a new database together; the first to write the version wins.

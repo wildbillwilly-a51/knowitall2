@@ -123,6 +123,10 @@ def learn(
     report = LearnReport(logs=len(logs))
     memory = None if dry_run or memory_factory is None else memory_factory()
     run_seen: set[str] = set()
+
+    def remaining() -> int:
+        return min(settings.max_calls_per_run - report.calls, settings.max_calls_per_day - calls_today - report.calls)
+
     try:
         for log in logs:
             try:
@@ -134,6 +138,10 @@ def learn(
                 continue
             if not right_away and datetime.fromtimestamp(status.st_mtime, tz=timezone.utc) > idle_since:
                 report.active += 1
+                continue
+            if not dry_run and remaining() <= 0:
+                # Counted, not read: reading every waiting log took minutes at each run once the calls ran out.
+                report.deferred += 1
                 continue
             start = int(entry.get("offset", 0))
             # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
@@ -155,7 +163,7 @@ def learn(
                 continue
             if extractor is None:
                 raise ExtractionError("no extractor is configured")
-            budget = min(settings.max_calls_per_run - report.calls, settings.max_calls_per_day - calls_today - report.calls)
+            budget = remaining()
             progress: int | None = None
             completed = True
             current: Dossier | None = None
@@ -338,7 +346,7 @@ def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tup
         return "rejected (not accepted by memory)", []
     ids = [result.record.id] + ([replaces] if replaces else [])
     if result.status == "already_known":
-        return "already known", ids
+        return ("updated" if result.replaced else "already known"), ids
     if older is not None:
         review.ask_conflict(memory, older, result.record)
         return "saved with a question", ids + [older.id]

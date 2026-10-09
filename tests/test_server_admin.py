@@ -137,6 +137,107 @@ class AdminAccountTests(unittest.TestCase):
         self.assertNotIn(code.replace("-", ""), stored[1])
 
 
+class CredentialRaceTests(unittest.TestCase):
+    """A credential is checked before the write, as scrypt is slow; a change in between wins (audit 2026-10-09)."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / "server.db"
+        store = self.open()
+        self.code = admin.create(store, "keeper", PASSWORD, now=NOW)
+
+    def open(self):  # one connection for each request, as the server has
+        store = open_store(self.path)
+        self.addCleanup(store.close)
+        return store
+
+    def paused_after_checking(self, work):
+        """Run ``work`` until it has checked a password; returns its outcome holder and a function that finishes it."""
+
+        checked, resume, outcome = threading.Event(), threading.Event(), {}
+        check = admin.check_password
+
+        def paused(password: str, stored: str | None) -> bool:
+            found = check(password, stored)
+            checked.set()
+            resume.wait(10)
+            return found
+
+        def run() -> None:
+            store = open_store(self.path)  # closed in its own thread, as SQLite requires
+            try:
+                outcome["result"] = work(store)
+            except admin.AdminError as exc:
+                outcome["result"] = exc
+            finally:
+                store.close()
+
+        with mock.patch.object(admin, "check_password", paused):
+            thread = threading.Thread(target=run)
+            thread.start()
+            self.assertTrue(checked.wait(10))
+
+        def finish() -> object:
+            resume.set()
+            thread.join(10)
+            return outcome["result"]
+
+        return finish
+
+    def sessions(self) -> int:
+        return self.open().connection.execute("SELECT COUNT(*) FROM server_sessions").fetchone()[0]
+
+    def test_a_sign_in_checked_before_a_recovery_starts_no_session(self) -> None:
+        finish = self.paused_after_checking(lambda store: admin.sign_in(store, "keeper", PASSWORD, now=NOW))
+        admin.recover(self.open(), "keeper", self.code, "a brand new password", now=NOW)
+        self.assertIsInstance(finish(), admin.AdminError)
+        self.assertEqual(1, self.sessions())  # the recovery's own
+
+    def test_a_password_change_checked_before_a_recovery_is_refused(self) -> None:
+        token = admin.start_session(self.open(), now=NOW)["token"]
+        finish = self.paused_after_checking(
+            lambda store: admin.change_password(store, token, PASSWORD, "another new password", now=NOW))
+        admin.recover(self.open(), "keeper", self.code, "a brand new password", now=NOW)
+        self.assertIsInstance(finish(), admin.AdminError)
+        admin.sign_in(self.open(), "keeper", "a brand new password", now=NOW)
+
+    def test_a_recovery_code_replaced_after_a_recovery_is_refused(self) -> None:
+        finish = self.paused_after_checking(lambda store: admin.replace_recovery_code(store, PASSWORD, now=NOW))
+        admin.recover(self.open(), "keeper", self.code, "a brand new password", now=NOW)
+        self.assertIsInstance(finish(), admin.AdminError)
+
+    def test_one_recovery_code_spent_twice_at_once_works_once(self) -> None:
+        both_checked = threading.Barrier(2, timeout=10)
+        hashing = admin.hash_password
+
+        def then_wait(password: str) -> str:
+            hashed = hashing(password)
+            both_checked.wait()
+            return hashed
+
+        outcomes: dict[int, object] = {}
+
+        def recover(number: int) -> None:
+            store = open_store(self.path)
+            try:
+                outcomes[number] = admin.recover(store, "keeper", self.code, f"new password {number}!", now=NOW)
+            except admin.AdminError as exc:
+                outcomes[number] = exc
+            finally:
+                store.close()
+
+        with mock.patch.object(admin, "hash_password", then_wait):
+            threads = [threading.Thread(target=recover, args=(number,)) for number in (1, 2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(1, sum(isinstance(outcome, tuple) for outcome in outcomes.values()), outcomes)
+        self.assertEqual(1, sum(isinstance(outcome, admin.AdminError) for outcome in outcomes.values()), outcomes)
+        self.assertEqual(1, self.sessions())
+
+
 class Browser:
     """A minimal browser for the page: keeps the session cookie and sends the form token."""
 

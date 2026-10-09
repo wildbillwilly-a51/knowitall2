@@ -169,13 +169,21 @@ def _section(facet: str | None, kind: str) -> str:
 
 
 def change_marker(connection: sqlite3.Connection) -> str:
-    """Changes whenever anything the files show changes; cheap enough to check at every hook."""
+    """Changes whenever anything the files show changes; cheap enough to check at every hook.
+
+    The store counts each such change (``KNOWN_GENERATION``): counts and latest times alone missed an
+    update from the server older than the newest memory here, and a second change within the same second.
+    """
+
+    from .store import KNOWN_GENERATION
 
     row = connection.execute(
-        "SELECT (SELECT COUNT(*) FROM records WHERE status = 'active'), (SELECT MAX(updated_at) FROM records), "
+        "SELECT (SELECT value FROM meta WHERE key = ?), "
+        "(SELECT COUNT(*) FROM records WHERE status = 'active'), (SELECT MAX(updated_at) FROM records), "
         "(SELECT MAX(seq) FROM records), (SELECT COUNT(*) FROM record_notes), (SELECT MAX(written_at) FROM record_notes), "
         "(SELECT MAX(updated_at) FROM systems), (SELECT COUNT(*) FROM systems), (SELECT COUNT(*) FROM projects), "
-        "(SELECT COUNT(*) FROM project_paths)"
+        "(SELECT COUNT(*) FROM project_paths)",
+        (KNOWN_GENERATION,),
     ).fetchone()
     return "|".join(str(value) for value in row)
 

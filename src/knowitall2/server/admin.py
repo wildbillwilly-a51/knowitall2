@@ -179,15 +179,24 @@ def sign_in(store: Store, username: object, attempt: object, *, now: str) -> dic
     offered = attempt if isinstance(attempt, str) else ""
     if not check_password(offered, found["password_hash"] if found else None) or found is None:
         raise AdminError("that username and password do not match")
+    rehashed = None
     if _older_cost(found["password_hash"]):
-        # Kept at an older cost: saved again at today's, now that the password is known. Only if it is
-        # unchanged meanwhile, and not at all while the server is busy (the next sign-in does it).
+        # Kept at an older cost: saved again at today's, now that the password is known; not while the
+        # server is busy (the next sign-in does it).
         try:
-            store.connection.execute("UPDATE server_admin SET password_hash = ? WHERE id = 1 AND password_hash = ?",
-                                     (hash_password(offered), found["password_hash"]))
+            rehashed = hash_password(offered)
         except Busy:
             pass
-    return start_session(store, now=now)
+    with store.transaction():
+        # Checked before this write, as scrypt is slow: a recovery or a new password meanwhile wins.
+        current = store.connection.execute("SELECT password_hash FROM server_admin WHERE id = 1").fetchone()
+        if current is None or current["password_hash"] != found["password_hash"]:
+            raise AdminError("that username and password do not match")
+        if rehashed is not None:
+            store.connection.execute("UPDATE server_admin SET password_hash = ? WHERE id = 1", (rehashed,))
+        started = start_session(store, now=now)
+    return started
+
 
 
 def session(store: Store, token: str | None, *, now: str) -> dict[str, Any] | None:
@@ -229,10 +238,13 @@ def recover(
     new_code, new_hash = _new_recovery_code()
     password_hash = hash_password(chosen)
     with store.transaction():
-        store.connection.execute(
-            "UPDATE server_admin SET password_hash = ?, recovery_hash = ?, updated_at = ? WHERE id = 1",
-            (password_hash, new_hash, now),
-        )
+        # The code counts only if it is still the admin's, so one code spent twice at once works once.
+        if store.connection.execute(
+            "UPDATE server_admin SET password_hash = ?, recovery_hash = ?, updated_at = ? WHERE id = 1 "
+            "AND recovery_hash = ?",
+            (password_hash, new_hash, now, offered),
+        ).rowcount != 1:
+            raise AdminError("that username and recovery code do not match")
         store.connection.execute("DELETE FROM server_sessions")
         started = start_session(store, now=now)
     return new_code, started
@@ -247,9 +259,12 @@ def change_password(store: Store, token: str, current: object, new_password: obj
         raise AdminError("the current password is not right")
     password_hash = hash_password(chosen)
     with store.transaction():
-        store.connection.execute(
-            "UPDATE server_admin SET password_hash = ?, updated_at = ? WHERE id = 1", (password_hash, now),
-        )
+        # Only if the password checked is still the admin's: a recovery or another change meanwhile wins.
+        if store.connection.execute(
+            "UPDATE server_admin SET password_hash = ?, updated_at = ? WHERE id = 1 AND password_hash = ?",
+            (password_hash, now, row["password_hash"]),
+        ).rowcount != 1:
+            raise AdminError("the current password is not right")
         store.connection.execute("DELETE FROM server_sessions WHERE token_hash != ?", (_sha(token),))
 
 
@@ -260,9 +275,11 @@ def replace_recovery_code(store: Store, attempt: object, *, now: str) -> str:
     if row is None or not check_password(attempt if isinstance(attempt, str) else "", row["password_hash"]):
         raise AdminError("the password is not right")
     code, code_hash = _new_recovery_code()
-    store.connection.execute(
-        "UPDATE server_admin SET recovery_hash = ?, updated_at = ? WHERE id = 1", (code_hash, now),
-    )
+    if store.connection.execute(
+        "UPDATE server_admin SET recovery_hash = ?, updated_at = ? WHERE id = 1 AND password_hash = ?",
+        (code_hash, now, row["password_hash"]),
+    ).rowcount != 1:
+        raise AdminError("the password is not right")
     return code
 
 

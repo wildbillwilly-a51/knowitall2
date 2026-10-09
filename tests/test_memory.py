@@ -1,11 +1,13 @@
 import tempfile
 import unittest
 from pathlib import Path
+from secrets import token_urlsafe
 
 from _support import Clock, make_repository
 
 from knowitall2.identity import find_git_root
 from knowitall2.memory import Memory, MemoryInputError, fts_query
+from knowitall2.server import accounts
 from knowitall2.store import Store
 
 
@@ -73,6 +75,48 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(MemoryInputError):
             self.remember("The build server is build03.", replaces=old.record.id)
 
+    def test_replacing_with_what_is_already_known_supersedes_the_old_memory(self) -> None:
+        # Audit 2026-10-09: the duplicate was confirmed and the replacement silently dropped.
+        old = self.remember("The build step uses build-one.", source="user").record
+        known = self.remember("The build step uses build-two.", source="user").record
+        again = self.remember("The build step uses build-two.", source="user", replaces=old.id)
+        self.assertEqual(("already_known", known.id, old.id), (again.status, again.record.id, again.replaced.id))
+        self.assertIn(f"It replaces [{old.id}]", again.describe())
+        retired = self.store.get(old.id)
+        self.assertEqual(("superseded", known.id), (retired.status, retired.superseded_by))
+        self.assertEqual("active", self.store.get(known.id).status)
+        # Naming the known memory itself, or making the same call again, changes nothing.
+        same = self.remember("The build step uses build-two.", source="user", replaces=known.id)
+        self.assertEqual(("already_known", None), (same.status, same.replaced))
+        repeated = self.remember("The build step uses build-two.", source="user", replaces=old.id)
+        self.assertEqual(("already_known", None), (repeated.status, repeated.replaced))
+        self.assertEqual("active", self.store.get(known.id).status)
+        newer = self.remember("The build step uses build-three.", source="user", replaces=known.id).record
+        self.assertEqual("already_known", self.remember("The build step uses build-three.", source="user",
+                                                        replaces=known.id).status)
+        retired = self.store.get(known.id)
+        self.assertEqual(("superseded", newer.id), (retired.status, retired.superseded_by))
+
+    def test_replacing_with_what_is_already_known_keeps_the_users_statement(self) -> None:
+        stated = self.remember("Deploy on Tuesdays.", source="user").record
+        known = self.remember("Deploy on Thursdays.").record
+        again = self.remember("Deploy on Thursdays.", replaces=stated.id)
+        self.assertEqual(("already_known", None, stated.id), (again.status, again.replaced, again.kept.id))
+        self.assertEqual("active", self.store.get(stated.id).status)
+        [question] = self.store.open_questions(limit=5)
+        self.assertEqual(("conflict", [stated.id, known.id]), (question["kind"], question["record_ids"]))
+        with self.assertRaises(MemoryInputError):
+            self.remember("Deploy on Thursdays.", replaces="k-missing")
+
+    def test_correcting_a_memory_to_another_memorys_text_supersedes_it(self) -> None:
+        old = self.remember("The NAS is nas01.").record
+        known = self.remember("The NAS is nas02.").record
+        result = self.memory.correct(old.id, "The NAS is nas02.")
+        self.assertEqual((known.id, old.id), (result.record.id, result.replaced.id))
+        self.assertEqual("superseded", self.store.get(old.id).status)
+        with self.assertRaises(MemoryInputError):
+            self.memory.correct(known.id, "The NAS is nas02.")
+
     def test_forget_retires_a_memory(self) -> None:
         saved = self.remember("The temporary staging host is stage9.")
         self.assertIn("Forgot", self.memory.forget(saved.record.id, reason="decommissioned"))
@@ -120,6 +164,14 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("never stores secrets", str(caught.exception))
         self.assertEqual(0, self.store.stats()["active"])
         self.assertEqual("saved", self.remember("The admin password is in Vaultwarden item nas-admin.").status)
+
+    def test_a_knowitall2_key_is_refused(self) -> None:
+        # The shape a server gives an agent when it joins (audit 2026-10-09: it was saved).
+        key = accounts.KEY_PREFIX + token_urlsafe(32)
+        for text in (key, f"The agent key for this computer is {key}"):
+            with self.subTest(text=text[:30]), self.assertRaises(MemoryInputError):
+                self.remember(text)
+        self.assertEqual(0, self.store.stats()["active"])
 
     def test_leaked_tool_call_markup_is_refused(self) -> None:
         # The live case: an agent's malformed call swallowed the next argument.

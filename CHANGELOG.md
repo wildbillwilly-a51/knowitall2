@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.10.3 (2026-10-09)
+
+Fixes from a review of 0.10.2 on 2026-10-09; each was reproduced before it
+was fixed.
+
+- **Learning stops reading once it has no calls left.** Once its calls
+  for the day were used up, each background learning run still read,
+  split, and screened every session waiting to be learned, only to put it
+  off: about 8 minutes of work every 30 minutes on a computer with a large
+  backlog. A run now stops reading as soon as no call is left, and its
+  entry in the journal says how many sessions wait.
+- **A computer's key is sent only to its server.** If the server's address
+  ever redirected elsewhere, the agent's key went along with the request.
+  KnowItAll2 now refuses redirects and says where the address points.
+- **KnowItAll2's own keys and codes are kept out of memory.** An agent's
+  server key, or the server's recovery or setup code, was not recognized
+  as a secret, so it could be saved as a memory or sent to the learning
+  model. Both are now screened like other secrets.
+- **The server's admin sign-in is safe from two requests at once.** A
+  recovery code used twice at the same moment worked twice, and a sign-in
+  with the old password could finish just after a recovery and still get
+  in. Each now counts only if the password or code is still the current one.
+- **Replacing a memory with one that is already known works.** It used to
+  confirm the known memory and leave the old one in place.
+- **The knowledge files follow every change.** A change from another
+  computer could be missed when it carried an earlier time than the newest
+  memory here, and syncs, learning, upkeep, and changes in the app did not
+  rewrite the files until the next chat message. Each now does when it
+  finishes.
+
 ## 0.10.2 (2026-10-08)
 
 - **KnowItAll2 looks into its questions before you see them.** From

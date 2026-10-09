@@ -26,6 +26,8 @@ AZURE_KEY = fake(86, _BASE64) + "=="
 PEM_BODY = [fake(64, _BASE64) for _ in range(3)]
 PEM = "\n".join(["-----BEGIN " + "RSA PRIVATE " + "KEY-----", *PEM_BODY, "-----END " + "RSA PRIVATE " + "KEY-----"])
 GCP_PEM = "\\n".join(["-----BEGIN " + "PRIVATE " + "KEY-----", *PEM_BODY, "-----END " + "PRIVATE " + "KEY-----", ""])
+KIA_KEY = "kia" + "_" + fake(43, _ALNUM + "-_")  # an agent's key for the KnowItAll2 server
+SERVER_CODE = "-".join(fake(4, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(5))  # recovery or setup code
 JWT = ".".join(["eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0", fake(43)])
 
 # label: (text, the fake secret in it, which must not survive redaction)
@@ -120,9 +122,20 @@ SECRETS = {
     # Review 2026-10-04, L-L3.
     "docker login -p": (f"docker login -u alex -p {PASSWORD} registry.example", PASSWORD),
     "smbclient user%password": (f"smbclient //nas01/share -U alex%{PASSWORD}", PASSWORD),
+    # KnowItAll2's own (audit 2026-10-09): a key file shown in a chat, the key in JSON, the server's codes.
+    "KnowItAll2 key file": (f"$ cat ~/.knowitall2/server/keys/claude-code.key\n{KIA_KEY}\n", KIA_KEY[4:]),
+    "KnowItAll2 key in JSON": ('{"key": "' + KIA_KEY + '"}', KIA_KEY[4:]),
+    "KnowItAll2 key in prose": (f"The agent key for this computer is {KIA_KEY}.", KIA_KEY[4:]),
+    "KnowItAll2 recovery code": (f"Recovery code: {SERVER_CODE} (keep it safe)", SERVER_CODE),
 }
 
 REFERENCES = [
+    # KnowItAll2's own key prefix and code shape, named but not given.
+    'KEY_PREFIX = "kia_"',
+    "the key file holds kia_ and the key",
+    "a recovery code looks like XXXX-XXXX-XXXX-XXXX-XXXX",
+    "a join code such as ABCD-EFGH-JKLM-NPQR is used once",
+    "see build-step-four-five-six in the runbook",
     # How people describe a password, not the password (review 2026-10-04, C-M1).
     "The password is shared with the team.",
     "The admin password is different on each node.",
@@ -339,7 +352,8 @@ class SecretDetectionTests(unittest.TestCase):
             "address-like": ("a://b:c" * size)[:size],
             "commands": ("curl sshpass mysql net use " * size)[:size],
             "blank lines": "\n" * size,
-            **{f"repeated {prefix}": (prefix * size)[:size] for prefix in ("sk-", "glpat-", "xoxb-", "eyJ-", "pwd=")},
+            **{f"repeated {prefix}": (prefix * size)[:size]
+               for prefix in ("sk-", "glpat-", "xoxb-", "eyJ-", "pwd=", "kia_", "ABCD-")},
         }
         for label, text in texts.items():
             with self.subTest(label):

@@ -11,6 +11,7 @@ import urllib.request
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from secrets import token_urlsafe
 from unittest import mock
 
 from _support import Clock
@@ -209,6 +210,14 @@ class ExchangeTests(TemporaryFolder):
         self.remember(self.a, "The build server is build-1.")
         operation = sync.pending_operations(self.a)[0]
         operation["row"]["text"] = f"The deploy token is {FAKE_TOKEN}"
+        answer = self.send(self.a, "c-a", [operation])[0]
+        self.assertEqual(answer["result"], "rejected")
+        self.assertIn("secret", answer["reason"])
+
+    def test_a_memory_holding_an_agent_key_is_refused(self) -> None:
+        self.remember(self.a, "The build server is build-1.")
+        operation = sync.pending_operations(self.a)[0]
+        operation["row"]["text"] = f"The agent key is {accounts.KEY_PREFIX + token_urlsafe(32)}"
         answer = self.send(self.a, "c-a", [operation])[0]
         self.assertEqual(answer["result"], "rejected")
         self.assertIn("secret", answer["reason"])

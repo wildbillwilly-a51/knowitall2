@@ -17,7 +17,7 @@ from _support import SOURCE_ROOT, Clock, make_repository
 from knowitall2 import connected, review
 from knowitall2.cli import main
 from knowitall2.identity import ProjectIdentity
-from knowitall2.learning.command import news_entry
+from knowitall2.learning.command import news_entry, record_learning_run
 from knowitall2.learning.dossier import build_dossiers, file_by_work
 from knowitall2.learning.extractor import (
     OUTPUT_SCHEMA,
@@ -30,7 +30,7 @@ from knowitall2.learning.extractor import (
 )
 from knowitall2.learning.learner import learn, validate
 from knowitall2.learning.state import LearnerSettings, LearnerState, LockBusy, RunLock
-from knowitall2.learning.transcripts import read_claude_code_session
+from knowitall2.learning.transcripts import read_claude_code_session, read_session
 from knowitall2.memory import Memory
 from knowitall2.store import Store
 
@@ -668,6 +668,35 @@ class LearnerTests(LearningTestCase):
         self.settings.max_calls_per_run = 0
         report = self.run_learner(FakeExtractor([]))
         self.assertEqual((1, 0), (report.deferred, report.calls))
+
+    def test_once_the_budget_is_spent_waiting_sessions_are_counted_without_being_read(self) -> None:
+        # Audit 2026-10-09: each run read every waiting log after its calls ran out, about 8 minutes live.
+        self.sample_log().write(self.log_path)
+        waiting = []
+        for number in range(3):
+            path = self.logs / "C--work-homelab" / f"waiting-{number}.jsonl"
+            LogBuilder(self.project).user("check the NAS").assistant(text(f"Check {number} passed.")).write(path)
+            waiting.append(path)
+        self.settings.max_calls_per_run = 1
+        with mock.patch("knowitall2.learning.learner.read_session", wraps=read_session) as reading:
+            report = self.run_learner(FakeExtractor([[]]), logs=[self.log_path, *waiting])
+        self.assertEqual((1, 3, 1), (report.calls, report.deferred, reading.call_count))
+        self.assertEqual("done", self.state.entry(self.log_path)["status"])
+        self.assertEqual([0, 0, 0], [self.state.entry(path).get("offset", 0) for path in waiting])
+        engine = mock.Mock(model="haiku")
+        engine.name = "claude-cli"
+        record_learning_run(self.store, "r-budget", report, None, engine=engine, seconds=1)
+        self.assertIn("; 3 waiting for the call budget", self.store.events(kinds=["learning"])[0]["summary"])
+        # With the day's calls spent, as live, nothing is read, and the run says the sessions are waiting.
+        self.settings.max_calls_per_day = 1
+        report = self.run_learner(FakeExtractor([]), logs=waiting)
+        self.assertEqual((0, 3, 1), (report.calls, report.deferred, reading.call_count))
+        record_learning_run(self.store, "r-none", report, None, engine=engine, seconds=1)
+        event = self.store.events(kinds=["learning"])[0]
+        self.assertEqual(("waiting for budget", "3 session(s) ready, waiting for the call budget to allow more calls"),
+                         (event["outcome"], event["summary"]))
+        news = news_entry(report, self.settings, reason="catch-up", run="r-none", requests=[])
+        self.assertEqual("limit", news["status"])
 
     def test_an_identical_copy_of_a_session_costs_no_model_call(self) -> None:
         copy = self.logs / "C--work-homelab" / "copied-session.jsonl"

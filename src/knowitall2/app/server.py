@@ -213,8 +213,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, result)
             if method == "POST":
                 from ..connected import nudge
+                from ..known import nudge as refresh_known_files
 
                 nudge("app", pull=False)
+                refresh_known_files()
         except RequestError as exc:
             self._send_json(exc.status, {"error": str(exc)})
         except api.NotFound as exc:

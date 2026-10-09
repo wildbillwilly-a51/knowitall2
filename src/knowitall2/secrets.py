@@ -60,6 +60,11 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.IGNORECASE,
     )),
     ("bearer token", re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=\-]{16,}", re.IGNORECASE)),
+    # KnowItAll2's own: an agent's key ("kia_" and 43 characters), and the server's recovery and setup
+    # codes (five groups of four from the code alphabet, which has no 0, 1, I or O); "XXXX-..." is a placeholder.
+    ("KnowItAll2 key", re.compile(r"(?<![\w\-])kia_[A-Za-z0-9_\-]{40,}")),
+    ("KnowItAll2 code", re.compile(
+        r"(?<![\w\-])(?!X{4}-X{4})[A-HJ-NP-Z2-9]{4}(?:-[A-HJ-NP-Z2-9]{4}){4}(?![\w\-])")),
     ("connection-string password", re.compile(
         r"\b(?:password|pwd)\s*=\s*[^;\s'\"]{3,%d}+\s*;" % _REACH, re.IGNORECASE)),
 )

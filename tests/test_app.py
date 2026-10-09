@@ -308,6 +308,15 @@ class MemoryScreenTests(AppTestCase):
         self.assertEqual(404, self.request("POST", "/api/memories/k-0000000000/forget", body={})[0])
 
 
+    def test_a_change_in_the_app_rewrites_the_knowledge_files(self) -> None:
+        with mock.patch("knowitall2.known.nudge") as refresh:
+            self.assertEqual(200, self.request("POST", f"/api/memories/{self.nas.id}/confirm", body={})[0])
+            deadline = time.monotonic() + 5  # checked after the answer is sent
+            while not refresh.called and time.monotonic() < deadline:
+                time.sleep(0.01)
+        refresh.assert_called_once_with()
+
+
 class LearningScreenTests(AppTestCase):
     def test_learning_shows_runs_and_why_candidates_were_not_kept(self) -> None:
         store = Store.open(database_path())

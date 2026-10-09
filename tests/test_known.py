@@ -13,10 +13,11 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from _support import Clock, make_repository
 
-from knowitall2 import known
+from knowitall2 import cli, known, sync
 from knowitall2.memory import Memory
 from knowitall2.store import Store
 
@@ -298,6 +299,48 @@ class RefreshTests(KnownTestCase):
         self.clock.value = "2026-09-27T12:01:00Z"
         self.file(saved.id, "Synology")
         self.assertTrue(known.due(self.connection))
+
+    def test_a_change_from_the_server_older_than_the_newest_memory_makes_a_refresh_due(self) -> None:
+        # Audit 2026-10-09: a pulled row keeps its own time, so counts and latest times did not change.
+        first = self.remember("The NAS answers on 10.0.0.10.", scope="global")
+        self.clock.value = "2026-09-27T12:05:00Z"
+        self.remember("The router answers on 10.0.0.1.", scope="global")
+        known.refresh(self.connection)
+        row = sync.read_row(self.connection, sync.table_for("records"), first.id)
+        row.update(text="The NAS answers on 10.0.0.11.", updated_at="2026-09-27T12:01:00Z")
+        sync.apply_pulled(self.store, [{"table": "records", "key": first.id, "op": "upsert", "row": row, "seq": 7}])
+        self.assertTrue(known.due(self.connection))
+        known.refresh(self.connection)
+        self.assertIn("10.0.0.11", (self.project / known.FOLDER / known.file_name(known.GENERAL)).read_text(encoding="utf-8"))
+
+    def test_a_second_change_within_the_same_second_makes_a_refresh_due(self) -> None:
+        self.remember("The NAS answers on 10.0.0.10.", scope="global")
+        known.refresh(self.connection)
+        self.remember("The NAS answers on 10.0.0.10.", scope="global", source="user")  # no longer unverified
+        self.assertTrue(known.due(self.connection))
+
+    def test_using_a_memory_does_not_make_a_refresh_due(self) -> None:
+        self.remember("The NAS answers on 10.0.0.10.", scope="global")
+        known.refresh(self.connection)
+        self.memory.recall("NAS", project_path=self.project)
+        self.assertGreater(self.connection.execute("SELECT MAX(recall_count) FROM records").fetchone()[0], 0)
+        self.assertFalse(known.due(self.connection))
+
+    def test_work_without_a_hook_around_it_refreshes_the_files_when_done(self) -> None:
+        # Sync, learning, upkeep, and the finder run on their own, mostly after the hook that started them.
+        work = {
+            ("sync", "--quiet"): "knowitall2.connected.run_command",
+            ("learn",): "knowitall2.learning.command.run_learn",
+            ("maintain",): "knowitall2.learning.command.run_maintain",
+            ("catalog",): "knowitall2.learning.command.run_catalog_command",
+        }
+        for argv, target in work.items():
+            with self.subTest(argv=argv), mock.patch(target, return_value=0),                     mock.patch("knowitall2.known.nudge") as refresh:
+                self.assertEqual(0, cli.main(list(argv)))
+                refresh.assert_called_once_with()
+        with mock.patch("knowitall2.learning.command.run_learn", side_effect=RuntimeError("stopped")),                 mock.patch("knowitall2.known.nudge") as refresh, self.assertRaises(RuntimeError):
+            cli.main(["learn"])
+        refresh.assert_called_once_with()
 
     def test_nudge_starts_a_refresh_only_when_due_and_on(self) -> None:
         self.remember("Alpha deploys with make deploy.", scope="project")

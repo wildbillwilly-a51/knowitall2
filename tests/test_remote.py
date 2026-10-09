@@ -112,6 +112,56 @@ class BehindAProxy(unittest.TestCase):
             self.assertIn("could not be reached at the last try", health["items"][0]["text"])
 
 
+class Moved(BaseHTTPRequestHandler):
+    """Answers every request with its server's redirect status, to its server's ``to``."""
+
+    def do_GET(self) -> None:
+        self._answer()
+
+    def do_POST(self) -> None:
+        self._answer()
+
+    def _answer(self) -> None:
+        self.server.seen.append(self.headers.get("Authorization"))  # type: ignore[attr-defined]
+        self.send_response(self.server.status)  # type: ignore[attr-defined]
+        self.send_header("Location", self.server.to)  # type: ignore[attr-defined]
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class Redirects(unittest.TestCase):
+    """A redirect is refused: urllib would send the key, an ordinary header, to wherever it points."""
+
+    def serve(self) -> ThreadingHTTPServer:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Moved)
+        server.seen, server.status, server.to = [], 200, ""  # type: ignore[attr-defined]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_a_redirect_to_another_server_is_refused_and_the_key_stays_here(self) -> None:
+        here, elsewhere = self.serve(), self.serve()
+        port = elsewhere.server_address[1]
+        here.to = f"http://localhost:{port}/login?rd=somewhere"  # type: ignore[attr-defined]
+        key = "kia_" + "x" * 43
+        for status in (301, 302, 303, 307, 308):
+            here.status = status  # type: ignore[attr-defined]
+            for call in (lambda client: client.hello(), lambda client: client.push([])):
+                with self.subTest(status=status), self.assertRaises(RemoteError) as caught:
+                    call(RemoteClient(f"http://127.0.0.1:{here.server_address[1]}", key=key))
+                self.assertEqual(status, caught.exception.status)
+                self.assertIn(f"answered with a redirect to http://localhost:{port} ({status})", str(caught.exception))
+                self.assertNotIn("rd=somewhere", str(caught.exception))
+        self.assertEqual([f"Bearer {key}"] * 10, here.seen)  # type: ignore[attr-defined]
+        self.assertEqual([], elsewhere.seen)  # type: ignore[attr-defined]
+
+
 class SystemProxyTests(BehindAProxy):
     """A system proxy is for the internet: a server on this computer or its own network is reached directly."""
 
