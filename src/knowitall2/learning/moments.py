@@ -26,8 +26,9 @@ from ..files import read_text, write_text_atomic
 from ..paths import data_home
 
 NEWS_KEPT = 40
-SHOWN_ITEMS = 5
-ITEM_CHARACTERS = 160
+# The news line names this many of the memories learned, each cut to this length.
+NEWS_ITEMS = 2
+NEWS_ITEM_CHARACTERS = 90
 # A request older than this is dropped instead of learned: its session is
 # picked up by the regular pass anyway, and the user no longer waits for it.
 REQUEST_DAYS = 2
@@ -422,33 +423,16 @@ def describe(entry: dict[str, Any], *, here: bool = True) -> str:
         return f"KnowItAll2 could not learn from {what}: {entry.get('problem') or 'the model was not available'}. It will try again later."
     if status == "off":
         return f"KnowItAll2 did not learn from {what}: learning is turned off."
+    # One line, and never a question: the news comes after each commit, so in most turns (the user, 2026-10-11).
     saved = entry.get("saved") or []
     updated = entry.get("updated") or []
-    lines = []
-    if saved or updated:
-        count = len(saved) + len(updated)
-        lines.append(f"KnowItAll2 learned {count} {'thing' if count == 1 else 'things'} from {what}{because}:")
-        shown = [*saved, *updated][:SHOWN_ITEMS]
-        lines += [f"  - {_short(item.get('text'))}" for item in shown]
-        if count > len(shown):
-            lines.append(f"  (and {count - len(shown)} more; see KnowItAll2, Learning)")
-    else:
-        lines.append(f"KnowItAll2 checked {what}{because}: nothing new to remember.")
-    extras = []
-    if entry.get("already_known"):
-        extras.append(f"{entry['already_known']} already known")
-    turned_down = entry.get("turned_down") or []
-    if turned_down:
-        extras.append(f"{len(turned_down)} turned down")
-    if entry.get("questions"):
-        extras.append(f"{entry['questions']} with a question for you")
-    if extras:
-        lines.append("  (" + ", ".join(extras) + ")")
-    if entry.get("partial"):
-        rest = ("waits for today's learning limit" if entry.get("reason") == "catch-up"
-                else "is learned at its next commit or end, or when you ask")
-        lines.append(f"  The rest of this session {rest}.")
-    return "\n".join(lines)
+    if not saved and not updated:
+        return f"KnowItAll2 checked {what}{because}: nothing new to remember."
+    count = len(saved) + len(updated)
+    shown = [_short(item.get("text"), NEWS_ITEM_CHARACTERS) for item in [*saved, *updated][:NEWS_ITEMS]]
+    more = f"; and {count - len(shown)} more" if count > len(shown) else ""
+    return f"KnowItAll2 learned {count} {'thing' if count == 1 else 'things'} from {what}{because}: " + \
+        "; ".join(shown) + more + "."
 
 
 def _what(entry: dict[str, Any], here: bool) -> str:
@@ -458,6 +442,6 @@ def _what(entry: dict[str, Any], here: bool) -> str:
     return "this session" if here else "your last session here"
 
 
-def _short(text: object) -> str:
-    value = " ".join(str(text or "").split())
-    return value if len(value) <= ITEM_CHARACTERS else value[: ITEM_CHARACTERS - 3].rstrip() + "..."
+def _short(text: object, limit: int) -> str:
+    value = " ".join(str(text or "").split()).rstrip(".")
+    return value if len(value) <= limit else value[: limit - 3].rstrip() + "..."

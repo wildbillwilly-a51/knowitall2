@@ -17,10 +17,10 @@ from typing import Any, Callable
 
 from .. import journal, review
 from ..memory import (
-    KINDS, VERIFICATION_FOR_SOURCE, Memory, MemoryInputError, _stem, keywords, may_replace_unasked, significant_words,
+    KINDS, PREFERENCE_TAG, VERIFICATION_FOR_SOURCE, Memory, MemoryInputError, _stem, is_users_choice,
+    keywords, may_replace_unasked, same_statement, significant_words,
 )
 from ..quotes import nearly_quoted_in as _nearly_quoted_in, quoted_in as _quoted_in
-from ..review import UNCONFIRMED_RULE_PREFIX
 from ..secrets import contains_secret, redact
 from ..store import RecordRow, StoreError
 from .dossier import Dossier, build_dossiers, file_by_work
@@ -53,7 +53,45 @@ _WORK_STATE = re.compile(
 # A log's entry while its set-aside part is caught up: read up to here, then go on from ``RESUME_AT``.
 LEARN_TO = "learn_to"
 RESUME_AT = "resume_at"
+# A rule only when the user plainly made one. Anything else the user says about how they want things done is a
+# preference: kept with the work it was about, weighed like any memory, never a question; how often the user
+# says it again is what makes it a lasting preference (the user, 2026-10-11: a single statement in a chat must
+# not become a permanent rule).
+_STANDING_RULE = re.compile(
+    r"\b(?:make|made|making|add|save|keep)\s+(?:it|that|this|these|those|them)\s+(?:as\s+)?"
+    r"(?:a|one\s+of\s+my|my)\s+(?:standing\s+|permanent\s+)?rules?\b"
+    r"|\bas\s+a\s+(?:standing\s+|permanent\s+)?rule\b|\b(?:standing|permanent)\s+rule\b"
+    r"|\bfrom\s+now\s+on\b|\bgoing\s+forward\b",
+    re.IGNORECASE,
+)
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _made_a_rule(evidence: str, user_texts: list[str]) -> bool:
+    """Whether the user plainly made a standing rule: said in the quote, or in the sentence the quote is from
+    ("From now on, always keep backups in X" quoted as "always keep backups in X")."""
+
+    if _STANDING_RULE.search(evidence):
+        return True
+    words = {_stem(word) for word in significant_words(evidence)}
+    if not words:
+        return False
+    for said in user_texts:
+        if not _quoted_in(evidence, [said]):
+            continue
+        sentences = [part for part in _SENTENCE_END.split(said) if part.strip()]
+        best = max(sentences, key=lambda part: len(words & {_stem(word) for word in significant_words(part)}),
+                   default="")
+        if _STANDING_RULE.search(best):
+            return True
+    return False
+
+
+# Two preferences say the same when this share of each one's significant words is in the other.
+SAME_PREFERENCE_SHARE = 0.8
 KNOWN_LIMIT = 40
+# The user's preferences about the same things, shown besides, so the model can tell when the user says one again.
+KNOWN_PREFERENCES = 8
 # The project's newest memories, plus those of it and the global ones that match the excerpt's words.
 KNOWN_PROJECT_RECENT = 12
 KNOWN_KEYWORDS = 24
@@ -279,6 +317,14 @@ def known_context(memory: Memory, dossier: Dossier) -> list[RecordRow]:
         if row.id not in seen:
             known.append(row)
             seen.add(row.id)
+    preferences = 0
+    for row, _rank in memory.store.search(match, project_id=project_id, scope="all", limit=KNOWN_LIMIT * 5):
+        if preferences >= KNOWN_PREFERENCES:
+            break
+        if row.id not in seen and PREFERENCE_TAG in row.tags:
+            known.append(row)
+            seen.add(row.id)
+            preferences += 1
     return known
 
 
@@ -286,9 +332,9 @@ def publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, run:
     """Validate one candidate and save it; returns the outcome name for the report.
 
     A candidate that updates or contradicts a known memory replaces it only when
-    its evidence is at least as strong; the user's own statements give way only
-    to the same statement said again in nearly the same words. Otherwise both
-    are kept and the user is asked.
+    its evidence is at least as strong (``may_replace_unasked``); otherwise both
+    are kept and KnowItAll2 finds out which is right. A preference the user
+    states again is counted on the memory that holds it, not saved twice.
     Every candidate, kept or not, is recorded in the journal with the reason.
     """
 
@@ -332,6 +378,14 @@ def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tup
     checked, reason = validate(candidate, dossier)
     if checked is None:
         return f"rejected ({reason})", []
+    if PREFERENCE_TAG in checked["tags"]:
+        known = _preference_repeated(memory, checked, dossier)
+        if known is not None and known.kind == "rule":
+            return "already known", [known.id]   # one of the user's rules says it already
+        if known is not None:
+            return _said_again(memory, checked, dossier, known)
+    if checked["relation"] == "repeats":
+        return "already known", []   # it repeats something that is not one of the user's preferences
     older = _changed_memory(memory, checked, dossier)
     replaces = None
     if older is not None and may_replace_unasked(older, kind=checked["kind"], text=checked["text"],
@@ -342,6 +396,7 @@ def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tup
             checked["text"],
             kind=checked["kind"],
             subjects=checked["subjects"],
+            tags=checked["tags"],
             scope=checked["scope"],
             source=checked["source"],
             replaces=replaces,
@@ -357,10 +412,57 @@ def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tup
     if older is not None:
         review.ask_conflict(memory, older, result.record)
         return "saved with a question", ids + [older.id]
-    if checked["proposed_rule"]:
-        review.ask_rule(memory, result.record)
-        return "saved with a question", ids
     return ("updated" if replaces else "saved"), ids
+
+
+def _preference_repeated(memory: Memory, checked: dict[str, Any], dossier: Dossier) -> RecordRow | None:
+    """The user's preference or rule a candidate says again: the one the model named (as repeated, or as
+    changed in nearly the same words), or one in nearly the same words that the model was not shown."""
+
+    if checked["known_id"] in dossier.known_ids:
+        record = memory.store.get(checked["known_id"])
+        if record is not None and record.status == "active" and _a_preference(record) and (
+                (checked["relation"] == "repeats" and _about_the_same(record, checked))
+                or same_statement(record, kind=record.kind, text=checked["text"])):
+            return record
+    terms = keywords(checked["text"], limit=12)
+    mine = {_stem(word) for word in significant_words(checked["text"])}
+    if not terms or not mine:
+        return None
+    project_id = dossier.project.id if dossier.project is not None else None
+    match = " OR ".join(f'"{term}"' for term in terms)
+    for row, _rank in memory.store.search(match, project_id=project_id, scope="all", limit=20):
+        if not _a_preference(row):
+            continue
+        theirs = {_stem(word) for word in significant_words(row.text)}
+        if theirs and _share(mine, theirs) >= SAME_PREFERENCE_SHARE and _share(theirs, mine) >= SAME_PREFERENCE_SHARE:
+            return row
+    return None
+
+
+def _a_preference(record: RecordRow) -> bool:
+    """How the user wants things done: a preference, or a rule or decision in the user's own words."""
+
+    return PREFERENCE_TAG in record.tags or is_users_choice(record)
+
+
+def _share(words: set[str], others: set[str]) -> float:
+    return sum(1 for word in words if any(_same_word(word, other) for other in others)) / len(words)
+
+
+def _said_again(memory: Memory, checked: dict[str, Any], dossier: Dossier, known: RecordRow) -> tuple[str, list[str]]:
+    """Count a preference the user said again, in another chat, on the memory that holds it.
+
+    The new words are kept as their own memory, replaced at once by the one
+    that holds the preference: it syncs like any memory, keeps the user's words
+    and date, and ``Store.said_in_sessions`` counts the chats it came from.
+    """
+
+    if not dossier.session_id or dossier.session_id in memory.store.said_in_sessions(known.id):
+        return "already known", [known.id]
+    words = memory.said_again(known, checked["text"], subjects=checked["subjects"], source=checked["source"],
+                              session=dossier.session_id)
+    return "said again", [known.id, words.id]
 
 
 def _changed_memory(memory: Memory, checked: dict[str, Any], dossier: Dossier) -> RecordRow | None:
@@ -389,7 +491,7 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
     subjects = [" ".join(str(item).split())[:80] for item in subjects if str(item).strip()][:8]
     if not MIN_TEXT_CHARACTERS <= len(text) <= MAX_TEXT_CHARACTERS:
         return None, "length"
-    if kind not in KINDS:
+    if kind not in KINDS and kind != "preference":   # a preference is saved as a note (below)
         return None, "kind"
     if scope not in ("global", "project"):
         return None, "scope"
@@ -411,28 +513,30 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
         # user's words must also say what the memory says.
         return None, "evidence not in the session"
     source = "inferred"
-    proposed_rule = False
-    if kind == "rule":
+    tags: list[str] = []
+    if kind in ("rule", "preference"):
         quoted = _quoted_in(evidence, dossier.user_texts)
-        if quoted and _in_the_users_words(text, evidence):
-            source = "user"
+        in_their_words = quoted and _in_the_users_words(text, evidence)
+        if kind == "rule" and in_their_words and _made_a_rule(evidence, dossier.user_texts):
+            source = "user"   # the user plainly made it a rule
         elif quoted or _nearly_quoted_in(evidence, dossier.user_texts):
-            # The user's words, re-typed, or quoted for a rule they do not state: ask the user whether it is theirs.
-            kind, text, proposed_rule = "note", UNCONFIRMED_RULE_PREFIX + text, True
+            # How the user wants things done, said once: a preference, never a rule and never a question.
+            kind, tags = "note", [PREFERENCE_TAG]
+            source = "user" if in_their_words else "inferred"
         else:
-            # An instruction an agent wrote, not the user: a note, never a question the user cannot answer.
-            kind = "note"
+            kind = "note"   # an instruction an agent wrote, not the user's
     elif _quoted_in(evidence, dossier.trusted_outputs):
         # What a command printed is often raw data that the memory explains in its own words, so no shared words
         # are needed. Documents, searches, MCP tools, and helper agents only say what someone wrote: unverified.
         source = "observed"
     elif _quoted_in(evidence, dossier.user_texts) and _in_the_users_words(text, evidence):
         source = "user"
-    relation = candidate.get("relation") if candidate.get("relation") in ("updates", "contradicts") else "new"
+    relation = candidate.get("relation")
+    relation = relation if relation in ("updates", "contradicts", "repeats") else "new"
     known_id = str(candidate.get("known_id") or "").strip().strip("[]")
     return {
-        "text": text, "kind": kind, "scope": scope, "subjects": subjects, "source": source,
-        "proposed_rule": proposed_rule, "relation": relation, "known_id": known_id,
+        "text": text, "kind": kind, "scope": scope, "subjects": subjects, "source": source, "tags": tags,
+        "relation": relation, "known_id": known_id,
     }, None
 
 

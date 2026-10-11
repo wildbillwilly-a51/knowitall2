@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .. import catalog, review
-from ..memory import Memory, keywords
+from ..memory import Memory, is_users_choice, keywords
 from .extractor import ExtractionError, payload_items
 
 CATALOG_AGENT = "catalog"
@@ -211,6 +211,9 @@ def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: Cata
             state.record_call(at=datetime.now(timezone.utc), session="catalog", outcome=outcome)
 
     report.questions.update({name: count for name, count in review.expire_tasks(memory).items() if count})
+    unanswered = review.expire_unanswered(memory)
+    if unanswered:
+        report.questions["closed unanswered"] += unanswered
     # One batch of questions goes first: filing and describing have work after nearly every session, so a review
     # left to the end of the budget never ran (2026-09-28 to 10-08) and every question reached the user unreviewed.
     for step, most in ((_review_step, 1), (_file_step, None), (_profile_step, None), (_review_step, None)):
@@ -532,13 +535,15 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
 
 
 def _user_must_decide(records: list[Any], decision: Any) -> bool:
-    """Whether only the user can settle a conflict: when either side is in their own words.
+    """Whether only the user can settle a conflict: when either side is what the user wants, in their words.
 
     Whatever the model leans towards, an agent's check would settle a
-    disagreement with what the user said, so it goes straight to the user.
+    disagreement with the user's rule, preference, or decision, so it goes
+    straight to the user. Something the user said about a system an agent can
+    check like anything else.
     """
 
-    return any(record.verification == "user_stated" for record in records)
+    return any(is_users_choice(record) for record in records)
 
 
 def _render_question(memory: Memory, question: dict[str, Any], records: list[Any]) -> str:

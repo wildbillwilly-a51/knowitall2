@@ -194,7 +194,8 @@ class CodexLearningTests(CodexTestCase):
             self.assertEqual({"saved": 3}, dict(report.outcomes))
             kinds = {row.text: (row.kind, row.verification) for row in store.list_active(project_id=None, scope="global", limit=10)}
             self.assertEqual(("fact", "observed"), kinds["The homelab router runs OpenWrt 23.05.3."])
-            self.assertEqual(("rule", "user_stated"), kinds["Always keep router backups in /srv/backups."])
+            # Said once, without making it a rule: the user's preference (the user, 2026-10-11).
+            self.assertEqual(("note", "user_stated"), kinds["Always keep router backups in /srv/backups."])
             # Not the user's words: kept as a plain note, and the user is not asked about it.
             self.assertEqual(("note", "unverified"), kinds["The NAS is full and needs attention."])
             self.assertEqual(0, store.count_open_questions())

@@ -82,8 +82,8 @@ in your home folder, and sets it up for the agents you choose. Afterwards:
 2. Tell the agent something durable, for example where a service runs or
    where a credential is kept, and ask it to remember it. Then, in another
    project or a new session, ask about it.
-3. Tell it one of your rules in your own words, for example "always run the
-   tests before committing". Check that later sessions start with it.
+3. Give it a rule in your own words, for example "from now on, always run
+   the tests before committing". Check that later sessions start with it.
 4. Optionally, preview learning with `knowitall2 learn --dry-run`, then turn
    it on with `knowitall2 learn --enable`, or in the app's Learning screen.
    Then commit something, or ask the agent to have KnowItAll2 learn from the

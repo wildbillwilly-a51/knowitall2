@@ -296,8 +296,9 @@ class QuestionFlowTests(CatalogTestCase):
         save_settings(LearnerSettings(enabled=True))
         self.now = datetime.fromisoformat(self.clock().replace("Z", "+00:00"))
 
-    def conflict(self, *, older_source="observed"):
-        older = self.save("The Cisco access points reject the controller certificate at depth 0.", source=older_source)
+    def conflict(self, *, older_source="observed", older_kind="fact"):
+        older = self.save("The Cisco access points reject the controller certificate at depth 0.", source=older_source,
+                          kind=older_kind)
         newer = self.save("The Cisco access points were tested with a two-certificate chain without logs.")
         review.ask_conflict(self.memory, older, newer)
         [question] = self.store.open_questions(limit=5)
@@ -347,13 +348,22 @@ class QuestionFlowTests(CatalogTestCase):
         self.assertEqual("The later test", waiting["labels"][0]["label"])
         self.assertEqual("keep_both", waiting["not_sure"])
         self.assertIn("claude-code could not tell: The logs from that test are gone.", waiting["findings"])
-        self.assertIn("1 question for the user", self.memory.briefing(project_path=self.project))
+        self.assertIn("1 question about this project's memories for the user",
+                      self.memory.briefing(project_path=self.project))
 
-    def test_the_users_own_words_and_rules_only_go_to_the_user(self) -> None:
+    def test_what_the_user_wants_goes_to_the_user_and_their_word_on_a_system_to_an_agent(self) -> None:
         older, newer, question = self.conflict(older_source="user")
         self.run_catalog(FakeEngine(review=[self.decide(question, "use_new", certain=True)]))
-        self.assertEqual("ask_user", review.stage(self.store, question["id"]))
+        # KnowItAll2's own review never replaces the user's word; an agent's check of the system may.
+        self.assertEqual("checking", review.stage(self.store, question["id"]))
         self.assertEqual("active", self.store.get(older.id).status)
+        wanted = self.save("Deploy the access points only on weekends.", kind="note", source="user",
+                           tags=["preference"])
+        review.ask_conflict(self.memory, wanted, self.save("The access points can be deployed on any day.", kind="note"))
+        about = next(item for item in self.store.open_questions(limit=5) if item["record_ids"][0] == wanted.id)
+        self.run_catalog(FakeEngine(review=[self.decide(about, "use_new", certain=True)]))
+        self.assertEqual("ask_user", review.stage(self.store, about["id"]))
+        self.assertEqual("active", self.store.get(wanted.id).status)
         note = self.save(review.UNCONFIRMED_RULE_PREFIX + "Never downgrade the camera controller mid-run.", kind="note")
         review.ask_rule(self.memory, note)
         rule = [item for item in self.store.open_questions(limit=5) if item["kind"] == "confirm_rule"][0]
@@ -411,7 +421,7 @@ class QuestionFlowTests(CatalogTestCase):
         self.assertEqual(["review", "file"], [step for step, _ in engine.inputs])
 
     def test_listed_questions_say_what_was_found_and_which_were_never_looked_into(self) -> None:
-        older, newer, question = self.conflict(older_source="user")
+        older, newer, question = self.conflict(older_source="user", older_kind="note")
         self.run_catalog(FakeEngine(review=[self.decide(question, "use_new", certain=True)]))
         stale = self.save("Backups run nightly at 02:00.")
         review.ask_conflict(self.memory, stale, self.save("Backups run nightly at 04:00."))

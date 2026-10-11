@@ -77,10 +77,19 @@ KnowItAll2 keeps working when the server is down.
   summary and is filed under the system it is about; each system gets a
   plain summary and a list of what is missing. `knowitall2 catalog` runs it
   by hand (`--dry-run` shows what it would do).
+- What you say is context, not law. How you want something done, said in
+  a chat, is kept as a preference with the work it was about; said again in
+  three chats, it is a lasting preference that briefings show. A rule only
+  when you say so ("make that a rule", "from now on"). Your rules,
+  preferences, and decisions change only by your own words, a newer
+  statement replacing an older one; what you said about a system gives way
+  to what an agent observed.
 - Questions are settled by whoever can: KnowItAll2 itself when the memories
   make the answer clear, then the next relevant agent (an optional,
   look-only check offered in its briefing or search results), and only then
-  the user. Nothing but the user's own word changes the user's statements.
+  the user: in a chat about that project, at most two at a time and in at
+  most two chats. One no one answers closes after 30 days, changing
+  nothing.
 - An activity journal of everything KnowItAll2 does: briefings, recalls,
   saves, removals, questions and answers, each learning run with every
   candidate memory and why it was kept or rejected, maintenance changes, and

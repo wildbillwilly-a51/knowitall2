@@ -149,8 +149,10 @@ class RaceTests(ReviewTestCase):
         self.assertFalse(self.store.close_question(question_id, answer="use_new", now=self.clock()))
 
     def test_an_agents_stale_report_never_changes_what_the_user_just_confirmed(self) -> None:
-        older = self.save("The wiki runs on host wiki01.")
-        newer = self.save("The wiki moved to host wiki02.")
+        # What the user wants: an agent's report never replaces it (what the user said about a system, an agent's
+        # observation may).
+        older = self.save("Deploy the wiki only on weekends.", kind="note")
+        newer = self.save("Deploy the wiki on any day.", kind="note")
         review.ask_conflict(self.memory, older, newer)
         [question] = self.store.open_questions(limit=5)
         task_id = review.start_check(self.memory, question, [older, newer], plain=None, labels=None, reason=None)
@@ -269,30 +271,53 @@ class StuckCheckTests(ReviewTestCase):
         self.assertEqual([question["id"]], [item["id"] for item in review.for_user(self.store,
                                                                                   now=review._parse(later))])
         self.clock.value = later
-        self.assertIn("1 question for the user", self.memory.briefing(project_path=self.project))
+        self.assertIn("1 question about this project's memories for the user",
+                      self.memory.briefing(project_path=self.project))
         self.assertEqual([], review.in_progress(self.store, now=review._parse(later)))
 
-    def test_a_conflict_with_the_users_own_words_goes_to_the_user(self) -> None:
+    def test_a_conflict_with_what_the_user_wants_goes_to_the_user(self) -> None:
         # Review 2026-10-04, U-L4: an unsure model sent it to an agent unless it leaned towards the newer one.
         from knowitall2.learning.cataloguer import _user_must_decide
 
-        stated, newer, _ = self.conflict()
+        wanted = self.save("Never deploy on Fridays.", kind="rule", source="user")
+        guess = self.save("Deploying on Fridays is fine now.", kind="note")
         for decision in ("use_new", "keep_mine", "keep_both", None):
             with self.subTest(decision=decision):
-                self.assertTrue(_user_must_decide([stated, newer], decision))
+                self.assertTrue(_user_must_decide([wanted, guess], decision))
+        # What the user said about a system an agent can check (the user, 2026-10-11: context, not law).
+        stated, newer, _ = self.conflict()
+        self.assertFalse(_user_must_decide([stated, newer], None))
         plain = [self.save("The wiki runs on host wiki01."), self.save("The wiki moved to host wiki02.")]
         self.assertFalse(_user_must_decide(plain, "keep_both"))
 
 
 class NoticeTests(ReviewTestCase):
-    def test_the_briefing_mentions_questions_at_most_every_few_days(self) -> None:
+    def test_a_question_is_raised_only_in_its_projects_chats_and_in_at_most_two(self) -> None:
+        # The user, 2026-10-11: "a question or two, if they are relevant to that chat", not in every chat.
         self.conflict()
-        self.assertIn("1 question for the user", self.memory.briefing(project_path=self.project))
-        listed = review.list_questions(self.memory)
+        project = self.memory.project_for(self.project).id
+        other = make_repository(Path(self.temporary.name) / "beta", "https://gitlab.example.com/team/beta.git")
+        self.assertNotIn("question", self.memory.briefing(project_path=other))
+        notice = "1 question about this project's memories for the user"
+        self.assertIn(notice, self.memory.briefing(project_path=self.project))
+        listed = review.list_questions(self.memory, chat_project=project, in_chat=True)
         self.assertIn("use_new: The newer one is right", listed)
-        self.assertNotIn("question for the user", self.memory.briefing(project_path=self.project))
-        self.clock.value = "2026-09-30T12:00:00Z"
-        self.assertIn("1 question for the user", self.memory.briefing(project_path=self.project))
+        self.assertIn("Ask them once", listed)
+        self.assertIn(notice, self.memory.briefing(project_path=self.project))   # a second chat
+        self.assertNotIn("question", self.memory.briefing(project_path=self.project))   # never a third
+        self.assertIn("no questions about this project's memories", review.list_questions(
+            self.memory, chat_project=self.memory.project_for(other).id, in_chat=True))
+        self.assertIn("use_new: The newer one is right", review.list_questions(self.memory))   # the command line
+        self.assertIn("no questions about this project's memories",
+                      review.list_questions(self.memory, chat_project=None, in_chat=True))
+
+    def test_a_question_no_one_answers_closes_after_a_month_and_changes_nothing(self) -> None:
+        stated, newer, question_id = self.conflict()
+        self.assertEqual(0, review.expire_unanswered(self.memory))
+        self.clock.value = "2026-10-28T12:00:00Z"
+        self.assertEqual(1, review.expire_unanswered(self.memory))
+        self.assertNotEqual("open", self.store.question(question_id)["status"])
+        self.assertEqual(("active", "active"), (self.store.get(stated.id).status, self.store.get(newer.id).status))
 
     def test_no_questions(self) -> None:
         self.assertEqual("KnowItAll2 has no questions for the user.", review.list_questions(self.memory))

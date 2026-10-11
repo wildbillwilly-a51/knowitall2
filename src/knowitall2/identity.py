@@ -2,8 +2,9 @@
 
 Identity comes from the repository's remote when it has one, so moved,
 renamed, and cloned working copies of one repository share a project. A
-repository without a remote falls back to its root path. Nothing is ever
-written into the repository.
+repository without a remote falls back to its root path; when it gains a
+remote, what was saved under its folder's id follows it (``path_project_id``,
+``Memory.rejoin``). Nothing is ever written into the repository.
 """
 
 from __future__ import annotations
@@ -42,10 +43,19 @@ def identify(start: str | os.PathLike[str]) -> ProjectIdentity | None:
         return None
     raw_remote = read_remote_url(root)
     remote = normalize_remote(raw_remote)
-    key = f"git:{remote}" if remote else f"path:{os.path.normcase(str(root))}"
-    project_id = "prj-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    project_id = _project_id(f"git:{remote}") if remote else path_project_id(os.path.normcase(str(root)))
     name = (_display_name(raw_remote) if remote else None) or root.name
     return ProjectIdentity(project_id, name, root, remote)
+
+
+def path_project_id(path_key: str) -> str:
+    """The id of the repository in a folder (``ProjectIdentity.path_key``) while it has no remote."""
+
+    return _project_id(f"path:{path_key}")
+
+
+def _project_id(key: str) -> str:
+    return "prj-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 def identify_remote(url: str, name: str | None = None) -> ProjectIdentity | None:
@@ -57,8 +67,7 @@ def identify_remote(url: str, name: str | None = None) -> ProjectIdentity | None
     remote = normalize_remote(url)
     if remote is None or remote.startswith("file:"):
         return None
-    project_id = "prj-" + hashlib.sha256(f"git:{remote}".encode("utf-8")).hexdigest()[:16]
-    return ProjectIdentity(project_id, name or _display_name(url) or remote, Path(""), remote)
+    return ProjectIdentity(_project_id(f"git:{remote}"), name or _display_name(url) or remote, Path(""), remote)
 
 
 def find_git_root(start: Path) -> Path | None:

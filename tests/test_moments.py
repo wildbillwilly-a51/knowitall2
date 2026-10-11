@@ -170,9 +170,9 @@ class StopHookTests(MomentTestCase):
             "updated": [], "already_known": 1, "turned_down": [{"text": "x", "reason": "evidence not in the session"}],
         })
         message = self.stop()["systemMessage"]
-        self.assertIn("KnowItAll2 learned 2 things from this session (after your commit 1a2b3c4):", message)
-        self.assertIn("  - The homelab router runs OpenWrt 23.05.3.", message)
-        self.assertIn("(1 already known, 1 turned down)", message)
+        # One line, and never a question: it comes after each commit (the user, 2026-10-11).
+        self.assertEqual("KnowItAll2 learned 2 things from this session (after your commit 1a2b3c4): The homelab "
+                         "router runs OpenWrt 23.05.3; dnsmasq needs a restart after editing /etc/config/dhcp.", message)
         self.assertEqual({}, self.stop())
 
     def test_the_news_of_an_ended_session_is_shown_by_the_next_one_in_the_same_folder(self) -> None:
@@ -492,7 +492,7 @@ class RequestLearningTests(MomentTestCase):
         message = self.stop()["systemMessage"]
         self.assertIn("KnowItAll2 learned 1 thing from this session (after your commit 1a2b3c4):", message)
         self.assertIn("The homelab router runs OpenWrt 23.05.3.", message)
-        self.assertIn("1 turned down", message)
+        self.assertNotIn("turned down", message)
         self.assertIsNone(moments.read_now())
 
     def test_work_is_learned_whatever_the_daily_limit_and_still_counts_toward_it(self) -> None:

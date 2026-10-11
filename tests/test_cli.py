@@ -92,6 +92,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("no single project named 'gamma'", errors)
 
+    def test_rejoin_files_what_was_saved_before_a_repository_had_a_remote(self) -> None:
+        gamma = make_repository(Path(self.temporary.name) / "gamma")
+        self.run_cli("remember", "Gamma builds with make dist.", "--scope", "project", "--project-path", str(gamma))
+        (gamma / ".git" / "config").write_text(
+            '[remote "origin"]\n\turl = https://gitlab.example.com/team/gamma.git\n', encoding="utf-8")
+        code, output, _ = self.run_cli("rejoin", "--dry-run")
+        self.assertEqual(0, code)
+        self.assertIn("Would file what was saved in", output)
+        self.assertIn("under project gamma: 1 memory.", output)
+        _, output, _ = self.run_cli("rejoin")
+        self.assertIn("Filed what was saved in", output)
+        _, output, _ = self.run_cli("rejoin")
+        self.assertIn("Nothing to rejoin", output)
+        _, output, _ = self.run_cli("recall", "make dist", "--scope", "project", "--project-path", str(gamma))
+        self.assertIn("Gamma builds with make dist.", output)
+
     def test_remember_counts_as_the_users_words_only_when_told(self) -> None:
         # Agents run this command too, so a memory is a guess unless --source says otherwise.
         project = str(self.project)

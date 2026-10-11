@@ -7,13 +7,14 @@ import math
 import re
 import unicodedata
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from . import journal
-from .identity import ProjectIdentity, identify
+from .identity import ProjectIdentity, identify, path_project_id
 from .quotes import quoted_in
 from .secrets import find_secrets, redact
 from .store import RecordRow, Store
@@ -60,8 +61,6 @@ _INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
 _INSTRUCTION_FILE_LIMIT = 256 * 1024
 FRESH_DAYS = 90
 FRESHNESS_FLOOR = 0.6
-QUESTION_NOTICE_DAYS = 3
-QUESTIONS_SHOWN_KEY = "questions_shown_at"
 # A question the background review has not settled within this time goes to the user.
 QUESTION_REVIEW_DAYS = 3
 # And one handed to agents that none checked within this time after that.
@@ -72,6 +71,15 @@ TASK_OFFER_HEADER = (
 
 VERIFICATION_FOR_SOURCE = {"user": "user_stated", "observed": "observed", "inferred": "unverified"}
 VERIFICATION_STRENGTH = {"unverified": 0, "observed": 1, "user_stated": 2}
+# What is true about a system, as opposed to what the user wants (rules, preferences, decisions).
+FACT_KINDS = frozenset({"fact", "procedure", "lesson"})
+# How the user wants things done, said in a chat: a note with this tag, weighed like any memory. Said in this many
+# chats, it is a lasting preference that briefings show (the user, 2026-10-11).
+PREFERENCE_TAG = "preference"
+LASTING_PREFERENCE_CHATS = 3
+BRIEFING_PREFERENCES = 10
+# The reason on the user's words said again, replaced by the memory that holds the preference (``Store.times_said``).
+SAID_AGAIN = "said again by the user; counted on"
 # Two statements are the same one said again when this share of their distinct words is shared.
 SAME_STATEMENT_SHARE = 0.9
 DEFAULT_HISTORY_LIMIT = 20
@@ -119,42 +127,79 @@ class RememberResult:
             text = f"Saved [{self.record.id}] ({self.record.kind}, {_scope_label(self.record, None)})."
         if self.replaced is not None:
             text += f" It replaces [{self.replaced.id}]."
-        if self.kept is not None and self.kept.verification == "user_stated":
-            text += (f" [{self.kept.id}] is the user's own statement, so it was not replaced: both are kept, "
-                     "and the user will be asked which is right.")
+        if self.kept is not None and is_users_choice(self.kept):
+            text += (f" [{self.kept.id}] is what the user wants, in their own words, so it was not replaced: both "
+                     "are kept, and the user will be asked which is right.")
+        elif self.kept is not None and self.kept.verification == "user_stated":
+            text += (f" [{self.kept.id}] is the user's own statement, and only something observed corrects it: "
+                     "both are kept until KnowItAll2 finds out which is right.")
         elif self.kept is not None:
             text += (f" [{self.kept.id}] is better verified ({self.kept.verification}), so it was not replaced: "
                      "both are kept until KnowItAll2 finds out which is right.")
         return text
 
 
+@dataclass(frozen=True)
+class Rejoined:
+    """What ``Memory.rejoin`` filed, or would file, under a project from before its repository had a remote."""
+
+    project: ProjectIdentity
+    old_id: str
+    record_ids: tuple[str, ...]
+    active: int
+    duplicates: int  # active memories the project already had; kept as replaced by those
+    inactive: int  # retired and replaced memories, moved along so a restore brings them back here
+
+    def describe(self, *, dry_run: bool = False) -> str:
+        verb = "Would file" if dry_run else "Filed"
+        parts = [f"{self.active} {'memory' if self.active == 1 else 'memories'}"]
+        if self.duplicates:
+            parts.append(f"{self.duplicates} of them already known there, kept as replaced")
+        if self.inactive:
+            parts.append(f"{self.inactive} retired or replaced")
+        return (f"{verb} what was saved in {self.project.root} before its repository had a remote under project "
+                f"{self.project.name}: {', '.join(parts)}.")
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def may_supersede(older: str, newer: str) -> bool:
+def is_users_choice(record: RecordRow) -> bool:
+    """Whether ``record`` is what the user wants, in their own words: a rule, a preference, or a decision.
+
+    Only the user's own words change those. What the user said is true about a system (a fact, a procedure,
+    a lesson) is evidence like any other: a newer observation may correct it (the user, 2026-10-11).
+    """
+
+    return record.verification == "user_stated" and record.kind not in FACT_KINDS
+
+
+def may_supersede(older: str, newer: str, *, older_kind: str | None = None) -> bool:
     """Whether evidence of verification ``newer`` may replace a memory of verification ``older``.
 
-    Evidence must be at least as strong, and the user's own statement gives way
-    only to the user's own words.
+    Evidence must be at least as strong. The user's own statement gives way to
+    the user's own words, and, when it says what is true about a system
+    (``older_kind`` a fact, procedure, or lesson), to what an agent observed.
     """
 
     if older == "user_stated":
-        return newer == "user_stated"
+        return newer == "user_stated" or (newer == "observed" and older_kind in FACT_KINDS)
     return VERIFICATION_STRENGTH[newer] >= VERIFICATION_STRENGTH[older]
 
 
 def may_replace_unasked(older: RecordRow, *, kind: str, text: str, verification: str) -> bool:
     """Whether learning or maintenance may replace ``older`` with a memory of this kind, text, and verification.
 
-    Evidence must be at least as strong, and one of the user's own statements
-    gives way only to the same statement said again: a model may misread
-    which of two user statements is current, so otherwise the user is asked.
+    Evidence must be at least as strong. Newer words of the user win over older
+    ones without asking: what the user said once is context, not law (the
+    user, 2026-10-11). A rule gives way only to a newer rule, or to the same
+    rule said again.
     """
 
-    if not may_supersede(older.verification, verification):
+    if not may_supersede(older.verification, verification, older_kind=older.kind):
         return False
-    return older.verification != "user_stated" or same_statement(older, kind=kind, text=text)
+    return older.kind != "rule" or kind == "rule" or same_statement(older, kind=kind, text=text)
 
 
 def same_statement(record: RecordRow, *, kind: str, text: str) -> bool:
@@ -197,6 +242,13 @@ class Memory:
         if identity is not None and (identity.id, identity.path_key) not in self._touched:
             self.store.touch_project(identity, self._clock())
             self._touched.add((identity.id, identity.path_key))
+            try:
+                # Not inside another change (an import), which would keep half of it if this one failed.
+                if not self.store.connection.in_transaction:
+                    self.rejoin(identity)
+            except Exception as exc:  # never in the way of the work that asked for the project
+                journal.problem("project", f"what was saved before {identity.name} had a remote was not "
+                                           f"rejoined: {type(exc).__name__}: {exc}")
         return identity
 
     def remember(
@@ -352,7 +404,7 @@ class Memory:
             raise MemoryInputError(f"Not saved: there is no memory [{replaces}] to replace.")
         if found.status != "active":
             raise MemoryInputError(f"Not saved: [{found.id}] is already {found.status}.")
-        if not may_supersede(found.verification, verification):
+        if not may_supersede(found.verification, verification, older_kind=found.kind):
             return None, found
         return found, None
 
@@ -425,16 +477,46 @@ class Memory:
             weights[term] = math.log(1 + total / (documents or 0.5))
         return weights, unknown
 
+    def said_again(self, known: RecordRow, text: str, *, subjects: Iterable[str] = (), source: str = "inferred",
+                   session: str | None = None) -> RecordRow:
+        """Count the user's words for a preference ``known`` holds, said again in another chat.
+
+        The words are kept as a memory replaced at once by ``known`` (``SAID_AGAIN``), so they sync, keep their
+        date, and count toward how many chats the preference was said in (``Store.said_in_sessions``), even when
+        they are word for word the same.
+        """
+
+        body = _clean_text(text)
+        now = self._clock()
+        record_id = self._new_id()
+        with self.store.transaction():
+            self.store.insert_record(
+                record_id=record_id, kind="note", text=body, subjects=_clean_labels(subjects, "subjects"),
+                tags=[PREFERENCE_TAG], scope=known.scope, project_id=known.project_id,
+                verification=VERIFICATION_FOR_SOURCE[source], source_kind="user" if source == "user" else "agent",
+                source_agent=self.agent, source_session=session,
+                content_hash=_content_hash(body, known.scope, known.project_id), now=now,
+            )
+            self.store.supersede(record_id, known.id, now=now, reason=f"{SAID_AGAIN} [{known.id}]")
+            if PREFERENCE_TAG not in known.tags:
+                self.store.set_tags(known.id, [*known.tags, PREFERENCE_TAG], now=now)
+            self.record_event("remember", body, outcome="said again", project_id=known.project_id, session=session,
+                              record_ids=[known.id, record_id], details={"kind": "note", "source": source})
+        record = self.store.get(record_id)
+        assert record is not None
+        return record
+
     def forget(self, record_id: str, *, reason: str | None = None, by_user: bool = False) -> str:
-        """Retire a memory. Only the user's own request (``by_user``, such as the app's) retires the user's
-        own statement; anyone else's opens a question for the user, with the reason given."""
+        """Retire a memory. Only the user's own request (``by_user``, such as the app's) retires a rule,
+        preference, or decision in the user's words; anyone else's opens a question for the user, with the
+        reason given. Something the user said about a system is evidence an agent may find wrong."""
 
         identifier = (record_id or "").strip().strip("[]")
         if not identifier:
             raise MemoryInputError("forget needs the id of a memory, such as k-1a2b3c4d5e.")
         note = _clean_text(reason or "")[:200] or None
         stated = self.store.get(identifier)
-        if not by_user and stated is not None and stated.status == "active" and stated.verification == "user_stated":
+        if not by_user and stated is not None and stated.status == "active" and is_users_choice(stated):
             return self._ask_before_forgetting(stated, note)
         if self.store.retire(identifier, reason=note, now=self._clock()):
             record = self.store.get(identifier)
@@ -551,6 +633,75 @@ class Memory:
                           details={"from": before, "to": project.name})
         return f"Moved [{record.id}] from project {before} to project {project.name}."
 
+    def rejoin(self, project: ProjectIdentity, *, dry_run: bool = False) -> Rejoined | None:
+        """File what was saved in a folder before its repository had a remote under the project it is now.
+
+        A repository without a remote is known by its folder (``identity.path_project_id``); once it has
+        one, by the remote, like every copy of it. What the folder's old project holds follows: its
+        memories (retired and replaced ones too, so a restore brings one back here), its agent requests,
+        and the folder itself. An active memory the project already has is kept as replaced by that one.
+        The old project's entry stays, empty, since projects are never deleted across computers; each
+        memory travels to a KnowItAll2 server as a move does. Returns None when nothing is left to rejoin.
+        """
+
+        if project.remote is None or not project.root.parts:
+            return None
+        old_id = path_project_id(project.path_key)
+        if old_id == project.id:
+            return None
+        old = self.store.project_row(old_id)
+        if old is None or old["remote"] is not None or not self.store.project_holds_anything(old_id):
+            return None
+        now = self._clock()
+        with nullcontext() if dry_run else self.store.transaction():
+            records = self.store.project_records(old_id)
+            moves = [(record, _content_hash(record.text, "project", project.id)) for record in records]
+            twins = {record.id: self.store.find_active_duplicate(content_hash)
+                     for record, content_hash in moves if record.status == "active"}
+            if not dry_run:
+                self.store.ensure_project(project, now)
+                for record, content_hash in moves:
+                    if record.status != "active":
+                        self.store.refile_record(record.id, project_id=project.id, content_hash=content_hash)
+                        continue
+                    self.store.move_record(record.id, project_id=project.id, content_hash=content_hash, now=now)
+                    if twins[record.id] is not None:
+                        self.store.supersede(record.id, twins[record.id].id, now=now,
+                                             reason=f"the same memory was already filed under project {project.name}")
+                self.store.move_project_tasks(old_id, project.id, now=now)
+                self.store.move_project_paths(old_id, project.id)
+        result = Rejoined(
+            project, old_id, tuple(record.id for record in records), active=len(twins),
+            duplicates=sum(1 for twin in twins.values() if twin is not None), inactive=len(records) - len(twins),
+        )
+        if not dry_run and records:
+            self.record_event("move", result.describe(), outcome="rejoined", project_id=project.id,
+                              record_ids=list(result.record_ids),
+                              details={"from": old_id, "to": project.name, "folder": str(project.root)})
+        return result
+
+    def rejoin_everywhere(self, *, dry_run: bool = False) -> str:
+        """``rejoin`` for every folder KnowItAll2 knows, not only the ones agents work in again.
+
+        A folder that is still there belongs to the project it is now; one that is gone, to the project
+        seen there last.
+        """
+
+        lines = []
+        for project_id, name, path in self.store.all_project_paths():
+            folder = Path(path)
+            if folder.is_dir():
+                project = identify(folder)
+            else:
+                row = self.store.project_row(project_id)
+                project = ProjectIdentity(project_id, name, folder, row["remote"]) if row else None
+            result = self.rejoin(project, dry_run=dry_run) if project is not None else None
+            if result is not None and result.record_ids:
+                lines.append(result.describe(dry_run=dry_run))
+        if not lines:
+            return "Nothing to rejoin: what each folder's repository saved is filed under the project it is now."
+        return "\n".join(lines)
+
     def history(self, *, limit: int = DEFAULT_HISTORY_LIMIT) -> str:
         """Recently retired and replaced memories, so any removal can be undone."""
 
@@ -576,12 +727,13 @@ class Memory:
         rules = self.store.list_active(project_id=project_id, scope="all", kinds=("rule",), limit=40)
         rules, instructed = _without_instructed(rules, project)
         rules, elsewhere = self._rules_for_its_systems(rules, project)
+        preferences = self._lasting_preferences(project_id)
         entries, snapshots = self._contents(project) if project is not None else ([], 0)
-        notice = self._question_notice()
+        notice = self._question_notice(project_id)
         from .known import folder_line
 
         where_everything_is = folder_line(project_path)
-        if not rules and not entries and not instructed and not elsewhere:
+        if not rules and not preferences and not entries and not instructed and not elsewhere:
             self._log_usage("briefing", project, None, [])
             where = "this project" if project else "this folder"
             lines_out = [
@@ -615,6 +767,11 @@ class Memory:
             verb = "is" if len(elsewhere) == 1 else "are"
             lines.add(f"({len(elsewhere)} more of your rules {verb} about other systems ({names}); "
                       "recall finds them when you work there.)")
+        if preferences:
+            lines.add("Your preferences (said in several chats; weigh them with the work at hand):")
+            for row, times in preferences:
+                if lines.add_item(f"- [{row.id}] {_shorten(row.text, BRIEFING_RULE_CHARACTERS)} (said in {times} chats)"):
+                    shown.append(row.id)
         shown += _add_contents(lines, entries, now=self._clock())
         self._log_usage("briefing", project, None, shown)
         omitted = lines.omitted + snapshots
@@ -775,24 +932,37 @@ class Memory:
         assert record is not None
         return record
 
-    def _question_notice(self) -> str | None:
-        """One briefing line about open questions, at most once every few days."""
+    def _lasting_preferences(self, project_id: str | None) -> list[tuple[RecordRow, int]]:
+        """The user's preferences said in enough chats to last, global or this project's, most often said first.
+
+        Said once, a preference is one memory among others; said again in other chats, it is how the user works.
+        """
+
+        found = []
+        for row in self.store.list_active(project_id=project_id, scope="all", kinds=("note", "decision"), limit=500):
+            if PREFERENCE_TAG in row.tags:
+                times = self.store.times_said(row.id)
+                if times >= LASTING_PREFERENCE_CHATS:
+                    found.append((row, times))
+        found.sort(key=lambda item: (-item[1], item[0].created_at))
+        return found[:BRIEFING_PREFERENCES]
+
+    def _question_notice(self, project_id: str | None) -> str | None:
+        """One briefing line about the user's questions about this project's memories, if any; each question is
+        told to at most a few chats (``review.for_chat``)."""
+
+        from . import review
 
         try:
-            moment = _parse_time(self._clock())
-            overdue = (moment - timedelta(days=QUESTION_REVIEW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            unchecked = (moment - timedelta(days=QUESTION_REVIEW_DAYS + QUESTION_CHECK_DAYS)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ")
-            count = self.store.count_user_questions(overdue_before=overdue, checking_before=unchecked)
-            if not count:
+            questions = review.for_chat(self.store, project_id, now=_parse_time(self._clock()))
+            if not questions:
                 return None
-            shown = self.store.get_meta(QUESTIONS_SHOWN_KEY)
-            if shown and (_parse_time(self._clock()) - _parse_time(shown)).days < QUESTION_NOTICE_DAYS:
-                return None
+            review.offer_in_chat(self.store, questions)
         except Exception:
             return None
-        noun = "question" if count == 1 else "questions"
-        return f"KnowItAll2 has {count} {noun} for the user. When the user has a moment, show them with the questions tool."
+        noun = "question" if len(questions) == 1 else "questions"
+        return (f"KnowItAll2 has {len(questions)} {noun} about this project's memories for the user. At a natural "
+                "point in this chat, show them once with the questions tool.")
 
     def _new_id(self) -> str:
         while True:

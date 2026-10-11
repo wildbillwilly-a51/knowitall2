@@ -142,21 +142,34 @@ class GateTests(MaintenanceTestCase):
         [question] = self.store.open_questions(limit=5)
         self.assertEqual([old_seen.id, new_guess.id], question["record_ids"])
 
-    def test_only_the_user_retires_their_own_words(self) -> None:
+    def test_a_status_the_user_mentioned_goes_but_what_they_want_stays(self) -> None:
+        # What the user said once is context, not law (the user, 2026-10-11): a passing status goes like any other,
+        # with no question; what the user wants is not a status.
         stated = self.save("I am rebuilding the NAS this week.", source="user")
+        wanted = self.save("Rebuild the NAS only on weekends.", kind="note", source="user", tags=["preference"])
         status = self.save("The VPN is currently disconnected.")
         lesson = self.save("Restarting dnsmasq fixed DHCP.", kind="lesson")
         report = self.run_maintenance(FakeReviewer([[
-            {"kind": "snapshot", "keep_id": "", "ids": [stated.id, status.id, lesson.id], "reason": "Temporary."},
+            {"kind": "snapshot", "keep_id": "", "ids": [stated.id, wanted.id, status.id, lesson.id],
+             "reason": "Temporary."},
         ]]))
-        self.assertEqual({"question": 1, "retired snapshot": 1, "kept (lesson)": 1}, dict(report.changes))
-        self.assertEqual(("active", "retired", "active"), tuple(map(self.status, (stated.id, status.id, lesson.id))))
-        [question] = self.store.open_questions(limit=5)
-        self.assertEqual("still_true", question["kind"])
-        self.assertIn("Forgot", review.answer(self.memory, question["id"], "forget"))
-        self.assertEqual("retired", self.status(stated.id))
+        self.assertEqual({"retired snapshot": 2, "kept (the user's own)": 1, "kept (lesson)": 1}, dict(report.changes))
+        self.assertEqual(("retired", "active", "retired", "active"),
+                         tuple(map(self.status, (stated.id, wanted.id, status.id, lesson.id))))
+        self.assertEqual(0, self.store.count_open_questions())
 
-    def test_the_users_statements_are_merged_or_replaced_only_when_nearly_identical(self) -> None:
+    def test_merged_copies_of_a_preference_count_the_chats_they_came_from(self) -> None:
+        first = self.memory.remember("Keep deploy notes short.", tags=["preference"], source="user",
+                                     project_path=self.project, session="chat-1").record
+        second = self.memory.remember("Deploy notes should be short.", tags=["preference"], source="user",
+                                      project_path=self.project, session="chat-2").record
+        report = self.run_maintenance(FakeReviewer([[
+            {"kind": "duplicate", "keep_id": first.id, "ids": [second.id], "reason": "Same preference."},
+        ]]))
+        self.assertEqual({"merged duplicate": 1}, dict(report.changes))
+        self.assertEqual(2, self.store.times_said(first.id))
+
+    def test_the_users_rules_merge_and_a_newer_one_replaces_an_older(self) -> None:
         tag = self.save("Always tag releases before deploying them.", kind="rule", source="user")
         tag_again = self.save("Tag every release in Git.", kind="rule", source="user")
         old_host = self.save("Deploy from the build01 host.", kind="rule", source="user")
@@ -171,13 +184,14 @@ class GateTests(MaintenanceTestCase):
             {"kind": "duplicate", "keep_id": noted.id, "ids": [signed_tags.id], "reason": "Same."},
             {"kind": "duplicate", "keep_id": sign.id, "ids": [sign_again.id], "reason": "Same rule."},
         ]]))
-        self.assertEqual({"question": 3, "merged duplicate": 1}, dict(report.changes))
-        for record in (tag, tag_again, old_host, new_host, signed_tags, noted, sign):
+        self.assertEqual({"merged duplicate": 3, "replaced outdated": 1}, dict(report.changes))
+        for record in (tag, new_host, signed_tags, sign):
             self.assertEqual("active", self.status(record.id))
-        self.assertEqual("superseded", self.status(sign_again.id))
-        asked = sorted(question["record_ids"] for question in self.store.open_questions(limit=5))
-        self.assertEqual(sorted([[tag_again.id, tag.id], [old_host.id, new_host.id], [signed_tags.id, noted.id]]),
-                         asked)
+        # A note that says what a rule says goes into the rule, never the other way round.
+        for record in (tag_again, old_host, noted, sign_again):
+            self.assertEqual("superseded", self.status(record.id))
+        self.assertEqual(signed_tags.id, self.store.get(noted.id).superseded_by)
+        self.assertEqual(0, self.store.count_open_questions())
 
     def test_conflicts_become_questions_with_the_older_memory_first(self) -> None:
         first = self.save("Backups run at 02:00.")

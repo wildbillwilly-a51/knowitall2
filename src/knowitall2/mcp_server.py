@@ -42,12 +42,15 @@ INSTRUCTIONS = (
     "(its README.md lists the files): search it like any project file, read a file KnowItAll2 points you to, "
     "and do not edit it. "
     "When you establish a durable fact that would help a future session, or the user tells you "
-    "one (a system, a method, a rule), call `remember` right away and tell the user in one short line what was "
-    "saved; set source to 'user' only for the user's own words. Never save secrets; save where a credential is "
-    "kept instead. When the user asks KnowItAll2 to learn from the session, or once when a task the user gave you "
-    "is complete, call `learn`. Treat unverified memories as leads to check. When the briefing mentions questions for the user, "
-    "show them with `questions` at a convenient moment: look into each one first and tell the user what you found "
-    "and the answer you recommend; record only the user's own choices with `answer`. "
+    "one (a system, a method, how they want something done), call `remember` right away and tell the user in one "
+    "short line what was saved; set source to 'user' only for the user's own words. Save how the user wants "
+    "something done as a note tagged 'preference' that says what work it was about; save a rule only when the "
+    "user explicitly asks for a standing one ('make that a rule', 'from now on'). Never save secrets; save where a "
+    "credential is kept instead. When the user asks KnowItAll2 to learn from the session, or once when a task "
+    "the user gave you is complete, call `learn`. Treat unverified memories as leads to check. When the briefing says KnowItAll2 has "
+    "a question about this project's memories, show it with `questions` once, at a natural point in the chat: look "
+    "into it first and tell the user what you found and the answer you recommend; record only the user's own "
+    "choices with `answer`, and if the user does not answer, let it be. "
     "A briefing or recall result may include an optional KnowItAll2 request with a task id such as t-1a2b3c4d; "
     "help only if it is quick, look-only, and not in the way of the user's task, and report with `settle`. "
     "When the user asks to update KnowItAll2, run the update script `update.py` in the `.knowitall2` folder of "
@@ -125,7 +128,10 @@ TOOLS: list[dict[str, Any]] = [
                 "text": {"type": "string", "maxLength": 2000, "description": "The memory, as one statement."},
                 "kind": {
                     "type": "string", "enum": list(KINDS),
-                    "description": "Default 'fact'. Only the user can set a 'rule'.",
+                    "description": (
+                        "Default 'fact'. 'rule' only when the user explicitly asks for a standing rule ('make that a "
+                        "rule', 'from now on'); how the user wants something done is a 'note' tagged 'preference'."
+                    ),
                 },
                 "subjects": {
                     "type": "array", "items": {"type": "string"}, "maxItems": 8,
@@ -437,7 +443,8 @@ def _forget(memory: Memory, arguments: dict[str, Any], cwd: Path) -> str:
 
 
 def _questions(memory: Memory, arguments: dict[str, Any], cwd: Path) -> str:
-    return review.list_questions(memory)
+    project = memory.project_for(cwd)
+    return review.list_questions(memory, chat_project=project.id if project else None, in_chat=True)
 
 
 def _answer(memory: Memory, arguments: dict[str, Any], cwd: Path) -> str:

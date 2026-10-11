@@ -1,8 +1,10 @@
-"""Which command a lesson is about, so KnowItAll2 can show it just before an agent runs that command.
+"""Which command a lesson is about, so KnowItAll2 can show it to an agent when that command fails.
 
 The model reads lessons (and procedures and facts that say how a command fails or must be run) in batches and
 names, for each, the command it is about or nothing. The answer is a tag (``commands.COMMAND_TAG``), which
-syncs like any tag. Each memory is looked at once, recorded in ``reviews`` by its id and text.
+syncs like any tag. Each memory is looked at once, recorded in ``reviews`` by its id and text. A batch the
+model refuses (on 2026-10-11 its safeguards refused one about Cisco access points' certificates) is tried
+again in small groups, and a memory refused twice is left out, so it never holds up the ones behind it.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ from ..store import RecordRow, Store
 
 SCOPE_KEY = "commands"
 BATCH = 50
+RETRY_BATCH = 5
+MAX_REFUSALS = 2
 ITEM_CHARACTERS = 600
 # A procedure or fact is worth asking about only when it says how a command fails or must be run.
 _FAILURE = re.compile(r"\b(?:fail\w*|errors?|blocked|refus\w*|cannot|can't|doesn't|does not|won't|breaks?|instead|"
@@ -61,12 +65,15 @@ class TagReport:
     deferred: int = 0
     keys: dict[str, int] = field(default_factory=dict)
     blocked: str | None = None
+    refused: int = 0
 
     def describe(self) -> str:
         line = (f"Commands: looked at {self.looked_at} memories in {self.calls} model calls; tagged {self.tagged} "
                 f"with the command they are about.")
         if self.deferred:
             line += f" {self.deferred} wait for the budget."
+        if self.refused:
+            line += f" The model refused {self.refused}; they are tried again in small groups."
         if self.blocked:
             line += f" Stopped: {self.blocked}"
         return line
@@ -84,14 +91,29 @@ def fingerprint(record: RecordRow) -> str:
 
 
 def waiting(store: Store) -> list[RecordRow]:
-    """Memories not yet looked at for a command, newest first."""
+    """Memories not yet looked at for a command, newest first; those the model refused once come last."""
 
-    found = []
+    fresh, refused = [], []
     for record in store.records_by_kinds(("lesson", "procedure", "fact")):
-        if candidate(record) and store.review(fingerprint(record)) is None:
-            found.append(record)
-    found.sort(key=lambda record: record.created_at, reverse=True)
-    return found
+        if not candidate(record):
+            continue
+        seen = store.review(fingerprint(record))
+        if seen is None:
+            fresh.append(record)
+        elif seen["outcome"] == "failed" and seen["failures"] < MAX_REFUSALS:
+            refused.append(record)
+    fresh.sort(key=lambda record: record.created_at, reverse=True)
+    refused.sort(key=lambda record: record.created_at, reverse=True)
+    return fresh + refused
+
+
+def _batches(store: Store, pending: Sequence[RecordRow]) -> list[list[RecordRow]]:
+    """``BATCH`` at a time; a memory the model refused before goes in a small group, to find the one it refuses."""
+
+    fresh = [record for record in pending if store.review(fingerprint(record)) is None]
+    again = [record for record in pending if store.review(fingerprint(record)) is not None]
+    return ([fresh[start:start + BATCH] for start in range(0, len(fresh), BATCH)]
+            + [again[start:start + RETRY_BATCH] for start in range(0, len(again), RETRY_BATCH)])
 
 
 def render(batch: Sequence[RecordRow]) -> str:
@@ -107,19 +129,27 @@ def tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: Any
     calls toward the daily budget."""
 
     report = TagReport()
-    pending = waiting(store)
-    batches = [pending[start:start + BATCH] for start in range(0, len(pending), BATCH)]
+    batches = _batches(store, waiting(store))
     for number, batch in enumerate(batches):
         if report.calls >= budget:
             report.deferred = sum(len(item) for item in batches[number:])
             break
         try:
             answer = engine.run(render(batch), schema=SCHEMA, system_prompt=SYSTEM_PROMPT)
-        except Exception as exc:   # the engine's own error; nothing in this batch is marked looked at
-            report.blocked = str(exc)[:300]
+        except Exception as exc:
             if state is not None:
                 state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="failed")
-            break
+            if getattr(exc, "blocking", True):
+                # The engine itself (signed out, a usage limit): nothing in this batch is marked looked at.
+                report.blocked = str(exc)[:300]
+                break
+            # The model refused or failed this batch: each memory in it counts a refusal, and the rest go on.
+            report.calls += 1
+            report.refused += len(batch)
+            with store.transaction():
+                for record in batch:
+                    store.record_review(fingerprint(record), scope_key=SCOPE_KEY, outcome="failed", now=now)
+            continue
         report.calls += 1
         if state is not None:
             state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="ok")

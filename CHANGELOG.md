@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.5 (2026-10-11)
+
+From your review of how KnowItAll2 weighs what you say: something said once in
+a chat was treated as a possible permanent rule, and KnowItAll2's questions
+came up in nearly every chat.
+
+- **What you say once is a preference, not a rule.** Learning keeps how you
+  want something done as a preference, with the work it was about, and never
+  asks whether it should be a rule. A rule only when you say so: "make that a
+  rule", "from now on".
+- **Saying it again is what makes a preference last.** When you say the same
+  thing in another chat, KnowItAll2 counts it; said in three chats, briefings
+  list it under "Your preferences".
+- **Newer words win.** A newer statement of yours replaces an older one
+  without asking, and what you said about a system gives way to what an
+  agent observed. Your rules, preferences, and decisions still change only
+  by your own words.
+- **Questions only where they belong.** A question reaches you only in a
+  chat about its project, at most two at a time and in at most two chats;
+  one no one answers closes after 30 days, changing nothing. The news after
+  a commit is one line and never mentions questions.
+- **A lesson the model refuses to read no longer holds up the rest.** Noting
+  which command each lesson is about tries a refused batch again in small
+  groups, and leaves out what is refused twice.
+- **A project keeps what it learned when its repository gets a remote.** A
+  project is known by its folder until its repository has a remote, then by
+  the remote. What was saved before now moves with it the first time an
+  agent works there, on every computer (`knowitall2 rejoin` does it for
+  every folder at once), and work in that folder is no longer filed under
+  the old project.
+
 ## 0.10.4 (2026-10-11)
 
 From a measurement of five days of real use (37 chats): KnowItAll2 delivered

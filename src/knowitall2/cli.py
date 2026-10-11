@@ -68,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     move.add_argument("--project", required=True, help="the project's name, as the app shows it")
     move.add_argument("--system", help="also file them under this system in the catalog (its name)")
 
+    rejoin = commands.add_parser(
+        "rejoin", help="file what was saved before a repository had a remote under its project (done on its own "
+                       "when an agent works there)",
+    )
+    rejoin.add_argument("--dry-run", action="store_true", help="only show what would be filed")
+
     restore = commands.add_parser("restore", help="bring back a retired or replaced memory")
     restore.add_argument("id")
     history = commands.add_parser("history", help="show recently retired or replaced memories")
@@ -167,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     cataloguing.add_argument("--dry-run", action="store_true", help="show what would be done; no model calls")
     cataloguing.add_argument(
         "--commands", type=int, nargs="?", const=40, metavar="CALLS",
-        help="note which command each lesson is about, so agents see it just before running that command; "
+        help="note which command each lesson is about, so an agent sees it when that command fails; "
              "at most CALLS model calls (default 40), each for 50 memories",
     )
 
@@ -366,6 +372,8 @@ def _run(memory: Memory, store: Store, arguments: argparse.Namespace) -> str:
         return memory.restore(arguments.id)
     if arguments.command == "move":
         return _move(memory, store, arguments)
+    if arguments.command == "rejoin":
+        return memory.rejoin_everywhere(dry_run=arguments.dry_run)
     if arguments.command == "import":
         from .importer import import_file
 

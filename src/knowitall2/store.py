@@ -708,6 +708,28 @@ class Store:
             (verification, now, now, record_id),
         )
 
+    def said_in_sessions(self, record_id: str) -> set[str]:
+        """The chats a preference was said in: its own, and those of the user's words counted on it.
+
+        Words said again (reason ``memory.SAID_AGAIN``) and copies maintenance merged as duplicates count,
+        through any number of steps; a preference the user changed does not. A memory saved without a chat
+        counts as one of its own.
+        """
+
+        rows = self._connection.execute(
+            "WITH RECURSIVE chain(id, session) AS ("
+            " SELECT id, COALESCE(source_session, id) FROM records WHERE id = ?"
+            " UNION SELECT r.id, COALESCE(r.source_session, r.id) FROM records r JOIN chain c ON r.superseded_by = c.id"
+            "  WHERE r.status = 'superseded' AND (r.retired_reason LIKE 'said again by the user%'"
+            "   OR r.retired_reason LIKE 'maintenance: duplicate of%'))"
+            " SELECT DISTINCT session FROM chain",
+            (record_id,),
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def times_said(self, record_id: str) -> int:
+        return len(self.said_in_sessions(record_id))
+
     def supersede(self, old_id: str, new_id: str, *, now: str, reason: str | None = None) -> None:
         self._connection.execute(
             "UPDATE records SET status = 'superseded', superseded_by = ?, retired_reason = ?, updated_at = ? "
@@ -1121,6 +1143,54 @@ class Store:
         )
         return cursor.rowcount == 1
 
+    def refile_record(self, record_id: str, *, project_id: str, content_hash: str) -> None:
+        """File a retired or replaced memory under another project, keeping when it last changed."""
+
+        self._connection.execute(
+            "UPDATE records SET project_id = ?, content_hash = ? WHERE id = ? AND status != 'active'",
+            (project_id, content_hash, record_id),
+        )
+
+    def project_row(self, project_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return dict(row) if row else None
+
+    def project_holds_anything(self, project_id: str) -> bool:
+        """Whether any memory, agent request, or folder still belongs to a project."""
+
+        row = self._connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM records WHERE status IN ('active', 'superseded', 'retired') "
+            "AND scope = 'project' AND project_id = ?) "
+            "OR EXISTS (SELECT 1 FROM project_paths WHERE project_id = ?) "
+            "OR EXISTS (SELECT 1 FROM agent_tasks WHERE project_id = ?)",
+            (project_id, project_id, project_id),
+        ).fetchone()
+        return bool(row[0])
+
+    def project_records(self, project_id: str) -> list[RecordRow]:
+        """All of a project's own memories, retired and replaced ones too, oldest first."""
+
+        rows = self._connection.execute(
+            f"SELECT {_COLUMNS} {_FROM} WHERE r.project_id = ? ORDER BY r.seq", (project_id,),
+        ).fetchall()
+        return [RecordRow.from_row(row) for row in rows]
+
+    def move_project_tasks(self, old_id: str, new_id: str, *, now: str) -> int:
+        cursor = self._connection.execute(
+            "UPDATE agent_tasks SET project_id = ?, updated_at = ? WHERE project_id = ?", (new_id, now, old_id),
+        )
+        return cursor.rowcount
+
+    def move_project_paths(self, old_id: str, new_id: str) -> None:
+        """Give one project's folders to another (this computer's own list; it is not shared)."""
+
+        self._connection.execute(
+            "INSERT INTO project_paths (project_id, path, last_seen_at) SELECT ?, path, last_seen_at "
+            "FROM project_paths WHERE project_id = ? ON CONFLICT (project_id, path) DO NOTHING",
+            (new_id, old_id),
+        )
+        self._connection.execute("DELETE FROM project_paths WHERE project_id = ?", (old_id,))
+
     def candidate_origin(self, record_id: str) -> tuple[str | None, str | None]:
         """The agent and project of the chat a memory was learned from, from its learning candidate."""
 
@@ -1149,10 +1219,16 @@ class Store:
         return dict(rows[0]) if len(rows) == 1 else None
 
     def all_project_paths(self) -> list[tuple[str, str, str]]:
-        """Every folder any project was seen in, with the project's id and name."""
+        """Every folder any project was seen in, with the id and name of the project seen there last.
+
+        A folder belongs to one project at a time: one whose repository gained or changed its remote
+        belongs to its new project, not to the one it was before.
+        """
 
         rows = self._connection.execute(
-            "SELECT pp.project_id, p.name, pp.path FROM project_paths pp JOIN projects p ON p.id = pp.project_id",
+            "SELECT project_id, name, path FROM (SELECT pp.project_id, p.name, pp.path, ROW_NUMBER() OVER "
+            "(PARTITION BY pp.path ORDER BY pp.last_seen_at DESC, pp.project_id) AS newest "
+            "FROM project_paths pp JOIN projects p ON p.id = pp.project_id) WHERE newest = 1",
         ).fetchall()
         return [(row[0], row[1], row[2]) for row in rows]
 
@@ -1273,18 +1349,6 @@ class Store:
         return int(self._connection.execute(
             "SELECT COUNT(*) FROM records WHERE status != 'active' AND retired_reason LIKE ? AND updated_at >= ?",
             (reason_prefix.replace("%", "") + "%", since),
-        ).fetchone()[0])
-
-    def count_user_questions(self, *, overdue_before: str, checking_before: str | None = None) -> int:
-        """Open questions waiting for the user: handed over, not reviewed since ``overdue_before``, or asked
-        before ``checking_before`` and still waiting for an agent's check (see ``review.for_user``)."""
-
-        return int(self._connection.execute(
-            "SELECT COUNT(*) FROM questions q LEFT JOIN question_stages s ON s.question_id = q.id "
-            "WHERE q.status = 'open' AND (s.stage = 'ask_user' "
-            "OR (COALESCE(s.stage, 'review') = 'review' AND q.created_at < ?) "
-            "OR (s.stage = 'checking' AND q.created_at < ?))",
-            (overdue_before, checking_before or ""),
         ).fetchone()[0])
 
     def count_open_questions(self) -> int:

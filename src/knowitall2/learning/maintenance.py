@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from .. import journal, review
-from ..memory import VERIFICATION_STRENGTH, Memory, may_replace_unasked, same_statement, significant_words
+from ..memory import VERIFICATION_STRENGTH, Memory, is_users_choice, may_replace_unasked, significant_words
 from ..store import RecordRow
 from .extractor import ClaudeCliExtractor, CodexCliExtractor, ExtractionError, payload_items
 from .state import MAX_FAILURES, LearnerState
@@ -358,17 +358,21 @@ def apply_finding(
     if kind == "duplicate":
         # The model's choice is the most complete copy. It replaces only copies whose
         # evidence is no stronger: weaker evidence never retires a better-verified
-        # memory, and a terser verified copy never retires a fuller one. One of the
-        # user's statements gives way only to the same statement said again; between
-        # two that differ (a rule and a note, or other words), the user decides.
+        # memory, and a terser verified copy never retires a fuller one. The user's
+        # words merge like any others (each copy still counts toward how often the
+        # user said it, ``Store.times_said``); a rule is never merged into a
+        # preference that says the same: the preference goes into the rule.
         keep = current[keep_id]
         for item in ids:
             record = current[item]
             if VERIFICATION_STRENGTH[record.verification] > VERIFICATION_STRENGTH[keep.verification]:
                 outcomes.append("kept (better verified)")
-            elif record.verification == "user_stated" and not same_statement(record, kind=keep.kind, text=keep.text):
-                outcomes.append(_asked(review.ask_conflict(memory, record, keep)))
-                busy.update((record.id, keep.id))
+            elif record.kind == "rule" and keep.kind != "rule":
+                memory.store.supersede(
+                    keep.id, record.id, now=now, reason=f"{REASON_PREFIX}duplicate of [{record.id}]{detail}",
+                )
+                outcomes.append(changed("merged duplicate", keep, record, reason))
+                keep = record
             else:
                 memory.store.supersede(
                     record.id, keep.id, now=now, reason=f"{REASON_PREFIX}duplicate of [{keep.id}]{detail}",
@@ -389,9 +393,8 @@ def apply_finding(
     elif kind == "snapshot":
         for item in ids:
             record = current[item]
-            if record.verification == "user_stated":
-                outcomes.append(_asked(review.ask_still_true(memory, record)))
-                busy.add(record.id)
+            if is_users_choice(record):
+                outcomes.append("kept (the user's own)")   # what the user wants is not a status
             elif record.kind in SNAPSHOT_KINDS:
                 memory.store.retire(record.id, reason=f"{REASON_PREFIX}temporary status{detail}", now=now)
                 outcomes.append(changed("retired snapshot", record, None, reason))

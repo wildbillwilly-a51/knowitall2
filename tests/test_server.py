@@ -14,7 +14,7 @@ from pathlib import Path
 from secrets import token_urlsafe
 from unittest import mock
 
-from _support import Clock
+from _support import Clock, make_repository
 
 from knowitall2 import cli, sync
 from knowitall2.memory import Memory
@@ -186,6 +186,24 @@ class ExchangeTests(TemporaryFolder):
         sync.apply_pulled(self.b, found["changes"], cursor=found["next"])
         self.assertIn("build-1", Memory(self.b).recall("build server", project_path=self.plain))
         self.assertEqual(sync.changes_since(self.server, found["next"])["changes"], [])
+
+    def test_memories_rejoined_when_a_repository_gains_a_remote_follow_on_every_computer(self) -> None:
+        folder = make_repository(self.root / "gamma")
+        memory = Memory(self.a, agent="codex", clock=Clock(NOW))
+        saved = memory.remember("Gamma builds with make dist.", scope="project", project_path=folder).record.id
+        self.send(self.a, "c-a")
+        sync.apply_pulled(self.b, sync.changes_since(self.server, 0)["changes"])
+        (folder / ".git" / "config").write_text(
+            '[remote "origin"]\n\turl = https://gitlab.example.com/team/gamma.git\n', encoding="utf-8")
+
+        project = Memory(self.a, agent="codex", clock=Clock("2026-10-02T12:00:00Z")).project_for(folder)
+        self.assertEqual([("projects", project.id, "upsert"), ("records", saved, "upsert")], changed(self.a))
+        self.assertEqual({"applied"}, {answer["result"] for answer in self.send(self.a, "c-a")})
+        on_server = sync.read_row(self.server.connection, sync.table_for("records"), saved)
+        self.assertEqual(project.id, on_server["project_id"])
+        sync.apply_pulled(self.b, sync.changes_since(self.server, 0)["changes"])
+        self.assertEqual(project.id, self.b.get(saved).project_id)
+        self.assertIn(saved, Memory(self.b).recall("make dist", project_path=folder, scope="project"))
 
     def test_changes_come_in_pages_with_each_row_once(self) -> None:
         for number in range(5):

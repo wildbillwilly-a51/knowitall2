@@ -30,12 +30,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from . import journal
-from .memory import QUESTION_CHECK_DAYS, QUESTION_REVIEW_DAYS, QUESTIONS_SHOWN_KEY, Memory, MemoryInputError
+from .memory import QUESTION_CHECK_DAYS, QUESTION_REVIEW_DAYS, Memory, MemoryInputError, is_users_choice
 from .store import RecordRow, Store
 
 UNCONFIRMED_RULE_PREFIX = "Possible rule, not confirmed by the user: "
 LIST_LIMIT = 5
 STAGES = ("review", "checking", "ask_user")
+# A question reaches a chat only when it is about that chat's project: at most this many at once, and in at most
+# this many chats; the rest wait in the app (the user, 2026-10-11: "a question or two, if they are relevant to that
+# chat", never in every chat).
+CHAT_QUESTIONS = 2
+QUESTION_CHAT_OFFERS = 2
+_OFFERED = "question_offered:"
+# A question no one answered within this time closes with nothing changed: both memories are kept.
+QUESTION_EXPIRE_DAYS = 30
 CHECK_OFFERS = 6
 CHECK_DAYS = QUESTION_CHECK_DAYS
 FIND_OUT_OFFERS = 12
@@ -142,6 +150,58 @@ def for_user(store: Store, *, limit: int = 100, now: datetime | None = None) -> 
     return waiting[:limit]
 
 
+def question_project(store: Store, question: dict[str, Any]) -> str | None:
+    """The project a question is about: its memories' own, or the one of the chat they were learned in."""
+
+    for record_id in question["record_ids"]:
+        record = store.get(record_id)
+        if record is not None and record.project_id:
+            return record.project_id
+    return _learned_in(store, list(question["record_ids"]))
+
+
+def times_offered(store: Store, question_id: str) -> int:
+    try:
+        return int(store.get_meta(_OFFERED + question_id) or 0)
+    except ValueError:
+        return 0
+
+
+def for_chat(store: Store, project_id: str | None, *, now: datetime | None = None,
+             offers: int = QUESTION_CHAT_OFFERS) -> list[dict[str, Any]]:
+    """The user's questions a chat in this project may raise: about its memories, and not yet raised in
+    ``offers`` chats. None outside a project."""
+
+    if not project_id:
+        return []
+    return [question for question in for_user(store, now=now)
+            if times_offered(store, question["id"]) < offers and question_project(store, question) == project_id
+            ][:CHAT_QUESTIONS]
+
+
+def offer_in_chat(store: Store, questions: Sequence[dict[str, Any]]) -> None:
+    """Count a chat that was told about these questions."""
+
+    for question in questions:
+        store.set_meta(_OFFERED + question["id"], str(times_offered(store, question["id"]) + 1))
+
+
+def expire_unanswered(memory: Memory) -> int:
+    """Close the questions no one answered within ``QUESTION_EXPIRE_DAYS``, changing nothing; how many."""
+
+    moment = _parse(memory.now())
+    closed = 0
+    for question in memory.store.open_questions(limit=500):
+        if _parse(question["created_at"]) >= moment - timedelta(days=QUESTION_EXPIRE_DAYS):
+            continue
+        with memory.store.transaction():
+            if memory.store.close_question(question["id"], answer=f"no answer in {QUESTION_EXPIRE_DAYS} days; "
+                                           "nothing was changed", now=memory.now()):
+                _close_tasks(memory, question["id"], "done")
+                closed += 1
+    return closed
+
+
 def in_progress(store: Store, *, now: datetime | None = None) -> list[dict[str, Any]]:
     """Open questions KnowItAll2 or an agent is still looking into."""
 
@@ -220,18 +280,28 @@ def plain_fallback(store: Store, question: dict[str, Any]) -> str:
     return question["prompt"]
 
 
-def list_questions(memory: Memory, *, limit: int = LIST_LIMIT, how_to_answer: str | None = None) -> str:
-    """The questions waiting for the user, in plain words, for an agent to show the user (or for the user)."""
+def list_questions(memory: Memory, *, limit: int = LIST_LIMIT, how_to_answer: str | None = None,
+                   chat_project: str | None = None, in_chat: bool = False) -> str:
+    """The questions waiting for the user, in plain words, for the user (the command line) or for an agent to
+    show the user (``in_chat``: only those about the chat's project, ``chat_project``, at most two)."""
 
-    questions = for_user(memory.store, now=_parse(memory.now()))
-    memory.store.set_meta(QUESTIONS_SHOWN_KEY, memory.now())
-    if not questions:
-        return "KnowItAll2 has no questions for the user."
+    moment = _parse(memory.now())
+    if in_chat:
+        # The briefing that told the chat about them already counted it as one of their chats.
+        questions = for_chat(memory.store, chat_project, now=moment, offers=QUESTION_CHAT_OFFERS + 1)
+        if not questions:
+            return "KnowItAll2 has no questions about this project's memories for the user."
+    else:
+        questions = for_user(memory.store, now=moment)
+        if not questions:
+            return "KnowItAll2 has no questions for the user."
     guidance = how_to_answer or (
         "Before asking the user, look into each question yourself: recall its memories and check the files they "
         "name. Then tell the user what you found and the answer you recommend, and record each choice with the "
-        "answer tool once the user makes it.")
-    lines = [f"KnowItAll2 has {len(questions)} question(s) for the user. {guidance}"]
+        "answer tool once the user makes it. Ask them once, at a natural point in this chat; if the user does not "
+        "answer, let them be.")
+    about = " about this project's memories" if in_chat else ""
+    lines = [f"KnowItAll2 has {len(questions)} question(s){about} for the user. {guidance}"]
     for question in questions[:limit]:
         lines.append(f"[{question['id']}] {question['plain']}")
         if question.get("context"):
@@ -303,7 +373,7 @@ def settle(memory: Memory, question: dict[str, Any], choice: str, *, by: str, ev
             _close_tasks(memory, current["id"], "done")
             return f"[{current['id']}] no longer applies: its memories had already changed; nothing was changed."
         older, newer = records
-        if choice == "use_new" and older.verification == "user_stated":
+        if choice == "use_new" and (is_users_choice(older) or (older.verification == "user_stated" and not checked)):
             return None
         if choice == "keep_mine" and newer.verification == "user_stated":
             return None

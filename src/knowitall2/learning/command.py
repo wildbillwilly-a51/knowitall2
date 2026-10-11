@@ -306,7 +306,7 @@ def news_entry(report: LearnReport, settings: LearnerSettings, *, reason: str, r
             questions += outcome == "saved with a question"
         elif outcome == "updated":
             updated.append(item)
-        elif outcome == "already known":
+        elif outcome in ("already known", "said again"):
             known += 1
         elif outcome.startswith("rejected"):
             turned_down.append({"text": item["text"], "reason": outcome[len("rejected ("):-1]})

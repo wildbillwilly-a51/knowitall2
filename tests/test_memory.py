@@ -1,11 +1,15 @@
+import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from secrets import token_urlsafe
+from unittest import mock
 
 from _support import Clock, make_repository
 
-from knowitall2.identity import find_git_root
+from knowitall2 import chats, journal
+from knowitall2.identity import find_git_root, identify, identify_remote
 from knowitall2.memory import Memory, MemoryInputError, fts_query
 from knowitall2.server import accounts
 from knowitall2.store import Store
@@ -126,11 +130,11 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(MemoryInputError):
             self.memory.forget("k-missing")
 
-    def test_an_agent_cannot_replace_the_users_statement(self) -> None:
+    def test_an_agent_cannot_replace_what_the_user_wants(self) -> None:
         stated = self.remember("Never deploy to production on Fridays.", kind="rule", source="user").record
         newer = self.remember("Deploying on Fridays is fine.", replaces=stated.id)
         self.assertEqual(("saved", None), (newer.status, newer.replaced))
-        self.assertIn(f"[{stated.id}] is the user's own statement", newer.describe())
+        self.assertIn(f"[{stated.id}] is what the user wants, in their own words", newer.describe())
         self.assertIn("the user will be asked", newer.describe())
         self.assertEqual("active", self.store.get(stated.id).status)
         [question] = self.store.open_questions(limit=5)
@@ -143,6 +147,20 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(("active", 2), (self.store.get(seen.id).status, self.store.count_open_questions()))
         said = self.remember("The build server is build03.", source="user", replaces=seen.id)
         self.assertEqual(seen.id, said.replaced.id)
+
+    def test_what_an_agent_observed_corrects_what_the_user_said_about_a_system(self) -> None:
+        # Context, not law (the user, 2026-10-11): the user's word on a system gives way to an observation, though
+        # not to a guess, and an agent may forget it when it is wrong.
+        stated = self.remember("The NAS backup runs nightly at 02:00.", source="user").record
+        guess = self.remember("The NAS backup probably runs weekly.", replaces=stated.id)
+        self.assertIsNone(guess.replaced)
+        self.assertIn("only something observed corrects it", guess.describe())
+        seen = self.remember("The NAS backup runs weekly on Sundays at 02:00.", source="observed", replaces=stated.id)
+        self.assertEqual(stated.id, seen.replaced.id)
+        self.assertEqual("superseded", self.store.get(stated.id).status)
+        wrong = self.remember("The NAS is called nas01.", source="user").record
+        self.assertIn("Forgot", self.memory.forget(wrong.id, reason="it is called file1"))
+        self.assertEqual("retired", self.store.get(wrong.id).status)
 
     def test_an_agent_asks_before_forgetting_the_users_statement(self) -> None:
         stated = self.remember("Keep the NAS backups for a year.", kind="rule", source="user").record
@@ -413,6 +431,148 @@ class MemoryTests(unittest.TestCase):
             self.skipTest("the temporary folder is inside a Git repository")
         with self.assertRaises(MemoryInputError):
             self.memory.remember("Only here.", scope="project", project_path=plain)
+
+
+class RemoteAddedLaterTests(unittest.TestCase):
+    """A repository is known by its folder until it has a remote; what was saved before follows it."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.folder = make_repository(self.root / "gamma")
+        self.clock = Clock("2026-10-01T09:00:00Z")
+        self.store = Store.in_memory()
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.temporary.cleanup()
+
+    def memory(self) -> Memory:
+        """The memory of a new process, which has not looked at any folder yet."""
+
+        return Memory(self.store, agent="codex", clock=self.clock)
+
+    def add_remote(self, folder: Path, url: str = "https://gitlab.example.com/team/gamma.git") -> None:
+        (folder / ".git" / "config").write_text(f'[remote "origin"]\n\turl = {url}\n', encoding="utf-8")
+
+    def project_of(self, record_id: str) -> str:
+        return self.store.get(record_id).project_id
+
+    def test_memories_saved_before_the_remote_follow_the_repository(self) -> None:
+        memory = self.memory()
+        before = memory.project_for(self.folder)
+        kept = memory.remember("Gamma builds with make dist.", scope="project", project_path=self.folder)
+        other = memory.remember("Gamma's tests need a running cache.", scope="project", project_path=self.folder)
+        retired = memory.remember("Gamma deploys by copying files.", scope="project", project_path=self.folder)
+        memory.forget(retired.record.id, reason="outdated")
+        retired_at = self.store.get(retired.record.id).updated_at
+        self.store.add_task(task_id="t-1", kind="check", prompt="Check the build.", now=self.clock(),
+                            project_id=before.id)
+        self.add_remote(self.folder)
+        self.clock.value = "2026-10-02T09:00:00Z"
+
+        memory = self.memory()
+        after = memory.project_for(self.folder)
+        self.assertIsNotNone(after.remote)
+        self.assertNotEqual(before.id, after.id)
+        for saved in (kept, other, retired):
+            self.assertEqual(after.id, self.project_of(saved.record.id))
+        self.assertIn(kept.record.id, memory.recall("make dist", project_path=self.folder, scope="project"))
+        self.assertIn(other.record.id, memory.briefing(project_path=self.folder))
+        # Still the same memories: none is new, and the retired one keeps its place in the history.
+        self.assertEqual("2026-10-01T09:00:00Z", self.store.get(kept.record.id).created_at)
+        self.assertEqual(retired_at, self.store.get(retired.record.id).updated_at)
+        self.assertEqual(after.id, self.store.task("t-1")["project_id"])
+        self.assertEqual([after.id], [item[0] for item in self.store.all_project_paths()])
+        self.assertIsNotNone(self.store.project_row(before.id))  # never deleted, so no computer is told to
+        moves = self.store.events(kinds=["move"], limit=5)
+        self.assertEqual(["rejoined"], [event["outcome"] for event in moves])
+        self.assertIn("under project gamma: 2 memories, 1 retired or replaced.", moves[0]["summary"])
+        # A restore brings the retired one back here, and saying it again finds it.
+        memory.restore(retired.record.id)
+        again = memory.remember("Gamma deploys by copying files.", scope="project", project_path=self.folder)
+        self.assertEqual(("already_known", retired.record.id), (again.status, again.record.id))
+        self.assertIsNone(self.memory().rejoin(after))
+
+    def test_a_memory_the_project_already_has_is_kept_once(self) -> None:
+        early = self.memory().remember("Gamma builds with make dist.", scope="project", project_path=self.folder)
+        clone = make_repository(self.root / "clone", "git@gitlab.example.com:team/gamma.git")
+        later = self.memory().remember("Gamma builds with make dist.", scope="project", project_path=clone)
+        self.add_remote(self.folder)
+
+        self.memory().project_for(self.folder)
+        row = self.store.get(early.record.id)
+        self.assertEqual(("superseded", later.record.id), (row.status, row.superseded_by))
+        self.assertEqual(self.project_of(later.record.id), row.project_id)
+        found = self.memory().recall("make dist", project_path=self.folder)
+        self.assertIn(later.record.id, found)
+        self.assertNotIn(early.record.id, found)
+
+    def test_nothing_moves_without_a_remote_or_between_remotes(self) -> None:
+        saved = self.memory().remember("Gamma builds with make dist.", scope="project", project_path=self.folder)
+        local = self.memory().project_for(self.folder)
+        self.assertIsNone(self.memory().rejoin(local))
+        self.assertEqual(local.id, self.project_of(saved.record.id))
+
+        self.add_remote(self.folder)
+        first = self.memory().project_for(self.folder)
+        self.assertEqual(first.id, self.project_of(saved.record.id))
+        # Another remote is another project, which other copies of the first one still are: nothing moves,
+        # but the folder belongs to the new one alone, so work there is no longer filed under the first.
+        self.add_remote(self.folder, "https://gitlab.example.com/archive/gamma.git")
+        self.clock.value = "2026-10-03T09:00:00Z"
+        second = self.memory().project_for(self.folder)
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(first.id, self.project_of(saved.record.id))
+        self.assertEqual([second.id], [item[0] for item in self.store.all_project_paths()])
+
+    def test_work_in_the_folder_counts_for_the_project_it_is_now(self) -> None:
+        # The live case: learning filed 86 memories under the folder's old project after the remote was added,
+        # because the folder was listed under both projects and the old one matched the chats' tool calls first.
+        self.store.touch_project(identify(self.folder), self.clock())
+        self.add_remote(self.folder)
+        self.clock.value = "2026-10-02T09:00:00Z"
+        project = identify(self.folder)
+        self.store.touch_project(project, self.clock())
+        calls = [f"cat {project.root / 'README.md'}"] * 3
+        self.assertEqual({project.id: 3}, chats.projects_worked_in(calls, self.store.all_project_paths()))
+
+    def test_rejoin_everywhere_reaches_folders_no_one_works_in_again(self) -> None:
+        memory = self.memory()
+        saved = memory.remember("Gamma builds with make dist.", scope="project", project_path=self.folder)
+        gone = make_repository(self.root / "delta")
+        lost = memory.remember("Delta listens on port 8080.", scope="project", project_path=gone)
+        self.add_remote(self.folder)
+        self.add_remote(gone, "https://gitlab.example.com/team/delta.git")
+        # As an older version left it: the folder seen under its new project, its memories still under the old.
+        self.clock.value = "2026-10-02T09:00:00Z"
+        self.store.touch_project(identify(gone), self.clock())
+        shutil.rmtree(gone)
+
+        preview = self.memory().rejoin_everywhere(dry_run=True).splitlines()
+        self.assertEqual(2, len(preview), preview)
+        self.assertTrue(all(line.startswith("Would file") and line.endswith(": 1 memory.") for line in preview))
+        self.assertNotEqual(identify(self.folder).id, self.project_of(saved.record.id))
+        report = self.memory().rejoin_everywhere()
+        self.assertIn("under project gamma", report)
+        self.assertIn("under project delta", report)
+        self.assertEqual(identify(self.folder).id, self.project_of(saved.record.id))
+        self.assertEqual(identify_remote("https://gitlab.example.com/team/delta.git").id,
+                         self.project_of(lost.record.id))
+        self.assertIn("Nothing to rejoin", self.memory().rejoin_everywhere())
+
+    def test_a_failed_rejoin_never_stops_the_work(self) -> None:
+        saved = self.memory().remember("Gamma builds with make dist.", scope="project", project_path=self.folder)
+        self.add_remote(self.folder)
+        failure = sqlite3.OperationalError("disk I/O error")
+        with mock.patch.object(Store, "project_records", side_effect=failure), \
+                mock.patch.object(journal, "problem") as problem:
+            text = self.memory().briefing(project_path=self.folder)
+        self.assertIn("briefing for project gamma", text)
+        self.assertTrue(any("disk I/O error" in call.args[1] for call in problem.call_args_list))
+        self.assertNotEqual(identify(self.folder).id, self.project_of(saved.record.id))  # all or nothing
+        self.memory().project_for(self.folder)
+        self.assertEqual(identify(self.folder).id, self.project_of(saved.record.id))
 
 
 if __name__ == "__main__":

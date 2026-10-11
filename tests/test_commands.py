@@ -215,6 +215,27 @@ class TaggingTests(CommandTestCase):
         self.assertEqual(3, len(command_tags.waiting(self.store)))
 
 
+    def test_a_batch_the_model_refuses_is_tried_in_small_groups_and_never_holds_up_the_rest(self) -> None:
+        # 2026-10-11: the model's safeguards refused a batch of Cisco access point certificate lessons, and each
+        # background run would have asked for that same batch again, with every new lesson waiting behind it.
+        from knowitall2.learning.extractor import ExtractionError
+
+        refusal = ExtractionError("the Claude CLI reported: API Error: safeguards flagged this session")
+        refused = [self.lesson(f"Lesson {number}: the access point rejects the controller certificate unless "
+                               "--chain is passed.") for number in range(7)]
+        report = command_tags.tag_commands(self.store, FakeEngine(refusal), budget=1, now="now")
+        self.assertEqual((1, 7, None), (report.calls, report.refused, report.blocked))
+        self.assertIn("The model refused 7", report.describe())
+        newer = self.lesson("Lesson: sleep is blocked here, so wait with a loop that checks instead.")
+        self.assertEqual([newer, *sorted(refused)], [command_tags.waiting(self.store)[0].id, *sorted(
+            record.id for record in command_tags.waiting(self.store)[1:])])
+        engine = FakeEngine({"lessons": [{"id": newer, "command": "sleep", "where": ""}]}, refusal, refusal)
+        report = command_tags.tag_commands(self.store, engine, budget=5, now="now")
+        self.assertEqual((3, 1, 7), (report.calls, report.tagged, report.refused))
+        self.assertEqual([1, 5, 2], [text.count("[k-") for text in engine.inputs])   # the refused, five at a time
+        self.assertEqual([], command_tags.waiting(self.store))   # refused twice: left out for good
+
+
 class UpkeepShareTests(CommandTestCase):
     def test_catching_up_leaves_calls_for_maintenance_the_catalog_and_commands(self) -> None:
         # Waiting sessions took every call of every run, and maintenance made none in a week (2026-10-11).
