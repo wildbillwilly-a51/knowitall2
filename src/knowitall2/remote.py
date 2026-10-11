@@ -77,6 +77,8 @@ class RemoteClient:
                 message = found.get("error") if isinstance(found, dict) else None
             except (ValueError, OSError):
                 message = None
+            finally:
+                exc.close()   # its response, left open, was reported as a ResourceWarning and once failed a test
             if not message and exc.code in PROXY_UNREACHABLE:
                 # A proxy in front of the server (such as Traefik) answers for it when it is stopped.
                 raise RemoteError(f"cannot reach the KnowItAll2 server at {self.address}: a proxy between here "

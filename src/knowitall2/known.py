@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
-from . import journal
+from . import commands, journal
 from .files import read_text, write_text_atomic
 from .paths import data_home, database_path
 
@@ -182,8 +182,10 @@ def change_marker(connection: sqlite3.Connection) -> str:
         "(SELECT COUNT(*) FROM records WHERE status = 'active'), (SELECT MAX(updated_at) FROM records), "
         "(SELECT MAX(seq) FROM records), (SELECT COUNT(*) FROM record_notes), (SELECT MAX(written_at) FROM record_notes), "
         "(SELECT MAX(updated_at) FROM systems), (SELECT COUNT(*) FROM systems), (SELECT COUNT(*) FROM projects), "
-        "(SELECT COUNT(*) FROM project_paths)",
-        (KNOWN_GENERATION,),
+        "(SELECT COUNT(*) FROM project_paths), "
+        # What ``commands.json`` holds: the lessons tagged with a command (a tag alone changes nothing above).
+        "(SELECT COUNT(*) || ':' || IFNULL(MAX(updated_at), '') FROM records WHERE status = 'active' AND tags LIKE ?)",
+        (KNOWN_GENERATION, f"%{commands.COMMAND_TAG}%"),
     ).fetchone()
     return "|".join(str(value) for value in row)
 
@@ -375,6 +377,10 @@ def refresh(connection: sqlite3.Connection, *, force: bool = False) -> RefreshRe
     if not force and status.get("marker") == marker:
         return RefreshReport(marker, unchanged=True)
     files = render(connection)
+    try:
+        commands.write_index(connection, data_home())
+    except OSError as exc:
+        journal.problem("knowledge files", f"the command index could not be written: {exc}")
     report = RefreshReport(marker)
     for root in project_roots(connection):
         try:
@@ -405,6 +411,8 @@ def remove_all(connection: sqlite3.Connection | None) -> list[str]:
             changes.extend(remove_folder(root))
         except OSError as exc:
             changes.append(f"could not clean {root}: {exc}")
+    # Off means off: no reminders before commands either.
+    (data_home() / commands.INDEX).unlink(missing_ok=True)
     _write_status({"marker": None, "at": journal.utc_now(), "folders": []})
     return changes
 
@@ -443,7 +451,7 @@ def _write_status(data: dict[str, Any]) -> None:
 
 # --- Pointing an agent to the right file ----------------------------------------------------------------
 
-# A chat is pointed to a file once, when the user's message or the agent's own tool calls name a system or
+# A chat is pointed to a file once, when the user's message or the agent's own words name a system or
 # project the folder has a file about. The pointer says only where the knowledge is, never what it says.
 POINTERS_PER_MESSAGE = 3
 POINTER_TEXT_LIMIT = 200_000
@@ -451,6 +459,7 @@ POINTER_MINIMUM_CHARACTERS = 4
 POINTER_MINIMUM_MEMORIES = 3
 POINTER_LOG = "pointers.jsonl"
 POINTER_LOG_KEPT = 2000
+OWN_NAME = "knowitall2"   # the word that names the file about KnowItAll2 itself
 _WORD = re.compile(r"[^\W_]+")
 
 
@@ -515,18 +524,25 @@ def _word_table(entries: Sequence[tuple[str, str, Sequence[str]]]) -> dict[tuple
 
 
 def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: Path,
-                  shown: Sequence[str]) -> list[tuple[str, str]]:
-    """Files in ``folder`` that ``texts`` name and this chat has not been pointed to, with the line to show."""
+                  shown: Sequence[str], *, own_words: Sequence[str] = ()) -> list[tuple[str, str]]:
+    """Files in ``folder`` that ``texts`` (the user's) or ``own_words`` (the agent's) name and this chat has not
+    been pointed to, with the line to show.
+
+    KnowItAll2's own name in the agent's words points nowhere: agents pass on its news ("KnowItAll2 learned
+    ..."), which pointed them to its file in every project (2026-10-10: 24 of 165 pointers, one opened).
+    """
 
     if not ours(folder):
         return []
     table = name_table(connection)
     if not table:
         return []
-    text = "\n".join(str(item)[:POINTER_TEXT_LIMIT] for item in texts if item)
+    itself = table.get((OWN_NAME,))
+    targets = named(_joined(texts), table)
+    targets += [target for target in named(_joined(own_words), table) if target != itself and target not in targets]
     found: list[tuple[str, str, int]] = []
     rejected: set[str] = set()
-    for target in named(text, table):
+    for target in targets:
         if target in shown or target in rejected:
             continue
         try:
@@ -544,6 +560,10 @@ def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: 
             break
     return [(target, f"KnowItAll2: what is known about {title} is in {FOLDER}/{target} ({count} memories); "
                      "read or search it before working this out again.") for target, title, count in found]
+
+
+def _joined(texts: Sequence[str]) -> str:
+    return "\n".join(str(item)[:POINTER_TEXT_LIMIT] for item in texts if item)
 
 
 def _not_a_mention(text: str, start: int, end: int) -> bool:

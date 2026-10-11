@@ -248,8 +248,8 @@ def _pointers(payload: dict[str, Any], store: Any, said: Sequence[str], state: d
         root = find_git_root(Path(cwd))
         if root is None:
             return []
-        texts = [_text(payload, "prompt") or "", *said]
-        return known.find_pointers(store._connection, texts, root / known.FOLDER, state.get("pointed", []))
+        return known.find_pointers(store._connection, [_text(payload, "prompt") or ""], root / known.FOLDER,
+                                   state.get("pointed", []), own_words=said)
     except Exception as exc:
         journal.problem("message hook", f"knowledge-file pointers could not be found: {type(exc).__name__}: {exc}")
         return []

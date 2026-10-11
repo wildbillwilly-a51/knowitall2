@@ -246,6 +246,19 @@ class ValidationTests(LearningTestCase):
                 "scope": "global", "evidence": "Checking the router."}
         return validate({**base, **candidate}, self.dossier)
 
+    def test_where_some_work_stood_is_not_kept(self) -> None:
+        # A catch-up of a day-old chat saved this after the fix had been released (2026-10-10).
+        for text in ("The audit defects were reproduced (not yet fixed as of 2026-10-09, on 0.10.2).",
+                     "The force-provision change is committed on its branch, not yet deployed to the sidecar.",
+                     "Recommended fix, not yet been implemented: an auth-check timer with an alert path."):
+            with self.subTest(text=text):
+                self.assertEqual((None, "work state"), self.check(text=text))
+        for text in ("For scripted Codex runs where the hook is not yet trusted, pass --dangerously-bypass-hook-trust.",
+                     "Adoption works only in state 2; HTTP 400 means the device is not yet in the pending list."):
+            with self.subTest(text=text):
+                checked, reason = self.check(text=text)
+                self.assertIsNone(reason)
+
     def test_a_near_quote_allows_a_few_retyped_words_but_not_paraphrase_or_stitching(self) -> None:
         from knowitall2.learning.learner import _nearly_quoted_in
 

@@ -127,7 +127,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
-                    "decision": {"type": "string", "enum": ["use_new", "keep_mine", "keep_both", "unsure"]},
+                    "decision": {"type": "string",
+                                 "enum": ["use_new", "keep_mine", "keep_both", "keep_note", "forget", "unsure"]},
                     "certain": {"type": "boolean"},
                     "reason": {"type": "string"},
                     "plain_question": {"type": "string"},
@@ -152,8 +153,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
 
 REVIEW_PROMPT = """You help keep the long-term memory of a user's coding agents accurate. Each item is a question KnowItAll2 has about its memories, with the memories involved, how and when each was learned, and related memories. For every question return:
 - id: the question's id.
-- decision: for kind "conflict": "use_new" when the newer memory is right and replaces the older one, "keep_mine" when the older one is still right, "keep_both" when they do not really conflict (for example they describe different things or different times), or "unsure". For every other kind: "unsure", because only the user can answer those.
-- certain: true only when the memories themselves make the answer clear, for example the newer one records a later observation of the same thing, or one is plainly a guess that the other disproves. When in doubt, false.
+- decision: for kind "conflict": "use_new" when the newer memory is right and replaces the older one, "keep_mine" when the older one is still right, "keep_both" when they do not really conflict (for example they describe different things or different times), or "unsure". For kind "confirm_rule" (a possible rule an agent guessed the user holds): "forget" when a rule or decision the user already stated says the same thing, or a later statement of the user contradicts it; "keep_note" when it plainly applied only to that one piece of work; otherwise "unsure", because only the user can make something one of their rules. For every other kind: "unsure".
+- certain: true only when the memories themselves make the answer clear, for example the newer one records a later observation of the same thing, one is plainly a guess that the other disproves, or the user's own rule shown among the related memories says the same as the possible rule. When in doubt, false.
 - reason: one plain sentence explaining the decision, or why it is unclear.
 - plain_question: the question rewritten for someone who is not a developer, at most 200 characters. Say what it is about and why it matters. No ids, paths, or jargon.
 - labels: for every option key listed with the question, a short plain answer label.
@@ -508,7 +509,11 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
         plain = _clean(item.get("plain_question"), 240) or None
         reason = _clean(item.get("reason"), 240) or None
         decision = item.get("decision")
-        if question["kind"] == "conflict" and item.get("certain") is True and decision in keys:
+        # A possible rule that repeats or contradicts the user's own, or that was a one-off, needs no one's answer;
+        # making it a rule does, so that never happens here (``review.settle``).
+        settleable = question["kind"] == "conflict" or (question["kind"] == "confirm_rule"
+                                                         and decision in ("keep_note", "forget"))
+        if settleable and item.get("certain") is True and decision in keys:
             outcome = review.settle(memory, question, decision, by="KnowItAll2", evidence=reason or "")
             if outcome:
                 # Settled now, or meanwhile by someone else (already answered, memories changed): done either way.

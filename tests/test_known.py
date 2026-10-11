@@ -335,10 +335,12 @@ class RefreshTests(KnownTestCase):
             ("catalog",): "knowitall2.learning.command.run_catalog_command",
         }
         for argv, target in work.items():
-            with self.subTest(argv=argv), mock.patch(target, return_value=0),                     mock.patch("knowitall2.known.nudge") as refresh:
+            with self.subTest(argv=argv), mock.patch(target, return_value=0), \
+                    mock.patch("knowitall2.known.nudge") as refresh:
                 self.assertEqual(0, cli.main(list(argv)))
                 refresh.assert_called_once_with()
-        with mock.patch("knowitall2.learning.command.run_learn", side_effect=RuntimeError("stopped")),                 mock.patch("knowitall2.known.nudge") as refresh, self.assertRaises(RuntimeError):
+        with mock.patch("knowitall2.learning.command.run_learn", side_effect=RuntimeError("stopped")), \
+                mock.patch("knowitall2.known.nudge") as refresh, self.assertRaises(RuntimeError):
             cli.main(["learn"])
         refresh.assert_called_once_with()
 
@@ -444,6 +446,20 @@ class PointerTests(KnownTestCase):
                 self.assertEqual([], known.find_pointers(self.connection, [text], folder, []))
         self.assertEqual(["synology.md"], [t for t, _ in known.find_pointers(
             self.connection, ["the files are on nas-file1/files/cisco ap"], folder, [])])   # a host first in a path
+
+    def test_knowitall2_named_in_the_agents_words_brings_no_pointer(self) -> None:
+        # Agents pass on KnowItAll2's news, which pointed them to its file in every project (2026-10-10).
+        folder = self.systems()
+        for number in range(3):
+            saved = self.remember(f"KnowItAll2 note {number}: run its update script.", scope="global")
+            self.file(saved.id, "KnowItAll2", aliases=["KIA2"])
+        known.refresh(self.connection)
+        news = ["KnowItAll2 learned 3 things from this session.", "KIA2 saved the NAS route."]
+        self.assertEqual([], known.find_pointers(self.connection, ["go on"], folder, [], own_words=news))
+        self.assertEqual(["synology.md"], [t for t, _ in known.find_pointers(
+            self.connection, ["go on"], folder, [], own_words=["KnowItAll2 learned how to reach nas-file1."])])
+        self.assertEqual(["knowitall2.md"], [t for t, _ in known.find_pointers(
+            self.connection, ["how do I update KnowItAll2?"], folder, [], own_words=news)])
 
     def test_no_pointer_without_the_folder_knowitall2_wrote(self) -> None:
         self.systems()

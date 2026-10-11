@@ -123,6 +123,8 @@ class Moved(BaseHTTPRequestHandler):
 
     def _answer(self) -> None:
         self.server.seen.append(self.headers.get("Authorization"))  # type: ignore[attr-defined]
+        # Read what was sent: Windows resets a connection closed with it unread, sometimes before the client reads the answer.
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self.send_response(self.server.status)  # type: ignore[attr-defined]
         self.send_header("Location", self.server.to)  # type: ignore[attr-defined]
         self.send_header("Content-Length", "0")

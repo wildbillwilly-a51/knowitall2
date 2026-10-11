@@ -362,6 +362,31 @@ class QuestionFlowTests(CatalogTestCase):
         waiting = {item["id"]: item for item in review.for_user(self.store, now=self.now)}
         self.assertEqual("Should agents never downgrade the camera controller?", waiting[rule["id"]]["plain"])
 
+    def test_a_possible_rule_that_needs_no_answer_is_settled_but_never_made_a_rule(self) -> None:
+        # All 17 questions waiting for the user on 2026-10-11 were possible rules; the review had already found
+        # some repeated a rule the user stated, or were one-offs, but could not close them.
+        def possible(text):
+            note = self.save(review.UNCONFIRMED_RULE_PREFIX + text, kind="note")
+            review.ask_rule(self.memory, note)
+            return note, next(item for item in self.store.open_questions(limit=10) if item["record_ids"] == [note.id])
+
+        repeated, about_repeated = possible("Credentials are referenced from Vaultwarden, never stored.")
+        one_off, about_one_off = possible("Use the blue receipt template for the October trip report.")
+        new, about_new = possible("Never downgrade the camera controller mid-run.")
+        engine = FakeEngine(review=[{"questions": [
+            {**self.decide(about_repeated, "forget", certain=True, reason="The user's own rule says the same.")
+             ["questions"][0]},
+            {**self.decide(about_one_off, "keep_note", certain=True, reason="It applied to one report.")
+             ["questions"][0]},
+            {**self.decide(about_new, "unsure", certain=False, reason="Only the user can make it a rule.")
+             ["questions"][0]},
+        ]}])
+        report = self.run_catalog(engine)
+        self.assertEqual({"settled": 2, "for you": 1}, dict(report.questions))
+        self.assertEqual(("retired", "active"), (self.store.get(repeated.id).status, self.store.get(one_off.id).status))
+        self.assertEqual("note", self.store.get(one_off.id).kind)   # kept as a note, not a rule
+        self.assertEqual([about_new["id"]], [item["id"] for item in review.for_user(self.store, now=self.now)])
+
     def test_checks_nobody_can_do_reach_the_user_and_old_unreviewed_questions_too(self) -> None:
         older, newer, question = self.conflict()
         self.run_catalog(FakeEngine(review=[self.decide(question, "unsure", certain=False)]))

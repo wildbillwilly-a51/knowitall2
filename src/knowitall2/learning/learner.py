@@ -7,6 +7,7 @@ bad excerpt can never block the rest of its session, other logs, or learning.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
@@ -43,6 +44,12 @@ _COMMAND_WORDS = frozenset({
 RELATED_WORDS = 2
 RELATED_SHARE = 0.25
 LEARNER_AGENT = "learner"
+# What some work has not done yet ("not yet deployed"): a record of the moment, not knowledge. A condition
+# that is not about the work ("until the hook is trusted", "not yet in the pending list") is kept.
+_WORK_STATE = re.compile(
+    r"\bnot\s+yet\s+(?:been\s+)?(?:fixed|deployed|released|implemented|merged|pushed|done|finished|built|tested|"
+    r"tried|connected|confirmed|verified|reviewed|applied|installed|configured|migrated|published|committed|"
+    r"started|completed|resolved)\b", re.IGNORECASE)
 # A log's entry while its set-aside part is caught up: read up to here, then go on from ``RESUME_AT``.
 LEARN_TO = "learn_to"
 RESUME_AT = "resume_at"
@@ -386,6 +393,10 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
         return None, "kind"
     if scope not in ("global", "project"):
         return None, "scope"
+    if _WORK_STATE.search(text):
+        # Where some work stood goes out of date, often before anyone reads it: a catch-up of a day-old chat
+        # saved "not yet fixed" after the fix was released (2026-10-10). The prompt says so; models do it anyway.
+        return None, "work state"
     if scope == "project" and dossier.project is None:
         scope = "global"
     if dossier.from_documents and dossier.project is not None:

@@ -165,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
         "catalog", help="file memories under systems and review questions (also runs after learning)",
     )
     cataloguing.add_argument("--dry-run", action="store_true", help="show what would be done; no model calls")
+    cataloguing.add_argument(
+        "--commands", type=int, nargs="?", const=40, metavar="CALLS",
+        help="note which command each lesson is about, so agents see it just before running that command; "
+             "at most CALLS model calls (default 40), each for 50 memories",
+    )
 
     finding = commands.add_parser(
         "find-out", help="have an agent look up a system's missing parts in its project folder now (read-only)",

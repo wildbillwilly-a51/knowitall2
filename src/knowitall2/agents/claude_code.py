@@ -2,7 +2,8 @@
 
 - The MCP server is a user-scope entry under ``mcpServers`` in ``.claude.json``,
   which the CLI and the desktop app's Code tab share.
-- The session hooks (SessionStart, Stop, SessionEnd, UserPromptSubmit) are exec-form entries in
+- The session hooks (SessionStart, Stop, SessionEnd, UserPromptSubmit, and PostToolUseFailure
+  for shell commands) are exec-form entries in
   ``settings.json`` that run a small launcher in the KnowItAll2 data home.
   Exec form (``command`` plus ``args``) involves no shell, so paths with
   spaces need no quoting whether Claude Code would use Git Bash or PowerShell.
@@ -183,7 +184,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             for event in HOOK_EVENTS:
                 groups = _event_groups(data, event, self.settings_path)
                 _drop_our_hooks(groups)
-                groups.append({"matcher": "", "hooks": [hook_entry(launch, event)]})
+                groups.append({"matcher": _EVENT_MATCHERS.get(event, ""), "hooks": [hook_entry(launch, event)]})
                 data.setdefault("hooks", {})[event] = groups
             if self._settings.write_if_unchanged(text, data):
                 persisted = self._settings.load()[1]
@@ -240,13 +241,16 @@ class ClaudeCodeAdapter(AgentAdapter):
 
 # Session start adds the briefing; a turn's end learns after a commit and shows
 # what was learned; the session's end learns the rest; the user's message
-# carries news to the agent where the app does not show hook messages.
-HOOK_EVENTS = ("SessionStart", "Stop", "SessionEnd", "UserPromptSubmit")
+# carries news to the agent where the app does not show hook messages. After a
+# Bash or PowerShell command fails, what is known about that command (``commands``).
+HOOK_EVENTS = ("SessionStart", "Stop", "SessionEnd", "UserPromptSubmit", "PostToolUseFailure")
 _EVENT_ARGUMENTS = {"SessionStart": [], "Stop": ["stop"], "SessionEnd": ["session-end"],
-                    "UserPromptSubmit": ["prompt-submit"]}
+                    "UserPromptSubmit": ["prompt-submit"], "PostToolUseFailure": ["command"]}
 _EVENT_WORDS = {"SessionStart": "session-start", "Stop": "end-of-turn", "SessionEnd": "session-end",
-                "UserPromptSubmit": "message"}
-_EVENT_TIMEOUTS = {"SessionStart": HOOK_TIMEOUT_SECONDS, "Stop": 15, "SessionEnd": 15, "UserPromptSubmit": 10}
+                "UserPromptSubmit": "message", "PostToolUseFailure": "failed-command"}
+_EVENT_TIMEOUTS = {"SessionStart": HOOK_TIMEOUT_SECONDS, "Stop": 15, "SessionEnd": 15, "UserPromptSubmit": 10,
+                   "PostToolUseFailure": 5}
+_EVENT_MATCHERS = {"PostToolUseFailure": "Bash|PowerShell"}
 
 
 def hook_launcher_path() -> Path:

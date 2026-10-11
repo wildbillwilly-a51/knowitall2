@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.4 (2026-10-11)
+
+From a measurement of five days of real use (37 chats): KnowItAll2 delivered
+about a third of what agents needed, and about a quarter more was in memory
+but not delivered, mostly quirks met while running a command.
+
+- **When a command fails, the agent hears what KnowItAll2 knows about it.**
+  In Claude Code, after a Bash or PowerShell command fails, KnowItAll2 gives
+  the agent the newest lessons about that command, such as how a tool is
+  blocked or must be run here, once per command in a chat and only when the
+  error points at that command. Learning notes which command each new lesson
+  is about; `knowitall2 catalog --commands` does the same for the lessons
+  you already have. Replayed on those five days, it spoke up about once in
+  two chats, nearly always about that failure, and commands that succeed are
+  not slowed down.
+- **Pointers no longer follow KnowItAll2's own news.** Agents pass on what
+  KnowItAll2 learned, and the pointer then named KnowItAll2's own file in
+  unrelated projects: one pointer in seven, almost never read.
+- **Learning no longer keeps where some work stood.** A memory saying some
+  work is "not yet" fixed, deployed, or released goes out of date, often
+  before anyone reads it; learning now turns such memories down.
+- **Upkeep gets its share of each background run.** Learning from waiting
+  chats used every call of every run, so merging repeated memories had not
+  run in a week (one quirk was stored 66 times). Learning now leaves calls
+  for upkeep, the catalog, and noting commands.
+- **Guessed rules that need no answer no longer wait for you.** When a rule
+  the learner guessed repeats or contradicts one of your own, or was about
+  one piece of work, the question review forgets it or keeps it as a note.
+  Making something a rule is still only yours.
+- A computer closes the server's error responses once it has read them.
+
 ## 0.10.3 (2026-10-09)
 
 Fixes from a review of 0.10.2 on 2026-10-09; each was reproduced before it

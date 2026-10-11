@@ -1008,6 +1008,15 @@ class Store:
         ).fetchall()
         return [RecordRow.from_row(row) for row in rows]
 
+    def records_by_kinds(self, kinds: Sequence[str]) -> list[RecordRow]:
+        """Active memories of these kinds, oldest first."""
+
+        marks = ", ".join("?" * len(kinds))
+        rows = self._connection.execute(
+            f"SELECT {_COLUMNS} {_FROM} WHERE r.status = 'active' AND r.kind IN ({marks}) ORDER BY r.seq", tuple(kinds),
+        ).fetchall()
+        return [RecordRow.from_row(row) for row in rows]
+
     def count_unnoted(self) -> int:
         return int(self._connection.execute(
             "SELECT COUNT(*) FROM records r WHERE r.status = 'active' "

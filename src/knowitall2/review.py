@@ -16,8 +16,10 @@ Each question moves through stages:
    English, with the details on request and a "Not sure" choice.
 
 Rules and statements the user made go straight to the user: nothing but the
-user's own word may change them. An answer from the user carries full
-authority. Agents are also asked to find missing information about a system
+user's own word may change them. A possible rule the learner guessed is
+settled in review only when it needs no one's answer (it repeats or
+contradicts the user's own rule, or applied to one piece of work); making it
+a rule is always the user's. An answer from the user carries full authority. Agents are also asked to find missing information about a system
 (``find_out`` tasks), reported the same way.
 """
 
@@ -277,13 +279,15 @@ def answer(memory: Memory, question_id: str, choice: str) -> str:
 def settle(memory: Memory, question: dict[str, Any], choice: str, *, by: str, evidence: str) -> str | None:
     """Apply a decision KnowItAll2 or an agent is sure of; None when only the user may make it.
 
-    Only conflicts are settled this way, and never by replacing or retiring
-    something the user said. The question and its memories are read again once
-    no one else can write, since what the caller saw may have changed: the user
-    may have answered, or confirmed one of the memories, in the meantime.
-    Everything settled can be undone with restore.
+    Conflicts are settled this way, and possible rules that need no one's answer: one that repeats or
+    contradicts the user's own rule is forgotten, and a one-off kept as a note. Never by replacing or retiring
+    something the user said, and never by making a rule. The question and its memories are read again once
+    no one else can write, since what the caller saw may have changed: the user may have answered, or
+    confirmed one of the memories, in the meantime. Everything settled can be undone with restore.
     """
 
+    if question["kind"] == "confirm_rule" and choice in ("keep_note", "forget"):
+        return _settle_possible_rule(memory, question, choice, by=by, evidence=evidence)
     if question["kind"] != "conflict" or choice not in ("use_new", "keep_mine", "keep_both"):
         return None
     now = memory.now()
@@ -317,6 +321,36 @@ def settle(memory: Memory, question: dict[str, Any], choice: str, *, by: str, ev
             memory.store.confirm(older.id, verification=older.verification, now=now)
             memory.store.confirm(newer.id, verification=newer.verification, now=now)
             outcome = f"Kept both [{older.id}] and [{newer.id}]; they do not conflict."
+        _close(memory, current["id"], f"{choice} (settled by {by})")
+        _close_tasks(memory, current["id"], "done")
+        journal.record(
+            memory.store, "settle", f"{outcome} {evidence}".strip(), outcome=choice, agent=by,
+            record_ids=current["record_ids"], details={"question": current["id"], "evidence": evidence}, at=now,
+        )
+    return outcome
+
+
+def _settle_possible_rule(memory: Memory, question: dict[str, Any], choice: str, *, by: str, evidence: str) -> str | None:
+    """Keep a guessed rule as a note, or forget it, without asking the user (never a rule, never their words)."""
+
+    now = memory.now()
+    note = " ".join(f"settled by {by}: {evidence}".split())[:200]
+    with memory.store.transaction():
+        current = memory.store.question(question["id"])
+        if current is None or current["status"] != "open":
+            return f"[{question['id']}] was already answered; nothing was changed."
+        record = memory.store.get(current["record_ids"][0]) if current["record_ids"] else None
+        if record is None or record.status != "active":
+            _close(memory, current["id"], "memories had already changed")
+            _close_tasks(memory, current["id"], "done")
+            return f"[{current['id']}] no longer applies: its memories had already changed; nothing was changed."
+        if record.verification == "user_stated":
+            return None
+        if choice == "forget":
+            memory.store.retire(record.id, reason=note, now=now)
+            outcome = f"Forgot the possible rule [{record.id}]."
+        else:
+            outcome = f"Kept the possible rule [{record.id}] as a note."
         _close(memory, current["id"], f"{choice} (settled by {by})")
         _close_tasks(memory, current["id"], "done")
         journal.record(

@@ -243,9 +243,14 @@ def render_hook_launcher(launch: ServerLaunch, agent: str) -> str:
         lines.append(f"os.environ.setdefault({HOME_ENVIRONMENT_VARIABLE!r}, {launch.env[HOME_ENVIRONMENT_VARIABLE]!r})")
     lines += [
         "try:",
-        "    from knowitall2.hooks import main",
+        '    if sys.argv[1:2] == ["command"]:  # after a shell command fails: only the light module',
+        "        from knowitall2.commands import run_hook",
         "",
-        f'    main(["{agent}", sys.argv[1] if len(sys.argv) > 1 else "session-start"])',
+        f'        run_hook("{agent}")',
+        "    else:",
+        "        from knowitall2.hooks import main",
+        "",
+        f'        main(["{agent}", sys.argv[1] if len(sys.argv) > 1 else "session-start"])',
         "except BaseException:",
         "    pass  # a hook never fails the agent's session",
         "raise SystemExit(0)",

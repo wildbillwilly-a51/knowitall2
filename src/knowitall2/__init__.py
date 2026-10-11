@@ -1,3 +1,3 @@
 """KnowItAll2: an always-on, agent-agnostic memory for coding agents."""
 
-__version__ = "0.10.3"
+__version__ = "0.10.4"

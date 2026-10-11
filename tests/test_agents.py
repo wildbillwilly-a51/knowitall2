@@ -387,6 +387,10 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
         self.assertEqual([str(hook_launcher_path()), "prompt-submit"],
                          data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1:])
         self.assertEqual(guard, data["hooks"]["PreToolUse"])
+        # After a shell command fails: what is known about that command.
+        failed = data["hooks"]["PostToolUseFailure"][0]
+        self.assertEqual("Bash|PowerShell", failed["matcher"])
+        self.assertEqual(["-B", str(hook_launcher_path()), "command"], failed["hooks"][0]["args"])
         self.assertTrue(data["switchModelsOnFlag"])
         self.assertIn(repr("C:\\src dir"), hook_launcher_path().read_text(encoding="utf-8"))
         self.adapter.uninstall()
