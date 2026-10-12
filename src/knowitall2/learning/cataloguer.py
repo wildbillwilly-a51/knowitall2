@@ -1,7 +1,7 @@
 """The background catalog, with plain summaries, systems, what is missing, and settling questions.
 
-It runs after learning and maintenance, within the same call budget, in three
-steps, each a sealed model call on the learning engine:
+It runs after learning and maintenance, with its own calls a day in the
+background, in three steps, each a sealed model call on the learning engine:
 
 1. File memories: each memory without a note gets a plain one-line summary,
    the system it is about, and the part of that system's profile it fills.
@@ -10,7 +10,14 @@ steps, each a sealed model call on the learning engine:
 3. Review questions: KnowItAll2 settles a question when the memories make the
    answer clear; otherwise it asks the next relevant agent to check, or hands
    the question to the user in plain words. One batch of questions is reviewed
-   before the other steps, so filing and describing cannot use up every run.
+   before the other steps, so filing and describing cannot use up every run,
+   but never with the run's last call, so the review cannot use it up either.
+
+A batch the model refuses counts a failure against each memory, system, or
+question in it, like one the model leaves out of its answer. Those are tried
+again in small groups after the others, and given up after two failures: a
+memory is filed as general, a system kept as it is, and a question handed to
+the user.
 
 The model only proposes; deterministic code decides what is stored, and
 nothing about a memory's own text changes.
@@ -22,10 +29,10 @@ import json
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from .. import catalog, review
-from ..memory import Memory, is_users_choice, keywords
+from ..memory import VERIFICATION_STRENGTH, Memory, is_users_choice, keywords
 from .extractor import ExtractionError, payload_items
 
 CATALOG_AGENT = "catalog"
@@ -45,9 +52,12 @@ MAX_PROFILE_ALIASES = 12
 ALIAS_RULE = ("An alias must mean this system and nothing else: a host name, an address, a product name, or another "
               "name the user uses for it. Never a generic word (such as workstation, server, docker, or connector), "
               "a broader product or category, a folder or file, or the name of another system or project.")
-# A memory, or a new system, the model leaves out of its answer is tried again; after this many answers that
-# left it out, it is filed as general (or the system kept without a summary) so it cannot hold the queue.
-SKIPS_BEFORE_GENERAL = 3
+# A memory, system, or question the model refuses or leaves out of its answer is tried again, in groups of
+# ``RETRY_BATCH`` after the others; after this many failures it is given up, so it cannot hold the queue: filed as
+# general, the system kept without a summary, or the question handed to the user (a refused batch took the
+# catalog's call in every run, 2026-10-11).
+SKIPS_BEFORE_GENERAL = 2
+RETRY_BATCH = 5
 SKIPS_KEY = "catalog.skips"
 
 FILE_SCHEMA: dict[str, Any] = {
@@ -172,10 +182,13 @@ class CatalogReport:
     failed: int = 0
     blocked: str | None = None
     usage: Counter = field(default_factory=Counter)
+    refused: int = 0
     # Questions already sent to the model in this run, so one it skips is not paid for twice.
     reviewed: set = field(default_factory=set)
     # Memories and systems the model left out of an answer in this run: tried again in a later run, not this one.
     left_out: set = field(default_factory=set)
+    # What the batch being sent holds, by key, with what giving each up means.
+    attempt: dict = field(default_factory=dict)
 
     def describe(self) -> str:
         parts = [f"filed {self.filed} memories", f"{self.new_systems} new systems", f"described {self.profiled} systems"]
@@ -183,6 +196,8 @@ class CatalogReport:
         line = f"Catalog: {self.calls} calls; " + ", ".join(parts) + "."
         if self.deferred:
             line += f" Waiting for the budget: {self.deferred} batch(es)."
+        if self.refused:
+            line += f" The model refused or failed {self.refused}; they are tried again in small groups."
         if self.blocked:
             line += f" Stopped: {self.blocked}"
         return line
@@ -190,25 +205,26 @@ class CatalogReport:
     def details(self) -> dict[str, Any]:
         return {"calls": self.calls, "deferred": self.deferred, "filed": self.filed, "new_systems": self.new_systems,
                 "profiled": self.profiled, "questions": dict(self.questions), "failed": self.failed,
-                "blocked": self.blocked, "usage": dict(self.usage)}
+                "refused": self.refused, "blocked": self.blocked, "usage": dict(self.usage)}
 
 
 def run_catalog(*, memory: Memory, engine: Any, budget: int, state: Any = None,
-                run: str | None = None) -> CatalogReport:
-    """File, describe, and review, within ``budget`` model calls; ``state`` counts them toward the daily budget."""
+                run: str | None = None, origin: str = "catalog") -> CatalogReport:
+    """File, describe, and review, within ``budget`` model calls; ``state`` counts them, as from ``origin``."""
 
     report = CatalogReport()
     try:
-        return _run(memory, engine, budget, run, report, state)
+        return _run(memory, engine, budget, run, report, state, origin)
     finally:
         if state is not None:
             state.save()
 
 
-def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: CatalogReport, state: Any) -> CatalogReport:
+def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: CatalogReport, state: Any,
+         origin: str) -> CatalogReport:
     def counted(outcome: str) -> None:
         if state is not None:
-            state.record_call(at=datetime.now(timezone.utc), session="catalog", outcome=outcome)
+            state.record_call(at=datetime.now(timezone.utc), session="catalog", outcome=outcome, origin=origin)
 
     report.questions.update({name: count for name, count in review.expire_tasks(memory).items() if count})
     unanswered = review.expire_unanswered(memory)
@@ -216,25 +232,30 @@ def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: Cata
         report.questions["closed unanswered"] += unanswered
     # One batch of questions goes first: filing and describing have work after nearly every session, so a review
     # left to the end of the budget never ran (2026-09-28 to 10-08) and every question reached the user unreviewed.
-    for step, most in ((_review_step, 1), (_file_step, None), (_profile_step, None), (_review_step, None)):
+    # That first look never takes the run's last call: with one call a run it took every one (2026-10-11).
+    for step, first in ((_review_step, True), (_file_step, False), (_profile_step, False), (_review_step, False)):
         taken = 0
-        while not report.blocked and (most is None or taken < most):
+        while not report.blocked and not (first and taken):
             if not step(memory, report, peek=True):
                 break
-            if report.calls >= budget:
-                report.deferred += 1
+            if report.calls >= budget - (1 if first else 0):
+                if not first:
+                    report.deferred += 1
                 break
+            report.attempt = {}
             try:
                 calls = step(memory, report, engine=engine, run=run)
             except ExtractionError as exc:
                 report.usage.update(getattr(engine, "last_usage", None) or {})
                 if exc.blocking:
                     report.blocked = str(exc)
-                else:
-                    report.calls += 1
-                    report.failed += 1
-                    counted("failed")
-                break
+                    break
+                report.calls += 1
+                report.failed += 1
+                counted("failed")
+                _refused(memory, report)
+                taken += 1
+                continue
             report.usage.update(getattr(engine, "last_usage", None) or {})
             report.calls += calls
             taken += 1
@@ -261,14 +282,17 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
                run: str | None = None) -> int:
     """With ``peek``, whether there is work; otherwise one batch, returning the model calls made."""
 
-    batch = [record for record in memory.store.unnoted_records(limit=FILE_BATCH + len(report.left_out))
-             if record.id not in report.left_out][:FILE_BATCH]
+    skips = _skips(memory)
+    waiting = [record for record in memory.store.unnoted_records(limit=FILE_BATCH + len(report.left_out) + len(skips))
+               if record.id not in report.left_out]
+    batch = _fresh_first(waiting, skips, lambda record: record.id, FILE_BATCH)
     if peek or not batch:
         return int(bool(batch))
+    now = memory.now()
+    report.attempt = {record.id: _filing_as_general(memory, record, now) for record in batch}
     systems = memory.store.systems_list()
     payload = engine.run(_render_file_input(systems, batch), schema=FILE_SCHEMA, system_prompt=FILE_PROMPT)
     wanted = {record.id: record for record in batch}
-    now = memory.now()
     with memory.store.transaction():
         # The batch was read before the model call: a memory filed meanwhile (such as by the user) keeps its
         # note, and one forgotten meanwhile gets none, nor a new system.
@@ -295,10 +319,36 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
                 continue
             report.left_out.add(record.id)
             if _skipped_again(skips, record.id):
-                memory.store.add_note(record.id, headline=_clean(record.text, 100), system_id=None, facet="other",
-                                      written_by=CATALOG_AGENT, now=now)
+                _filing_as_general(memory, record, now)()
         _save_skips(memory, skips)
     return 1
+
+
+def _filing_as_general(memory: Memory, record: Any, now: str) -> Callable[[], None]:
+    return lambda: memory.store.add_note(record.id, headline=_clean(record.text, 100), system_id=None,
+                                         facet="other", written_by=CATALOG_AGENT, now=now)
+
+
+def _fresh_first(waiting: list[Any], skips: dict[str, int], key: Callable[[Any], str], size: int) -> list[Any]:
+    """The next batch: those never refused nor left out first, then those that were, ``RETRY_BATCH`` at a time."""
+
+    fresh = [item for item in waiting if key(item) not in skips]
+    return fresh[:size] or [item for item in waiting if key(item) in skips][:min(size, RETRY_BATCH)]
+
+
+def _refused(memory: Memory, report: CatalogReport) -> None:
+    """The model refused or failed the batch it was sent: each item in it counts a failure and waits for a later
+    run, and one that failed again is given up."""
+
+    with memory.store.transaction():
+        skips = _skips(memory)
+        for key, give_up in report.attempt.items():
+            report.left_out.add(key)
+            report.refused += 1
+            if _skipped_again(skips, key):
+                give_up()
+        _save_skips(memory, skips)
+    report.attempt = {}
 
 
 def _skips(memory: Memory) -> dict[str, int]:
@@ -410,10 +460,14 @@ def _systems_to_describe(memory: Memory) -> list[tuple[dict[str, Any], list[dict
 
 def _profile_step(memory: Memory, report: CatalogReport, *, peek: bool = False, engine: Any = None,
                   run: str | None = None) -> int:
-    pending = [item for item in _systems_to_describe(memory)
-               if f"system:{item[0]['id']}" not in report.left_out][:PROFILE_BATCH]
+    skips = _skips(memory)
+    waiting = [item for item in _systems_to_describe(memory) if f"system:{item[0]['id']}" not in report.left_out]
+    pending = _fresh_first(waiting, skips, lambda item: f"system:{item[0]['id']}", PROFILE_BATCH)
     if peek or not pending:
         return int(bool(pending))
+    now = memory.now()
+    report.attempt = {f"system:{system['id']}": _kept_as_it_is(memory, system["id"], fingerprint, now)
+                      for system, _, _, fingerprint in pending}
     lines = []
     for system, records, named, _ in pending:
         lines.append(f"System [{system['id']}] {system['name']} ({system['kind']}, {system['area']}), "
@@ -428,7 +482,6 @@ def _profile_step(memory: Memory, report: CatalogReport, *, peek: bool = False, 
     payload = engine.run("\n".join(lines), schema=PROFILE_SCHEMA, system_prompt=PROFILE_PROMPT)
     by_id = {system["id"]: (system, fingerprint) for system, _, _, fingerprint in pending}
     shown_records = {system["id"]: records for system, records, _, _ in pending}
-    now = memory.now()
     with memory.store.transaction():
         described: set[str] = set()
         renamed: set[str] = set()
@@ -470,6 +523,10 @@ def _profile_step(memory: Memory, report: CatalogReport, *, peek: bool = False, 
     return 1
 
 
+def _kept_as_it_is(memory: Memory, system_id: str, fingerprint: str, now: str) -> Callable[[], None]:
+    return lambda: memory.store.set_system_profiled(system_id, profiled=fingerprint, now=now)
+
+
 # --- Step 3: review questions ---
 
 
@@ -480,8 +537,9 @@ def _questions_to_review(memory: Memory) -> list[dict[str, Any]]:
 
 def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, engine: Any = None,
                  run: str | None = None) -> int:
-    pending = [question for question in _questions_to_review(memory)
-               if question["id"] not in report.reviewed][:QUESTION_BATCH]
+    skips = _skips(memory)
+    waiting = [question for question in _questions_to_review(memory) if question["id"] not in report.reviewed]
+    pending = _fresh_first(waiting, skips, lambda question: f"question:{question['id']}", QUESTION_BATCH)
     if peek or not pending:
         return int(bool(pending))
     report.reviewed.update(question["id"] for question in pending)
@@ -497,6 +555,8 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
         rendered.append(_render_question(memory, question, records))
     if not rendered:
         return 0
+    report.attempt = {f"question:{question_id}": _for_the_user(memory, question_id, report)
+                      for question_id in records_by_question}
     payload = engine.run("\n\n".join(rendered), schema=REVIEW_SCHEMA, system_prompt=REVIEW_PROMPT)
     answered = set()
     for item in payload_items(payload, "questions", QUESTION_BATCH):
@@ -516,7 +576,7 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
         # making it a rule does, so that never happens here (``review.settle``).
         settleable = question["kind"] == "conflict" or (question["kind"] == "confirm_rule"
                                                          and decision in ("keep_note", "forget"))
-        if settleable and item.get("certain") is True and decision in keys:
+        if settleable and item.get("certain") is True and decision in keys and _no_weaker(question, records, decision):
             outcome = review.settle(memory, question, decision, by="KnowItAll2", evidence=reason or "")
             if outcome:
                 # Settled now, or meanwhile by someone else (already answered, memories changed): done either way.
@@ -530,8 +590,38 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
                                             finding=f"KnowItAll2 looked: {reason}" if reason else None,
                                             now=memory.now())
             report.questions["for you"] += 1
-    # A question the model skipped is looked at again next run.
+    # A question the model skipped is looked at again in a later run, and handed to the user after another.
+    with store.transaction():
+        skips = _skips(memory)
+        for question_id in records_by_question:
+            key = f"question:{question_id}"
+            if question_id in answered:
+                skips.pop(key, None)
+            elif _skipped_again(skips, key):
+                report.attempt[key]()
+        _save_skips(memory, skips)
     return 1
+
+
+def _for_the_user(memory: Memory, question_id: str, report: CatalogReport) -> Callable[[], None]:
+    def give_up() -> None:
+        memory.store.set_question_stage(question_id, stage="ask_user", now=memory.now(),
+                                        finding="KnowItAll2 tried to look into this twice and got no answer.")
+        report.questions["for you"] += 1
+
+    return give_up
+
+
+def _no_weaker(question: dict[str, Any], records: list[Any], decision: Any) -> bool:
+    """Whether KnowItAll2's own judgment may settle a conflict this way: only for the memory with the stronger or
+    equal evidence. On 2026-10-11 an unverified memory that only claimed to be a later observation replaced an
+    observed one on the model's word; such a conflict goes to an agent's check instead."""
+
+    if question["kind"] != "conflict" or decision not in ("use_new", "keep_mine"):
+        return True
+    older, newer = records
+    kept, dropped = (newer, older) if decision == "use_new" else (older, newer)
+    return VERIFICATION_STRENGTH[kept.verification] >= VERIFICATION_STRENGTH[dropped.verification]
 
 
 def _user_must_decide(records: list[Any], decision: Any) -> bool:

@@ -33,13 +33,14 @@ from .cataloguer import CATALOG_AGENT, CatalogReport, run_catalog
 from .command_tags import BATCH as COMMAND_BATCH, TagReport, tag_commands
 from .command_tags import waiting as command_waiting
 from .cataloguer import plan as catalog_plan
-from .learner import LEARNER_AGENT, LearnReport, learn
+from .learner import LEARNER_AGENT, SET_ASIDE_DAYS, LearnReport, learn
 from .maintenance import MAINTENANCE_AGENT, EngineReviewer, MaintenanceReport, maintain
 from .state import (
     CLAUDE_MODEL, FORMER_CLAUDE_MODELS, LearnerSettings, LearnerState, LockBusy, RunLock, day_ago, learner_lock,
-    load_settings, save_settings,
+    load_settings, save_settings, upkeep_allowance,
 )
 from .transcripts import claude_code_logs, codex_logs, is_codex_log, read_session, session_folder, session_logs
+from .transcripts import line_boundary as _line_boundary
 
 BACKENDS = ("claude-cli", "codex-cli")
 _ENGINE_NAMES = {"claude-cli": "Claude Code", "codex-cli": "Codex"}
@@ -125,11 +126,12 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         requested = learn_requests(store, state, settings, extractor)
         if not sweep or requested.blocked:
             if requested.saved and not requested.blocked:
-                # File what was just learned, so "What it knows" shows it.
+                # File what was just learned, so "What it knows" shows it: part of the work, not of upkeep.
                 moments.set_now({"since": moments.now_iso(), "doing": "filing what it learned"})
                 run = new_run_id()
                 filing = run_catalog(memory=Memory(store, agent=CATALOG_AGENT), engine=extractor, state=state,
-                                     run=run, budget=min(2, _remaining_budget(work_limits(settings), state, used=0)))
+                                     run=run, budget=min(2, _remaining_budget(work_limits(settings), state, used=0)),
+                                     origin="work")
                 if filing.calls:
                     journal.record(store, "catalog", filing.describe(), outcome="stopped" if filing.blocked else "ok",
                                    agent=CATALOG_AGENT, run=run, details=filing.details())
@@ -140,11 +142,8 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         started = time.monotonic()
         moments.set_now({"since": moments.now_iso(), "doing": "learning from sessions that ended without being learned",
                          "reason": "catch-up"})
-        # Catching up leaves part of the run for upkeep: a backlog of waiting sessions took every call of
-        # every run, and maintenance made none in a week (2026-10-11).
         report = learn(
-            logs=session_logs(), state=state,
-            settings=replace(settings, max_calls_per_run=max(1, settings.max_calls_per_run - UPKEEP_CALLS)),
+            logs=session_logs(), state=state, settings=settings,
             memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
             extractor=extractor, dry_run=False, run=run,
         )
@@ -156,13 +155,13 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
             share_quietly(store)
             with maintenance_turn() as ours:
                 if ours:
-                    # Maintenance, then the catalog, follow learning with whatever the budget has left.
+                    # Maintenance, the catalog, and noting commands follow learning, each with its own calls a day:
+                    # learning from the user's work used up the daily limit, and maintenance made none in 13 days
+                    # (2026-10-11).
                     moments.set_now({"since": moments.now_iso(), "doing": "tidying up memories"})
-                    # One call each is kept for the catalog and for noting commands.
                     upkeep = maintain(
                         memory=Memory(store, agent=MAINTENANCE_AGENT), reviewer=EngineReviewer(extractor),
-                        state=state, budget=max(0, _remaining_budget(settings, state, used=report.calls) - 2),
-                        dry_run=False, run=run,
+                        state=state, budget=_upkeep_budget(settings, state, "maintenance"), dry_run=False, run=run,
                     )
                     print(upkeep.describe(dry_run=False))
                     # Maintenance can take long: hold the turn again for the catalogue, or leave it for later.
@@ -170,13 +169,12 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
                         moments.set_now({"since": moments.now_iso(), "doing": "filing memories under systems"})
                         filing = run_catalog(
                             memory=Memory(store, agent=CATALOG_AGENT), engine=extractor, state=state, run=run,
-                            budget=max(0, _remaining_budget(settings, state, used=report.calls + upkeep.calls) - 1),
+                            budget=_upkeep_budget(settings, state, "catalog"),
                         )
                         print(filing.describe())
                         if not filing.blocked:
                             tag_waiting_commands(store, extractor, state=state, run=run, budget=min(
-                                COMMAND_CALLS_PER_RUN,
-                                _remaining_budget(settings, state, used=report.calls + upkeep.calls + filing.calls)))
+                                COMMAND_CALLS_PER_RUN, _upkeep_budget(settings, state, "commands")))
                 else:
                     print("Another computer sharing this memory is tidying it up, or the server cannot be "
                           "reached; tidying up is left for later.")
@@ -192,18 +190,16 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
 # One call looks at 50 memories: enough for what a day's learning adds. Catching up on older memories is
 # ``knowitall2 catalog --commands``.
 COMMAND_CALLS_PER_RUN = 1
-# Calls of each background run that learning from waiting sessions leaves for upkeep: maintenance (merging
-# duplicates, settling conflicts), the catalog, and noting commands.
-UPKEEP_CALLS = 4
 
 
-def tag_waiting_commands(store: Store, engine: Any, *, state: LearnerState, run: str, budget: int) -> TagReport:
+def tag_waiting_commands(store: Store, engine: Any, *, state: LearnerState, run: str, budget: int,
+                         origin: str = "commands") -> TagReport:
     """Note which command each new lesson is about, so it can be shown just before that command runs."""
 
     if budget <= 0:
         return TagReport()
     moments.set_now({"since": moments.now_iso(), "doing": "noting which commands lessons are about"})
-    report = tag_commands(store, engine, budget=budget, now=journal.utc_now(), state=state)
+    report = tag_commands(store, engine, budget=budget, now=journal.utc_now(), state=state, origin=origin)
     print(report.describe())
     if report.calls or report.blocked:
         journal.record(store, "catalog", report.describe(), outcome="stopped" if report.blocked else "ok",
@@ -376,13 +372,16 @@ def record_learning_run(store, run: str, report: LearnReport, upkeep: Maintenanc
                    f"{rejected} candidates rejected")
         if report.deferred:
             summary += f"; {report.deferred} waiting for the call budget"
+    if report.set_aside:
+        summary += (f"; {report.set_aside} waiting over {SET_ASIDE_DAYS} days set aside "
+                    "(`knowitall2 learn --catch-up` lists them)")
     details = {
         "logs": report.logs, "active": report.active, "calls": report.calls, "deferred": report.deferred,
         "sessions": [{"session": item.session_id, "dossiers": item.dossiers, "characters": item.characters}
                      for item in report.ready],
         "outcomes": dict(report.outcomes), "failed": report.failed, "skipped": report.skipped,
         "blocked": report.blocked, "engine": engine.name, "model": getattr(engine, "model", None) or "",
-        "seconds": round(seconds, 1), "usage": dict(report.usage),
+        "seconds": round(seconds, 1), "usage": dict(report.usage), "set_aside": report.set_aside,
     }
     if trigger is not None:
         details["trigger"] = trigger
@@ -440,14 +439,15 @@ def run_catalog_command(arguments: argparse.Namespace) -> int:
                 store = Store.open(database_path())
                 try:
                     share_quietly(store)
+                    # The user asked for it now: held back neither by the daily limit nor by upkeep's own calls.
                     if commands_budget is not None:
-                        # The user asked for it now: not held back by the daily limit, like learning their work.
                         # It prints its own report.
-                        tag_waiting_commands(store, engine, state=state, run=run, budget=max(0, commands_budget))
+                        tag_waiting_commands(store, engine, state=state, run=run, budget=max(0, commands_budget),
+                                             origin="user")
                         report = None
                     else:
                         report = run_catalog(memory=Memory(store, agent=CATALOG_AGENT), engine=engine, state=state,
-                                             run=run, budget=_remaining_budget(settings, state, used=0))
+                                             run=run, budget=settings.max_calls_per_run, origin="user")
                         journal.record(store, "catalog", report.describe(),
                                        outcome="stopped" if report.blocked else "ok", agent=CATALOG_AGENT, run=run,
                                        details=report.details())
@@ -470,7 +470,7 @@ def maintenance_details(report: MaintenanceReport) -> dict:
     return {
         "groups": dict(report.statuses()), "calls": report.calls, "deferred": report.deferred,
         "failed": report.failed, "changes": dict(report.changes), "blocked": report.blocked,
-        "usage": dict(report.usage),
+        "usage": dict(report.usage), "left_alone": report.left_alone,
     }
 
 
@@ -478,6 +478,8 @@ def run_maintain(arguments: argparse.Namespace) -> int:
     """Review existing memories now, instead of waiting for the next background run."""
 
     settings = load_settings()
+    if getattr(arguments, "max_calls", None):
+        settings = replace(settings, max_calls_per_run=max(1, arguments.max_calls))
     if not arguments.dry_run and not settings.enabled:
         print(
             "Learning is off, and maintenance uses the same model calls. Preview it with "
@@ -645,11 +647,12 @@ def _maintain_now(reviewer, state, settings: LearnerSettings, *, dry_run: bool) 
     try:
         if not dry_run:
             share_quietly(store)
-        budget = 0 if state is None else _remaining_budget(settings, state, used=0)
+        # The user asked for it now: held back neither by the daily limit nor by upkeep's own calls.
+        budget = 0 if state is None else settings.max_calls_per_run
         run = None if dry_run else new_run_id()
         report = maintain(
             memory=Memory(store, agent=MAINTENANCE_AGENT), reviewer=reviewer, state=state, budget=budget,
-            dry_run=dry_run, run=run,
+            dry_run=dry_run, run=run, origin="user",
         )
         if run is not None:
             changed = sum(report.changes.get(name, 0) for name in ("merged duplicate", "replaced outdated",
@@ -671,8 +674,15 @@ def _maintain_now(reviewer, state, settings: LearnerSettings, *, dry_run: bool) 
 def _remaining_budget(settings: LearnerSettings, state: LearnerState, *, used: int) -> int:
     """Calls left in this run, counting ``used`` so far, and today (``state`` already counts them)."""
 
-    today = state.calls_since(day_ago(datetime.now(timezone.utc)))
+    today = state.limited_calls_since(day_ago(datetime.now(timezone.utc)))
     return max(0, min(settings.max_calls_per_run - used, settings.max_calls_per_day - today))
+
+
+def _upkeep_budget(settings: LearnerSettings, state: LearnerState, origin: str) -> int:
+    """What is left today of background upkeep's own calls for ``origin``: maintenance, the catalog, or commands."""
+
+    used = state.calls_since(day_ago(datetime.now(timezone.utc)), origins=(origin,))
+    return max(0, upkeep_allowance(settings, origin) - used)
 
 
 def _start_from_now(agent: str) -> int:
@@ -817,21 +827,6 @@ def _documents(arguments: argparse.Namespace, settings: LearnerSettings) -> int:
         store.close()
 
 
-def _line_boundary(path, *, window: int = 1 << 16) -> int:
-    """The offset just past the last complete line, so a later read starts on a record."""
-
-    end = path.stat().st_size
-    with path.open("rb") as stream:
-        while end > 0:
-            start = max(0, end - window)
-            stream.seek(start)
-            index = stream.read(end - start).rfind(b"\n")
-            if index >= 0:
-                return start + index + 1
-            end = start
-    return 0
-
-
 def _session_key(log) -> str:
     """What names a session: the id at the end of a Codex rollout name, else the file stem."""
 
@@ -862,12 +857,15 @@ def _status(settings) -> str:
     for entry in state.logs.values():
         counts[str(entry.get("status"))] = counts.get(str(entry.get("status")), 0) + 1
     progress = ", ".join(f"{name} {count}" for name, count in sorted(counts.items())) or "none yet"
-    recent = state.calls_since(day_ago(datetime.now(timezone.utc)))
+    since = day_ago(datetime.now(timezone.utc))
+    recent, limited = state.calls_since(since), state.limited_calls_since(since)
     return "\n".join([
         f"Learning: {'on' if settings.enabled else 'off'} "
         f"(backend {settings.backend}, model {settings.model or 'the engine default'})",
         f"Background budget: {settings.max_calls_per_run} calls per run, {settings.max_calls_per_day} per day "
         f"(learning from your work has no daily limit); "
-        f"{recent} calls in the last 24 hours",
+        f"{recent} calls in the last 24 hours, {limited} of them toward the daily limit",
+        f"Upkeep's own calls a day: maintenance {settings.maintenance_calls_per_day}, catalog "
+        f"{settings.catalog_calls_per_day}, noting commands {settings.command_calls_per_day}",
         f"Sessions: {progress}",
     ])

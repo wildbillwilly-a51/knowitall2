@@ -4,7 +4,8 @@
   which the CLI and the desktop app's Code tab share.
 - The session hooks (SessionStart, Stop, SessionEnd, UserPromptSubmit, and PostToolUseFailure
   for shell commands) are exec-form entries in
-  ``settings.json`` that run a small launcher in the KnowItAll2 data home.
+  ``settings.json`` that run a small launcher in the KnowItAll2 data home,
+  when it is there (``hook_entry``).
   Exec form (``command`` plus ``args``) involves no shell, so paths with
   spaces need no quoting whether Claude Code would use Git Bash or PowerShell.
 
@@ -18,6 +19,7 @@ the result; ``doctor`` detects a lost entry.
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,7 @@ class ClaudeCodeAdapter(AgentAdapter):
     display_name = "Claude Code"
 
     def __init__(self, *, user_home: Path | None = None) -> None:
+        self.user_home = user_home
         configured = os.environ.get("CLAUDE_CONFIG_DIR") if user_home is None else None
         if configured:
             self.config_dir = Path(configured).expanduser()
@@ -216,7 +219,10 @@ class ClaudeCodeAdapter(AgentAdapter):
                     break
             else:
                 raise AgentError(f"{self.settings_path} kept changing; close Claude Code and run uninstall again.")
-        hook_launcher_path().unlink(missing_ok=True)
+        # The launcher is in the data home, which a test against another home leaves alone; and it goes only with
+        # the hooks that ran it.
+        if change and self.user_home is None:
+            hook_launcher_path().unlink(missing_ok=True)
         return change
 
     def _hook_check(self, launch: ServerLaunch) -> Check:
@@ -231,6 +237,8 @@ class ClaudeCodeAdapter(AgentAdapter):
             if found[event] != [hook_entry(launch, event)]:
                 what = _EVENT_WORDS[event]
                 detail = f"the {what} hook is not installed" if not found[event] else (
+                    f"the {what} hook is registered the way earlier versions did, which stops Claude Code if the "
+                    "launcher is missing" if any(_registered_the_earlier_way(hook) for hook in found[event]) else
                     f"the {what} hook is installed with different options than this installation")
                 return Check(name, False, detail, f"Run: {self.setup_command()}")
         if not launcher.is_file() or launcher.read_text(encoding="utf-8") != render_launcher(launch):
@@ -258,10 +266,22 @@ def hook_launcher_path() -> Path:
 
 
 def hook_entry(launch: ServerLaunch, event: str = "SessionStart") -> dict[str, Any]:
-    """Exec form: the interpreter and its arguments, with no shell in between."""
+    """Exec form: the interpreter and its arguments, with no shell in between.
 
-    return {"type": "command", "command": launch.command,
-            "args": ["-B", str(hook_launcher_path()), *_EVENT_ARGUMENTS[event]], "timeout": _EVENT_TIMEOUTS[event]}
+    Python runs the launcher only when it is there. Python exits 2 when it cannot open a script, and Claude
+    Code takes exit 2 as a blocking error (no prompt would reach Claude), so a launcher that is gone, with its
+    data home or after an uninstall, must still end in exit 0. ``-P`` keeps the session's folder out of the
+    module search path.
+    """
+
+    code = _RUN_LAUNCHER.format(path=str(hook_launcher_path()),
+                                arguments="".join(f", {word!r}" for word in _EVENT_ARGUMENTS[event]))
+    return {"type": "command", "command": launch.command, "args": ["-B", "-P", "-c", code],
+            "timeout": _EVENT_TIMEOUTS[event]}
+
+
+_RUN_PREFIX = "import os,runpy,sys; p="
+_RUN_LAUNCHER = _RUN_PREFIX + "{path!r}; sys.argv=[p{arguments}]; os.path.isfile(p) and runpy.run_path(p, run_name='__main__')"
 
 
 def render_launcher(launch: ServerLaunch) -> str:
@@ -280,10 +300,34 @@ def _event_groups(data: dict[str, Any], event: str, path: Path) -> list[Any]:
 def _is_our_hook(hook: object) -> bool:
     if not isinstance(hook, dict) or not isinstance(hook.get("args"), list):
         return False
-    return any(
-        isinstance(argument, str) and Path(argument).name == HOOK_LAUNCHER and Path(argument).parent.name == "hooks"
-        for argument in hook["args"]
-    )
+    return any(_is_launcher(_launcher_run_by(argument)) or _is_launcher(argument) for argument in hook["args"])
+
+
+def _registered_the_earlier_way(hook: object) -> bool:
+    """Whether the launcher is Python's script itself, as registered up to 0.10.5."""
+
+    return isinstance(hook, dict) and isinstance(hook.get("args"), list) and any(
+        _is_launcher(argument) for argument in hook["args"])
+
+
+def _is_launcher(path: object) -> bool:
+    return isinstance(path, str) and Path(path).name == HOOK_LAUNCHER and Path(path).parent.name == "hooks"
+
+
+def _launcher_run_by(argument: object) -> str | None:
+    """The launcher path in the words Python runs (``hook_entry``), or None."""
+
+    if not isinstance(argument, str) or not argument.startswith(_RUN_PREFIX):
+        return None
+    try:
+        statements = ast.parse(argument).body
+    except (SyntaxError, ValueError):
+        return None
+    for statement in statements:
+        if (isinstance(statement, ast.Assign) and [getattr(target, "id", None) for target in statement.targets] == ["p"]
+                and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str)):
+            return statement.value.value
+    return None
 
 
 def _find_hooks(groups: list[Any]) -> list[dict[str, Any]]:

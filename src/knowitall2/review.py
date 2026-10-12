@@ -1,9 +1,9 @@
 """Questions about memories, settled by whoever can: KnowItAll2, then an agent, then the user.
 
 KnowItAll2 queues a question when it must not decide on its own: when newer,
-weaker evidence contradicts a memory, when something the user stated looks
-like a temporary status, or when the learner thinks it heard a rule but could
-not find the user's own words for it.
+weaker evidence contradicts a memory, or when something the user stated looks
+like a temporary status. It no longer asks whether something should be a rule
+(0.10.5); such a question asked before is settled as a note.
 
 Each question moves through stages:
 
@@ -16,10 +16,8 @@ Each question moves through stages:
    English, with the details on request and a "Not sure" choice.
 
 Rules and statements the user made go straight to the user: nothing but the
-user's own word may change them. A possible rule the learner guessed is
-settled in review only when it needs no one's answer (it repeats or
-contradicts the user's own rule, or applied to one piece of work); making it
-a rule is always the user's. An answer from the user carries full authority. Agents are also asked to find missing information about a system
+user's own word may change them; making something a rule is always the
+user's. An answer from the user carries full authority. Agents are also asked to find missing information about a system
 (``find_out`` tasks), reported the same way.
 """
 
@@ -187,11 +185,15 @@ def offer_in_chat(store: Store, questions: Sequence[dict[str, Any]]) -> None:
 
 
 def expire_unanswered(memory: Memory) -> int:
-    """Close the questions no one answered within ``QUESTION_EXPIRE_DAYS``, changing nothing; how many."""
+    """Close the questions no one answered within ``QUESTION_EXPIRE_DAYS``, changing nothing, and any "Should it
+    be a rule?" question asked before 0.10.5, settled as a note; how many."""
 
     moment = _parse(memory.now())
     closed = 0
     for question in memory.store.open_questions(limit=500):
+        if question["kind"] == "confirm_rule":
+            closed += _keep_as_note(memory, question)
+            continue
         if _parse(question["created_at"]) >= moment - timedelta(days=QUESTION_EXPIRE_DAYS):
             continue
         with memory.store.transaction():
@@ -200,6 +202,26 @@ def expire_unanswered(memory: Memory) -> int:
                 _close_tasks(memory, question["id"], "done")
                 closed += 1
     return closed
+
+
+# 0.10.5 stopped asking whether something should be a rule (the user, 2026-10-11: a single statement in a chat is
+# not a rule); a question asked before it is settled as "Not sure" would: the memory stays an ordinary note.
+_RULE_QUESTIONS_RETIRED = "KnowItAll2 no longer asks whether something should be a rule; it stays a note."
+
+
+def _keep_as_note(memory: Memory, question: dict[str, Any]) -> bool:
+    now = memory.now()
+    with memory.store.transaction():
+        if not memory.store.close_question(question["id"], answer="keep_note (settled by KnowItAll2)", now=now):
+            return False
+        _close_tasks(memory, question["id"], "done")
+        notes = " ".join(f"[{record_id}]" for record_id in question["record_ids"])
+        journal.record(
+            memory.store, "settle", f"Kept the possible rule {notes} as a note. {_RULE_QUESTIONS_RETIRED}",
+            outcome="keep_note", agent="KnowItAll2", record_ids=question["record_ids"],
+            details={"question": question["id"], "evidence": _RULE_QUESTIONS_RETIRED}, at=now,
+        )
+    return True
 
 
 def in_progress(store: Store, *, now: datetime | None = None) -> list[dict[str, Any]]:
@@ -531,8 +553,9 @@ def settle_task(memory: Memory, task_id: str, *, choice: str, found: str, certai
 
 
 def offer_tasks(store: Store, *, project_id: str | None, record_ids: list[str] | tuple = (), limit: int = 1,
-                now: str) -> list[dict[str, Any]]:
-    """Open tasks an agent in this project, or looking at these memories, could help with; counts the offer."""
+                now: str, count: bool = True) -> list[dict[str, Any]]:
+    """Open tasks an agent in this project, or looking at these memories, could help with; counts the offer
+    unless ``count`` is off (then :func:`count_offers` does, later)."""
 
     wanted = set(record_ids)
     systems = {note["system_id"] for note in store.notes_for(list(wanted)).values() if note.get("system_id")}
@@ -548,9 +571,14 @@ def offer_tasks(store: Store, *, project_id: str | None, record_ids: list[str] |
             chosen.append(task)
         if len(chosen) >= limit:
             break
-    for task in chosen:
-        store.update_task(task["id"], offered=True, now=now)
+    if count:
+        count_offers(store, chosen, now=now)
     return chosen
+
+
+def count_offers(store: Store, tasks: Sequence[dict[str, Any]], *, now: str) -> None:
+    for task in tasks:
+        store.update_task(task["id"], offered=True, now=now)
 
 
 def expire_tasks(memory: Memory, *, now: datetime | None = None) -> dict[str, int]:

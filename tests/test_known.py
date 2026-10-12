@@ -25,6 +25,26 @@ GIT = shutil.which("git")
 RG = shutil.which("rg")
 
 
+def link_folder(link: Path, target: Path) -> None:
+    """A symbolic link to a folder, or on Windows without the privilege for one, a junction."""
+
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise unittest.SkipTest("symbolic links are not available here")
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+
+
+def link_file(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except OSError:
+        raise unittest.SkipTest("symbolic links to files are not available here")
+
+
 class KnownTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -37,6 +57,10 @@ class KnownTestCase(unittest.TestCase):
         self.clock = Clock()
         self.store = Store.open(self.root / "home" / "knowitall2.db")
         self.memory = Memory(self.store, agent="codex", clock=self.clock)
+        # Which folders were worked in lately is judged by the test's clock, not the day the tests run.
+        now = mock.patch.object(known, "_now", side_effect=lambda: self.clock(), create=True)
+        now.start()
+        self.addCleanup(now.stop)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -172,9 +196,18 @@ class RenderTests(KnownTestCase):
 
     def test_file_names_are_safe(self) -> None:
         self.assertEqual("readme-.md", known.file_name("README"))
-        self.assertEqual("con-.md", known.file_name("CON"))
+        self.assertEqual("con_.md", known.file_name("CON"))
         self.assertEqual("save-local-work.ps1.md", known.file_name("save-local-work.ps1"))
         self.assertEqual("vcenter-lab.md", known.file_name("vCenter Lab"))
+
+    def test_a_reserved_windows_name_before_a_dot_is_avoided_too(self) -> None:
+        # Review 2026-10-11 (N-L3): Windows refuses aux.lan.md as it refuses aux.md.
+        self.assertEqual("aux_.lan.md", known.file_name("aux.lan"))
+        self.assertEqual("com1_.example.md", known.file_name("COM1.example"))
+        self.assertEqual("lpt9_.md", known.file_name("lpt9"))
+        self.assertEqual("nul_.office.test.md", known.file_name("nul.office.test"))
+        for fine in ("auxiliary.lan", "console", "com10", "prn-server"):
+            self.assertEqual(f"{fine}.md", known.file_name(fine))
 
     def test_secret_like_text_is_redacted_again(self) -> None:
         saved = self.remember("Router admin is kept in Vaultwarden item 'router admin'.", scope="global")
@@ -226,10 +259,38 @@ class FolderTests(KnownTestCase):
         self.assertEqual("node_modules/\n", (other / ".ignore").read_text(encoding="utf-8"))
         self.assertTrue(any("add the line" in note for note in result.notes))
 
+    def test_the_ignore_file_is_kept_out_of_git_only_when_it_is_knowitall2s(self) -> None:
+        # Review 2026-10-11 (N-L5): a user's own .ignore, not yet committed, vanished from git status.
+        other = make_repository(self.root / "beta")
+        (other / known.IGNORE_FILE).write_text("node_modules/\n", encoding="utf-8")
+        exclude = other / ".git" / "info" / "exclude"
+        known.write_folder(other, self.files())
+        self.assertIn(f"/{known.FOLDER}/", exclude.read_text(encoding="utf-8"))
+        self.assertNotIn(f"/{known.IGNORE_FILE}", exclude.read_text(encoding="utf-8"))
+        # A block written before lists it: it is corrected in place.
+        exclude.write_text("*.log\n" + "\n".join([known.EXCLUDE_BEGIN, *known.EXCLUDE_LINES, known.EXCLUDE_END])
+                           + "\n*.tmp\n", encoding="utf-8")
+        known.write_folder(other, self.files())
+        self.assertEqual(f"*.log\n{known.EXCLUDE_BEGIN}\n/{known.FOLDER}/\n{known.EXCLUDE_END}\n*.tmp\n",
+                         exclude.read_text(encoding="utf-8"))
+        known.write_folder(self.project, self.files())   # KnowItAll2's own .ignore stays out of Git
+        self.assertIn(f"/{known.IGNORE_FILE}", (self.project / ".git" / "info" / "exclude").read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(GIT, "needs git")
+    def test_a_users_uncommitted_ignore_file_still_shows_in_git_status(self) -> None:
+        repo = self.root / "real"
+        repo.mkdir()
+        subprocess.run([GIT, "init", "-q"], cwd=repo, check=True)
+        (repo / known.IGNORE_FILE).write_text("node_modules/\n", encoding="utf-8")
+        known.write_folder(repo, self.files())
+        status = subprocess.run([GIT, "status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout
+        self.assertEqual(f"?? {known.IGNORE_FILE}\n", status)
+
     def test_a_worktree_uses_the_shared_exclude_file(self) -> None:
         main_git = self.project / ".git"
         (main_git / "worktrees" / "feature").mkdir(parents=True)
         (main_git / "worktrees" / "feature" / "commondir").write_text("../..\n", encoding="utf-8")
+        (main_git / "worktrees" / "feature" / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
         tree = self.root / "alpha-feature"
         tree.mkdir()
         (tree / ".git").write_text(f"gitdir: {main_git / 'worktrees' / 'feature'}\n", encoding="utf-8")
@@ -243,6 +304,136 @@ class FolderTests(KnownTestCase):
         plain.mkdir()
         self.assertEqual("not a Git working tree", known.write_folder(plain, self.files()).skipped)
         self.assertFalse((plain / known.FOLDER).exists())
+
+    def test_a_git_folder_git_cannot_use_is_not_a_repository(self) -> None:
+        # The live case: a .git folder holding only info/ in a parent folder of projects got the files.
+        stub = self.root / "projects"
+        (stub / ".git" / "info").mkdir(parents=True)
+        self.assertIsNone(known.git_common_dir(stub))
+        self.assertEqual("not a Git working tree", known.write_folder(stub, self.files()).skipped)
+        self.assertFalse((stub / known.FOLDER).exists())
+        self.assertFalse((stub / known.IGNORE_FILE).exists())
+        self.assertFalse((stub / ".git" / "info" / "exclude").exists())
+
+    def test_a_worktree_whose_repository_moved_is_skipped_and_no_git_folder_is_made(self) -> None:
+        gone = self.root / "moved-away" / "main" / ".git" / "worktrees" / "wt"
+        tree = self.root / "wt"
+        tree.mkdir()
+        (tree / ".git").write_text(f"gitdir: {gone}\n", encoding="utf-8")
+        self.assertEqual("not a Git working tree", known.write_folder(tree, self.files()).skipped)
+        self.assertFalse((self.root / "moved-away").exists())
+        self.assertFalse((tree / known.FOLDER).exists())
+
+    def test_a_file_that_cannot_be_written_does_not_stop_the_others(self) -> None:
+        # One refused name stopped every later file and the index in every project (N-L3).
+        files = {"a-bad.md": "# bad\n", "zeta.md": "# zeta\n", **self.files()}
+        real = known.write_text_atomic
+
+        def refuse(path, text, **options):
+            if Path(path).name == "a-bad.md":
+                raise FileExistsError(183, "Cannot create a file when that file already exists")
+            real(path, text, **options)
+
+        with mock.patch("knowitall2.known.write_text_atomic", side_effect=refuse):
+            result = known.write_folder(self.project, files)
+        self.assertIsNone(result.skipped)
+        folder = self.project / known.FOLDER
+        self.assertEqual(["README.md", "synology.md", "zeta.md"], sorted(path.name for path in folder.iterdir()))
+        self.assertTrue(any("a-bad.md" in note for note in result.notes), result.notes)
+
+    def test_a_linked_folder_is_refused_and_where_it_points_is_left_alone(self) -> None:
+        # Review 2026-10-11 (N-H2): a cloned repository can carry knowitall2-known/ as a link to any folder.
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / known.INDEX).write_text(known.MARKER + "\n", encoding="utf-8")
+        (outside / "notes.md").write_text("the user's own\n", encoding="utf-8")
+        link_folder(self.project / known.FOLDER, outside)
+        result = known.write_folder(self.project, self.files())
+        self.assertIn("link", result.skipped)
+        known.remove_folder(self.project)
+        self.assertEqual(["README.md", "notes.md"], sorted(path.name for path in outside.iterdir()))
+        self.assertEqual(known.MARKER + "\n", (outside / known.INDEX).read_text(encoding="utf-8"))
+        self.assertFalse((self.project / known.IGNORE_FILE).exists())
+
+    def test_a_folder_holding_anything_but_plain_files_is_refused(self) -> None:
+        planted = self.project / known.FOLDER
+        (planted / "keep").mkdir(parents=True)
+        (planted / known.INDEX).write_text(known.MARKER + "\n", encoding="utf-8")
+        (planted / "keep" / "notes.md").write_text("mine\n", encoding="utf-8")
+        result = known.write_folder(self.project, self.files())
+        self.assertIsNotNone(result.skipped)
+        self.assertEqual(known.MARKER + "\n", (planted / known.INDEX).read_text(encoding="utf-8"))
+        self.assertEqual(["README.md", "keep"], sorted(path.name for path in planted.iterdir()))
+
+    def test_a_linked_file_in_the_folder_is_never_written_through(self) -> None:
+        # The reproduction: general.md as a link to a file such as ~/.bashrc was overwritten with memories.
+        victim = self.root / "outside" / "important.conf"
+        victim.parent.mkdir()
+        victim.write_text("export IMPORTANT=1\n", encoding="utf-8")
+        planted = self.project / known.FOLDER
+        planted.mkdir()
+        (planted / known.INDEX).write_text(known.MARKER + "\n", encoding="utf-8")
+        link_file(planted / "general.md", victim)
+        files = self.files()
+        files["general.md"] = "# General\n"
+        self.assertIsNotNone(known.write_folder(self.project, files).skipped)
+        known.remove_folder(self.project)
+        self.assertEqual("export IMPORTANT=1\n", victim.read_text(encoding="utf-8"))
+        self.assertTrue((planted / "general.md").is_symlink())
+
+    def test_a_linked_ignore_file_is_never_written_through(self) -> None:
+        # A dangling .ignore link made KnowItAll2 create the file it points to, such as ~/.bash_profile.
+        missing = self.root / "outside" / "created.txt"
+        missing.parent.mkdir()
+        link_file(self.project / known.IGNORE_FILE, missing)
+        result = known.write_folder(self.project, self.files())
+        self.assertIsNone(result.skipped)
+        self.assertTrue((self.project / known.FOLDER / known.INDEX).is_file())
+        self.assertFalse(missing.exists())
+        self.assertTrue(any(known.IGNORE_FILE in note for note in result.notes))
+
+    def test_files_replace_what_is_there_instead_of_writing_into_it(self) -> None:
+        known.write_folder(self.project, self.files())
+        index = self.project / known.FOLDER / known.INDEX
+        with mock.patch("knowitall2.known.write_text_atomic", wraps=known.write_text_atomic) as writes:
+            files = self.files()
+            files[known.INDEX] += "changed\n"
+            known.write_folder(self.project, files)
+        self.assertTrue(writes.called)
+        self.assertTrue(all(call.kwargs.get("follow_links") is False for call in writes.call_args_list
+                            if Path(call.args[0]).parent == index.parent), writes.call_args_list)
+
+    @unittest.skipUnless(GIT, "needs git")
+    def test_a_folder_git_tracks_is_the_repositorys_own(self) -> None:
+        repo = self.root / "cloned"
+        run = lambda *args: subprocess.run([GIT, *args], cwd=repo, check=True, capture_output=True, text=True)
+        repo.mkdir()
+        run("init", "-q")
+        planted = repo / known.FOLDER
+        planted.mkdir()
+        (planted / known.INDEX).write_text(known.MARKER + "\n", encoding="utf-8")
+        (planted / "CONTRIBUTING.md").write_text("tracked\n", encoding="utf-8")
+        run("add", "-A")
+        run("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init")
+        result = known.write_folder(repo, self.files())
+        self.assertIn("Git tracks", result.skipped)
+        known.remove_folder(repo)
+        self.assertEqual("", run("status", "--porcelain", "--ignored").stdout)
+
+    @unittest.skipUnless(GIT, "needs git")
+    def test_an_ignore_file_git_tracks_is_never_changed_or_removed(self) -> None:
+        repo = self.root / "tracked-ignore"
+        run = lambda *args: subprocess.run([GIT, *args], cwd=repo, check=True, capture_output=True, text=True)
+        repo.mkdir()
+        run("init", "-q")
+        (repo / known.IGNORE_FILE).write_bytes(known.IGNORE_TEXT.encode("utf-8"))
+        run("add", "-A")
+        run("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init")
+        self.assertIsNone(known.write_folder(repo, self.files()).skipped)
+        self.assertTrue((repo / known.FOLDER / "synology.md").is_file())
+        known.remove_folder(repo)
+        self.assertFalse((repo / known.FOLDER).exists())
+        self.assertEqual("", run("status", "--porcelain").stdout)
 
     def test_removal_takes_out_only_what_it_added(self) -> None:
         known.write_folder(self.project, self.files())
@@ -395,15 +586,445 @@ class RefreshTests(KnownTestCase):
         self.store = Store.open(self.root / "home" / "knowitall2.db")
 
 
+def text_of(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+class WorkedInTests(KnownTestCase):
+    """Knowledge files go only where agents work: per project, the clone worked in last and its worktrees."""
+
+    def worktree(self, main: Path, tree: Path) -> Path:
+        git_dir = main / ".git" / "worktrees" / tree.name
+        git_dir.mkdir(parents=True)
+        (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+        (git_dir / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
+        tree.mkdir(parents=True)
+        (tree / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+        return tree
+
+    def test_only_the_clone_worked_in_last_and_its_worktrees_get_the_files(self) -> None:
+        # Review 2026-10-11: projects moved to another folder still got files in their old copies.
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        old = self.project
+        new = make_repository(self.root / "moved" / "alpha", "https://gitlab.example.com/team/alpha.git")
+        tree = self.worktree(new, self.root / "moved" / "alpha-feature")
+        for folder in (old, new, tree):
+            self.memory.project_for(folder)
+        known.worked_in(old)
+        self.clock.value = "2026-09-28T09:00:00Z"
+        known.worked_in(tree / "src")
+        self.clock.value = "2026-09-28T10:00:00Z"
+        known.worked_in(new)
+        known.refresh(self.connection)
+        written = lambda folder: (folder / known.FOLDER / "alpha.md").is_file()
+        self.assertEqual([False, True, True], [written(folder) for folder in (old, new, tree)])
+        self.clock.value = "2026-09-29T10:00:00Z"
+        known.worked_in(old / "docs")   # back in the old clone: it is the one written now
+        self.assertTrue(known.due(self.connection))
+        self.remember("Alpha's staging host is stage-1.", scope="project")
+        known.refresh(self.connection)
+        self.assertIn("stage-1", text_of(old / known.FOLDER / "alpha.md"))
+        self.assertNotIn("stage-1", text_of(new / known.FOLDER / "alpha.md"))
+
+    def test_going_back_to_another_copy_within_the_hour_is_noted(self) -> None:
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        new = make_repository(self.root / "moved" / "alpha", "https://gitlab.example.com/team/alpha.git")
+        known.worked_in(self.project)
+        self.clock.value = "2026-09-27T12:05:00Z"
+        known.worked_in(new)
+        self.clock.value = "2026-09-27T12:10:00Z"
+        known.worked_in(self.project)
+        known.worked_in(self.project)
+        known.refresh(self.connection)
+        self.assertTrue((self.project / known.FOLDER / "alpha.md").is_file())
+        self.assertFalse((new / known.FOLDER).exists())
+
+    def test_working_in_two_worktrees_in_turn_starts_no_refresh(self) -> None:
+        # Release-candidate review (R-M1): each prompt in the worktree used less lately made it the newest copy,
+        # which changed the marker, so a full refresh started after nearly every prompt of parallel work.
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        tree = self.worktree(self.project, self.root / "alpha-feature")
+        known.worked_in(self.project)
+        self.clock.value = "2026-09-27T12:01:00Z"
+        known.worked_in(tree / "src")
+        known.refresh(self.connection)
+        written = lambda folder: (folder / known.FOLDER / "alpha.md").is_file()
+        self.assertEqual([True, True], [written(self.project), written(tree)])
+        for moment in ("12:02", "12:03", "12:30", "13:20", "13:21", "14:40", "14:41"):
+            for folder in (self.project, tree):
+                self.clock.value = f"2026-09-27T{moment}:00Z"
+                known.worked_in(folder)
+                self.assertFalse(known.due(self.connection), (moment, folder.name))
+        other = make_repository(self.root / "moved" / "alpha", "https://gitlab.example.com/team/alpha.git")
+        known.worked_in(other)   # a copy with its own Git folder still changes where the files go
+        self.assertTrue(known.due(self.connection))
+
+    def test_the_clone_in_the_data_home_never_gets_files_or_counts_as_the_newest_copy(self) -> None:
+        # Release-candidate review (R-L5): the live install's own clone, inside the data home, is a clone of the
+        # project worked on; one session there took the files away from the checkout and its worktrees.
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        app = make_repository(self.root / "home" / "app", "https://gitlab.example.com/team/alpha.git")
+        self.clock.value = "2026-09-27T12:05:00Z"
+        self.memory.project_for(app)   # seen there later than in the checkout, before the record was seeded
+        known.refresh(self.connection)
+        self.clock.value = "2026-09-27T12:10:00Z"
+        known.worked_in(app / "src")
+        self.assertFalse(known.due(self.connection))
+        self.remember("Alpha's staging host is stage-1.", scope="project")
+        known.refresh(self.connection)
+        self.assertIn("stage-1", text_of(self.project / known.FOLDER / "alpha.md"))
+        self.assertFalse((app / known.FOLDER).exists())
+        self.assertFalse((app / known.IGNORE_FILE).exists())
+        self.assertEqual([os.path.normcase(str(self.project.resolve()))], list(known.worked_folders()))
+        self.assertEqual("inside KnowItAll2's own data folder, which never gets knowledge files",
+                         known.write_folder(app, known.render(self.connection)).skipped)
+        self.assertFalse((app / known.FOLDER).exists())
+
+    def test_a_folder_a_tool_call_names_gets_no_files(self) -> None:
+        # Review 2026-10-11 (H-M4): one briefing call naming any repository made it get every memory.
+        self.remember("The NAS answers on 10.0.0.10.", scope="global")
+        known.refresh(self.connection)
+        elsewhere = make_repository(self.root / "share" / "repo")
+        self.memory.briefing(project_path=elsewhere)
+        self.memory.remember("The share's repo builds with make.", scope="project", project_path=elsewhere)
+        known.refresh(self.connection)
+        self.assertTrue((self.project / known.FOLDER / known.INDEX).is_file())
+        self.assertFalse((elsewhere / known.FOLDER).exists())
+        self.assertFalse((elsewhere / known.IGNORE_FILE).exists())
+
+    def test_a_folder_no_agent_worked_in_for_30_days_gets_no_more_files(self) -> None:
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        known.worked_in(self.project)
+        known.refresh(self.connection)
+        self.assertTrue((self.project / known.FOLDER / "alpha.md").is_file())
+        self.clock.value = "2026-10-27T11:00:00Z"
+        self.assertFalse(known.due(self.connection))
+        self.clock.value = "2026-10-28T12:00:00Z"   # 31 days on
+        self.assertTrue(known.due(self.connection))
+        self.remember("Alpha's staging host is stage-1.", scope="project")
+        known.refresh(self.connection)
+        self.assertNotIn("stage-1", text_of(self.project / known.FOLDER / "alpha.md"))
+        self.assertFalse((self.project / known.FOLDER).exists())   # taken out once
+
+    def test_a_folder_no_longer_written_has_knowitall2s_files_taken_out_once(self) -> None:
+        # The release cleans up the old copies once, and then never touches them again (the user's choice).
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        old = self.project
+        exclude = old / ".git" / "info" / "exclude"
+        exclude.parent.mkdir()
+        exclude.write_text("*.log\n", encoding="utf-8")
+        known.worked_in(old)
+        known.refresh(self.connection)
+        self.assertTrue((old / known.FOLDER / "alpha.md").is_file())
+        new = make_repository(self.root / "moved" / "alpha", "https://gitlab.example.com/team/alpha.git")
+        self.clock.value = "2026-09-28T10:00:00Z"
+        known.worked_in(new)
+        report = known.refresh(self.connection)
+        self.assertTrue((new / known.FOLDER / "alpha.md").is_file())
+        self.assertFalse((old / known.FOLDER).exists())
+        self.assertFalse((old / known.IGNORE_FILE).exists())
+        self.assertEqual("*.log\n", exclude.read_text(encoding="utf-8"))
+        self.assertIn(f"{os.path.normcase(str(old.resolve()))}: no longer written here", report.describe())
+        # Put back by hand: left alone from now on.
+        (old / known.FOLDER).mkdir()
+        (old / known.FOLDER / known.INDEX).write_text(known.MARKER + "\n", encoding="utf-8")
+        self.remember("Alpha's staging host is stage-1.", scope="project")
+        known.refresh(self.connection, force=True)
+        self.assertEqual(known.MARKER + "\n", (old / known.FOLDER / known.INDEX).read_text(encoding="utf-8"))
+
+    def test_a_folder_written_before_with_a_stub_git_folder_is_cleaned_up(self) -> None:
+        # The live case: a .git folder holding only info/ made a parent folder of projects get the files.
+        stub = self.root / "projects"
+        (stub / ".git" / "info").mkdir(parents=True)
+        block = "\n".join([known.EXCLUDE_BEGIN, *known.EXCLUDE_LINES, known.EXCLUDE_END]) + "\n"
+        (stub / ".git" / "info" / "exclude").write_text(block, encoding="utf-8")
+        (stub / known.IGNORE_FILE).write_text(known.IGNORE_TEXT, encoding="utf-8")
+        (stub / known.FOLDER).mkdir()
+        (stub / known.FOLDER / known.INDEX).write_text(known.MARKER + "\n", encoding="utf-8")
+        (stub / known.FOLDER / "general.md").write_text("# General\n", encoding="utf-8")
+        (stub / "notes.txt").write_text("the user's own\n", encoding="utf-8")
+        (self.root / "home" / known.STATUS_FILE).write_text(json.dumps({"marker": "old", "folders": [str(stub)]}),
+                                                            encoding="utf-8")
+        self.remember("The NAS answers on 10.0.0.10.", scope="global")
+        known.refresh(self.connection)
+        self.assertEqual([".git", "notes.txt"], sorted(path.name for path in stub.iterdir()))
+        self.assertEqual("", (stub / ".git" / "info" / "exclude").read_text(encoding="utf-8"))
+        self.assertTrue((self.project / known.FOLDER / known.INDEX).is_file())
+
+    def test_the_first_refresh_takes_the_folders_seen_in_the_last_30_days(self) -> None:
+        old = make_repository(self.root / "old", "https://gitlab.example.test/team/old.git")
+        self.clock.value = "2026-08-01T12:00:00Z"
+        Memory(self.store, agent="codex", clock=self.clock).project_for(old)
+        self.clock.value = "2026-09-27T12:00:00Z"
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        fresh = make_repository(self.root / "fresh")
+        known.worked_in(fresh)   # a session that started before the first refresh
+        known.refresh(self.connection)
+        self.assertTrue((self.project / known.FOLDER / known.INDEX).is_file())
+        self.assertTrue((fresh / known.FOLDER / known.INDEX).is_file())
+        self.assertFalse((old / known.FOLDER).exists())
+        record = json.loads((self.root / "home" / known.WORKED_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(2, len(record["folders"]))
+        self.assertTrue(record["seeded"])
+
+
+class CleanupTests(KnownTestCase):
+    """A folder no longer written keeps KnowItAll2's exclude lines until its folder and .ignore are gone."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        self.exclude = self.project / ".git" / "info" / "exclude"
+        known.worked_in(self.project)
+        known.refresh(self.connection)
+        self.assertTrue((self.project / known.FOLDER / "alpha.md").is_file())
+        self.assertIn(f"/{known.IGNORE_FILE}", self.exclude.read_text(encoding="utf-8"))
+        # Then the project is worked on in a copy elsewhere: the checkout is cleaned up at the next refresh.
+        self.moved = make_repository(self.root / "moved" / "alpha", "https://gitlab.example.com/team/alpha.git")
+        self.clock.value = "2026-09-28T10:00:00Z"
+        known.worked_in(self.moved)
+
+    def retiring(self) -> list[str]:
+        return [os.path.normcase(os.path.realpath(path)) for path in known.read_status().get("retiring", [])]
+
+    def assert_kept(self) -> None:
+        """KnowItAll2's exclude lines are all still there, and the cleanup is tried again later."""
+
+        self.assertIn("\n".join([known.EXCLUDE_BEGIN, *known.EXCLUDE_LINES, known.EXCLUDE_END]),
+                      self.exclude.read_text(encoding="utf-8"))
+        self.assertEqual([os.path.normcase(os.path.realpath(self.project))], self.retiring())
+
+    def assert_cleaned(self) -> None:
+        self.assertFalse((self.project / known.FOLDER).exists())
+        self.assertFalse((self.project / known.IGNORE_FILE).exists())
+        self.assertNotIn(known.EXCLUDE_BEGIN, text_of(self.exclude))
+        self.assertEqual([], self.retiring())
+
+    def test_while_git_cannot_run_everything_stays_and_is_tried_again(self) -> None:
+        # Release-candidate review (R-M2): the exclude lines went although the folder and .ignore stayed, so
+        # every memory about the project showed in git status, ready for a `git add -A`.
+        real = known._tracked
+        same = lambda root: known._key(Path(root).resolve()) == known._key(self.project.resolve())
+        refused = lambda root, git_dir: None if same(root) else real(root, git_dir)
+        with mock.patch.object(known, "_tracked", side_effect=refused):
+            known.refresh(self.connection)
+        self.assertTrue((self.moved / known.FOLDER / "alpha.md").is_file())
+        self.assertTrue((self.project / known.FOLDER / "alpha.md").is_file())
+        self.assertEqual(known.IGNORE_TEXT, text_of(self.project / known.IGNORE_FILE))
+        self.assert_kept()
+        known.refresh(self.connection, force=True)   # Git runs again
+        self.assert_cleaned()
+
+    def test_a_file_knowitall2_did_not_write_keeps_the_folder_and_the_exclude_lines(self) -> None:
+        left = self.project / known.FOLDER / ".README.md.x1y2.tmp"   # such as what a crash leaves
+        left.write_text("partial\n", encoding="utf-8")
+        report = known.refresh(self.connection)
+        self.assertEqual([left.name], [path.name for path in (self.project / known.FOLDER).iterdir()])
+        self.assertEqual(known.IGNORE_TEXT, text_of(self.project / known.IGNORE_FILE))
+        self.assert_kept()
+        self.assertIn("tried again", report.describe())
+        known.refresh(self.connection, force=True)
+        self.assert_kept()
+        left.unlink()
+        known.refresh(self.connection, force=True)
+        self.assert_cleaned()
+
+    def test_an_ignore_file_that_cannot_be_removed_keeps_the_exclude_lines(self) -> None:
+        real = Path.unlink
+
+        def unlink(path: Path, *args, **options) -> None:
+            if path.name == known.IGNORE_FILE:
+                raise PermissionError(13, "The process cannot access the file because it is being used")
+            real(path, *args, **options)
+
+        with mock.patch.object(Path, "unlink", unlink):
+            known.refresh(self.connection)
+        self.assertFalse((self.project / known.FOLDER).exists())
+        self.assertEqual(known.IGNORE_TEXT, text_of(self.project / known.IGNORE_FILE))
+        self.assert_kept()
+        known.refresh(self.connection, force=True)
+        self.assert_cleaned()
+
+    def test_exclude_lines_go_when_the_folder_and_ignore_file_were_never_there(self) -> None:
+        other = make_repository(self.root / "beta")
+        exclude = other / ".git" / "info" / "exclude"
+        exclude.parent.mkdir()
+        exclude.write_text("*.log\n" + "\n".join([known.EXCLUDE_BEGIN, *known.EXCLUDE_LINES, known.EXCLUDE_END]) + "\n",
+                           encoding="utf-8")
+        self.assertEqual([f"removed KnowItAll2's lines from {exclude.resolve()}"], known.remove_folder(other))
+        self.assertEqual("*.log\n", exclude.read_text(encoding="utf-8"))
+
+
+class OwnershipTests(KnownTestCase):
+    """A folder KnowItAll2 wrote before is its own by its record in the data home, not only by the marker."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        self.folder = self.project / known.FOLDER
+        known.worked_in(self.project)
+
+    def damaged(self, readme: bytes, *, recorded: bool) -> None:
+        """The folder as a crash on 2026-10-05 left six live ones: the index empty or zeros, the rest stale."""
+
+        self.folder.mkdir()
+        (self.folder / known.INDEX).write_bytes(readme)
+        (self.folder / "alpha.md").write_text("# alpha\n\nstale\n", encoding="utf-8")
+        if recorded:
+            (self.root / "home" / known.STATUS_FILE).write_text(
+                json.dumps({"marker": "old", "folders": [str(self.project)]}), encoding="utf-8")
+
+    def test_a_recorded_folder_with_an_empty_or_zeroed_index_is_written_again(self) -> None:
+        # Release-candidate review (R-M3): six active projects kept stale files, refused as not KnowItAll2's.
+        for readme in (b"", b"\0" * 7255):
+            with self.subTest(size=len(readme)):
+                self.damaged(readme, recorded=True)
+                report = known.refresh(self.connection)
+                self.assertEqual([None], [item.skipped for item in report.folders])
+                self.assertTrue(known.ours(self.folder))
+                self.assertIn("make deploy", text_of(self.folder / "alpha.md"))
+                shutil.rmtree(self.folder)
+
+    def test_an_unrecorded_folder_without_the_marker_is_still_refused(self) -> None:
+        self.damaged(b"\0" * 7255, recorded=False)
+        report = known.refresh(self.connection)
+        self.assertIn("not written by KnowItAll2", report.folders[0].skipped)
+        self.assertEqual(b"\0" * 7255, (self.folder / known.INDEX).read_bytes())
+        self.assertEqual("# alpha\n\nstale\n", text_of(self.folder / "alpha.md"))
+        self.assertEqual([{"folder": report.folders[0].root, "reason": "foreign"}], known.read_status()["refused"])
+
+    def test_a_folder_a_crash_zeroed_beside_knowitall2s_own_ignore_file_is_written_again(self) -> None:
+        # The six live folders had dropped out of KnowItAll2's record before it kept one: their index is all zeros,
+        # and the .ignore beside them is KnowItAll2's own, word for word.
+        self.damaged(b"\0" * 7255, recorded=False)
+        (self.project / known.IGNORE_FILE).write_text(known.IGNORE_TEXT, encoding="utf-8")
+        report = known.refresh(self.connection)
+        self.assertIsNone(report.folders[0].skipped)
+        self.assertTrue(known.ours(self.folder))
+        self.assertFalse((self.folder / "alpha.md").exists() and "stale" in text_of(self.folder / "alpha.md"))
+
+    def test_a_recorded_folder_holding_anything_but_markdown_is_still_refused(self) -> None:
+        self.damaged(b"", recorded=True)
+        (self.folder / "notes.txt").write_text("the user's own\n", encoding="utf-8")
+        report = known.refresh(self.connection)
+        self.assertIn("not written by KnowItAll2", report.folders[0].skipped)
+        self.assertEqual("# alpha\n\nstale\n", text_of(self.folder / "alpha.md"))
+        self.assertEqual(b"", (self.folder / known.INDEX).read_bytes())
+
+    def test_the_index_is_written_last(self) -> None:
+        files = known.render(self.connection)
+        index_first = {known.INDEX: files[known.INDEX], **{name: text for name, text in files.items() if name != known.INDEX}}
+        with mock.patch("knowitall2.known.write_text_atomic", wraps=known.write_text_atomic) as writes:
+            known.write_folder(self.project, index_first)
+        names = [Path(call.args[0]).name for call in writes.call_args_list if Path(call.args[0]).parent.name == known.FOLDER]
+        self.assertEqual(sorted(files), sorted(names))
+        self.assertEqual(known.INDEX, names[-1])
+
+    def test_a_new_folder_a_crash_left_without_its_index_is_written_again(self) -> None:
+        # With the index written last, a crash before it left files no marker vouched for: the record does.
+        class Crash(BaseException):
+            pass
+
+        real = known.write_text_atomic
+
+        def crash(path, text, **options):
+            if Path(path).name == known.INDEX:
+                raise Crash()
+            real(path, text, **options)
+
+        with mock.patch("knowitall2.known.write_text_atomic", side_effect=crash), self.assertRaises(Crash):
+            known.refresh(self.connection)
+        self.assertTrue((self.folder / "alpha.md").is_file())
+        self.assertFalse((self.folder / known.INDEX).exists())
+        known.refresh(self.connection)
+        self.assertTrue(known.ours(self.folder))
+
+    def test_doctor_names_a_folder_the_refresh_refused_and_what_to_do(self) -> None:
+        from knowitall2 import doctor
+        from knowitall2.agents.base import describe_checks
+
+        self.damaged(b"\0" * 7255, recorded=False)
+        beta = make_repository(self.root / "beta")
+        known.worked_in(beta)
+        self.remember("Beta builds with npm.", scope="project", project_path=beta)
+        real = known._tracked
+        same = lambda root: known._key(Path(root).resolve()) == known._key(beta.resolve())
+        with mock.patch.object(known, "_tracked", side_effect=lambda root, git_dir: None if same(root) else real(root, git_dir)):
+            known.refresh(self.connection)
+        checks = doctor._refused_folder_checks()
+        self.assertEqual(2, len(checks))
+        text = describe_checks(checks)
+        self.assertTrue(all(line.startswith(("NOTE ", "     fix: ")) for line in text.splitlines()), text)
+        foreign = next(check for check in checks if os.path.normcase(str(self.project.resolve())) in os.path.normcase(check.detail))
+        self.assertIn("not written by KnowItAll2", foreign.detail)
+        self.assertIn("delete", foreign.fix)
+        git = next(check for check in checks if check is not foreign)
+        self.assertIn(os.path.normcase(str(beta.resolve())), os.path.normcase(git.detail))
+        self.assertIn("Git could not be run", git.detail)
+        self.assertIn("git -C", git.fix)
+        known.set_enabled(False)
+        self.assertEqual([], doctor._refused_folder_checks())
+
+
+class SelectionTests(KnownTestCase):
+    """Each project's folder holds its own memories and the shared memories about the systems it uses."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.beta = make_repository(self.root / "beta", "https://gitlab.example.test/team/beta.git")
+        self.filed = self.remember("Alpha backs up to the NAS share alpha-backups.", scope="project")
+        self.file(self.filed.id, "Synology")
+        self.naming = self.remember("Alpha's deploys go through the EdgeRouter first.", scope="project")
+        self.own = self.remember("Alpha deploys with make deploy.", scope="project")
+        for number in range(3):
+            self.file(self.remember(f"The EdgeRouter note {number}: it answers on 10.0.0.1.", scope="global").id,
+                      "EdgeRouter")
+            self.file(self.remember(f"The office printer note {number}: it takes toner.", scope="global").id, "Printer")
+        self.loose = self.remember("Prefer tabs over spaces in shell scripts.", scope="global")
+        self.betas = self.remember("Beta's release is signed with the vault entry beta-sign.", scope="project",
+                                   project_path=self.beta)
+        known.worked_in(self.project)
+        known.worked_in(self.beta)
+        known.refresh(self.connection)
+
+    def listed(self, root: Path) -> list[str]:
+        return sorted(path.name for path in (root / known.FOLDER).iterdir())
+
+    def test_each_project_gets_its_own_files_and_those_of_the_systems_it_uses(self) -> None:
+        # Review 2026-10-11: every folder held everything KnowItAll2 knew, from every project.
+        self.assertEqual(["README.md", "alpha.md", "edgerouter.md", "general.md", "synology.md"], self.listed(self.project))
+        self.assertEqual(["README.md", "beta.md", "general.md"], self.listed(self.beta))
+        held = "".join(text_of(path) for path in (self.project / known.FOLDER).iterdir())
+        for record in (self.filed, self.naming, self.own, self.loose):
+            self.assertIn(record.id, held)
+        self.assertNotIn(self.betas.id, held)
+        self.assertNotIn("toner", held)
+
+    def test_the_index_lists_only_the_files_present(self) -> None:
+        index = text_of(self.project / known.FOLDER / known.INDEX)
+        self.assertEqual(known.MARKER, index.splitlines()[0])
+        listed = sorted(line.split(":")[0][2:] for line in index.splitlines() if line.startswith("- "))
+        self.assertEqual(["alpha.md", "edgerouter.md", "general.md", "synology.md"], listed)
+
+    def test_a_pointer_goes_only_to_a_file_in_the_projects_folder(self) -> None:
+        folder = self.project / known.FOLDER
+        self.assertEqual([], known.find_pointers(self.connection, ["the Printer is jammed again"], folder, []))
+        self.assertEqual(["edgerouter.md"], [target for target, _ in known.find_pointers(
+            self.connection, ["the EdgeRouter dropped the route"], folder, [])])
+
+
 class PointerTests(KnownTestCase):
     def systems(self, *, memories: int = 3):
-        """Three systems, each with enough memories that a pointer to it is worth showing."""
+        """Three systems this project uses, each with enough memories that a pointer to it is worth showing."""
 
         for system, aliases, words in (("Synology", ["nas-file1", "NAS", "shared-name"], "the NAS"),
                                        ("gw-control", ["control host", "shared-name"], "the gateway"),
                                        ("Hermes", ["gw-control"], "the helper runner")):
             for number in range(memories):
-                saved = self.remember(f"Note {number} about {words}: sudo -u hermes, step {number}.", scope="global")
+                saved = self.remember(f"Note {number} about {words}: sudo -u hermes, step {number}.", scope="project")
                 self.file(saved.id, system, aliases=aliases)
         known.refresh(self.connection)
         return self.project / known.FOLDER
@@ -437,7 +1058,7 @@ class PointerTests(KnownTestCase):
     def test_logins_paths_and_small_files_bring_no_pointer(self) -> None:
         # Each of these pointed agents to files the work did not need, so they skipped the rest (2026-10-05).
         folder = self.systems()
-        tiny = self.remember("Linux note.", scope="global")
+        tiny = self.remember("Linux note.", scope="project")
         self.file(tiny.id, "Linux")
         known.refresh(self.connection)
         for text in ("ssh synology@10.0.0.5", r"C:\Projects\synology\src", "see .synology/config",
@@ -451,7 +1072,7 @@ class PointerTests(KnownTestCase):
         # Agents pass on KnowItAll2's news, which pointed them to its file in every project (2026-10-10).
         folder = self.systems()
         for number in range(3):
-            saved = self.remember(f"KnowItAll2 note {number}: run its update script.", scope="global")
+            saved = self.remember(f"KnowItAll2 note {number}: run its update script.", scope="project")
             self.file(saved.id, "KnowItAll2", aliases=["KIA2"])
         known.refresh(self.connection)
         news = ["KnowItAll2 learned 3 things from this session.", "KIA2 saved the NAS route."]
@@ -470,7 +1091,8 @@ class PointerTests(KnownTestCase):
         self.remember("Alpha deploys with make deploy.", scope="project")
         self.assertNotIn(known.FOLDER, self.memory.briefing(project_path=self.project))
         known.refresh(self.connection)
-        self.assertIn(f"Everything KnowItAll2 knows is also in {known.FOLDER}/", self.memory.briefing(project_path=self.project))
+        self.assertIn(f"What KnowItAll2 knows about this project and the systems it uses is also in {known.FOLDER}/",
+                      self.memory.briefing(project_path=self.project))
 
     def test_every_agent_text_says_where_everything_is(self) -> None:
         from knowitall2.agents import instructions, skill
@@ -507,7 +1129,7 @@ class PointerHookTests(unittest.TestCase):
                                 aliases=["nas-file1"], now=memory.now())
             for number in range(3):
                 nas = memory.remember(f"To read files on the NAS, step {number}: sudo -u hermes and run the helper.",
-                                      scope="global", project_path=self.alpha).record
+                                      scope="project", project_path=self.alpha).record
                 store.set_note(nas.id, headline="NAS", system_id="sys-syn", facet="access", written_by="catalog",
                                now=memory.now())
             known.refresh(store._connection)
@@ -552,6 +1174,23 @@ class PointerHookTests(unittest.TestCase):
             for record in self.builder(self.alpha).assistant(text("I'll try nas-file1 another way.")).records:
                 stream.write(json.dumps(record) + "\n")
         self.assertIn("synology.md", self.message("go on"))
+
+    def test_the_hooks_note_the_folder_the_agent_works_in(self) -> None:
+        # Only a folder an agent session runs in counts, as both agents' hooks report it.
+        from knowitall2 import hooks
+
+        beta = make_repository(self.root / "work" / "beta")
+        gamma = make_repository(self.root / "work" / "gamma")
+        (beta / "src").mkdir()
+        (beta / "src" / "main.py").write_text("print('beta')\n", encoding="utf-8")
+        hooks.session_start(json.dumps({"session_id": self.session, "transcript_path": str(self.log),
+                                        "cwd": str(beta / "src"), "source": "startup"}), start_learner=lambda: None)
+        hooks.prompt_submit(json.dumps({"session_id": "codex-chat", "cwd": str(gamma), "prompt": "hello",
+                                        "hook_event_name": "UserPromptSubmit"}), agent="codex")
+        noted = known.worked_folders()
+        for folder in (beta, gamma):
+            self.assertIn(os.path.normcase(str(folder.resolve())), noted)
+        self.assertNotIn(os.path.normcase(str((beta / "src").resolve())), noted)
 
     def test_turned_off_means_no_pointer(self) -> None:
         from knowitall2 import hooks

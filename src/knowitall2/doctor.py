@@ -12,11 +12,13 @@ from .agents import AGENT_NAMES, Check, adapter_for, probe_server, server_launch
 from .agents.base import cli_command, was_set_up
 from .paths import data_home, database_path, in_package_storage
 from .secrets import find_secrets
-from .store import SCHEMA_VERSION, StoreError, inspect_database
+from .store import SCHEMA_VERSION, StoreError, inspect_database, inspect_maintenance
 from .update import update_command
 
 # How many memories that look like secrets are named; the rest are counted.
 _SECRETS_SHOWN = 20
+# Maintenance without a model call for this long, while groups of memories wait for it, is worth a note.
+MAINTENANCE_STALLED_DAYS = 3
 
 
 def run_checks(*, agents: Iterable[str] | None = None, user_home: Path | None = None) -> list[Check]:
@@ -24,7 +26,9 @@ def run_checks(*, agents: Iterable[str] | None = None, user_home: Path | None = 
 
     launch = server_launch()
     checks = [_python_check(), _fts5_check(), _location_check(), *_store_checks(), _sharing_check(),
-              _engine_check(), _known_files_check(), probe_server(launch)]
+              _engine_check(), _maintenance_check(), _known_files_check(), *_refused_folder_checks(),
+              *_cloud_folder_checks(),
+              probe_server(launch)]
     for name in agents or AGENT_NAMES:
         adapter = adapter_for(name, user_home=user_home)
         if agents is None and adapter.installed() and not was_set_up(adapter):
@@ -66,6 +70,42 @@ def _engine_check() -> Check:
     return Check("learning engine", True, f"{name} at {describe_engine(found)}")
 
 
+def _maintenance_check() -> Check:
+    """Whether maintenance, when learning is on, still tidies memories while groups of them wait for it.
+
+    Read from the journal's learning runs: on 2026-10-11 maintenance had made no call in 13 days while 181
+    groups waited, and nothing said so.
+    """
+
+    from datetime import datetime, timedelta, timezone
+
+    from .learning.state import load_settings
+
+    name = "maintenance"
+    if not load_settings().enabled:
+        return Check(name, True, "learning is off, and tidying up memories with it")
+    path = database_path()
+    if not path.exists():
+        return Check(name, True, "nothing to tidy up yet")
+    try:
+        found = inspect_maintenance(path)
+    except StoreError as exc:
+        return Check(name, True, f"could not read the journal: {exc}")
+    last, waiting = found["last_call"], found["waiting"]
+    when = last[:16].replace("T", " ") + " UTC" if last else "never"
+    since = (datetime.now(timezone.utc) - timedelta(days=MAINTENANCE_STALLED_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not waiting or (last or "") >= since or (found["first_run"] or since) >= since:
+        detail = f"last tidied up memories {when}" + (f"; {waiting} groups wait for it" if waiting else "")
+        return Check(name, True, detail)
+    return Check(
+        name, True,
+        f"tidying up memories (merging duplicates, settling outdated ones) has made no model call since {when}, "
+        f"and {waiting} groups of memories wait for it",
+        f"Run: {cli_command('maintain')} to tidy up now; each run reviews a few groups, so run it again until "
+        "none wait.",
+    )
+
+
 def _sharing_check() -> Check:
     """Whether memory is kept here only, or shared through a server that answers."""
 
@@ -105,6 +145,62 @@ def _known_files_check() -> Check:
                      (f"; and {len(problems) - 3} more" if len(problems) > 3 else ""),
                      f"See the notes above; then run: {cli_command('known')}")
     return Check(name, True, detail)
+
+
+def _refused_folder_checks() -> list[Check]:
+    """A note for each project folder the knowledge files should be in but the last refresh refused, with
+    why and what to do: six projects kept stale files for days, and nothing said so (release-candidate
+    review, R-M3)."""
+
+    from . import known
+
+    if not known.enabled():
+        return []
+    refused = known.read_status().get("refused")
+    checks = []
+    for item in refused if isinstance(refused, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("folder"), str):
+            continue
+        root = item["folder"]
+        folder = str(Path(root) / known.FOLDER)
+        why, fix = {
+            "link": (f"{folder} is a link, or holds one, and KnowItAll2 never writes through a link",
+                     f"Delete the link (what it points to is kept), then run: {cli_command('known')}"),
+            "tracked": (f"Git tracks {known.FOLDER}/ there, so it is the repository's own",
+                        f"If those files are KnowItAll2's, untrack them (git -C \"{root}\" rm -r --cached "
+                        f"{known.FOLDER}) and commit, then run: {cli_command('known')}"),
+            "git": (f"Git could not be run there to check that it does not track {known.FOLDER}/",
+                    f"Check that Git works there (run: git -C \"{root}\" status), then run: {cli_command('known')}"),
+        }.get(item.get("reason"), (
+            f"{folder} was not written by KnowItAll2, or its {known.INDEX} is empty or damaged",
+            f"If it holds only KnowItAll2's old files, delete that folder, then run: {cli_command('known')}"))
+        checks.append(Check("knowledge files", True, f"not written in {root}: {why}", fix))
+    return checks
+
+
+def _cloud_folder_checks(*, home: Path | None = None) -> list[Check]:
+    """A note naming the project folders agents work in that OneDrive, Dropbox, Google Drive, or iCloud keeps
+    in sync, so they can be moved; nothing when there are none."""
+
+    from . import known
+
+    places = [os.environ.get(name) for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")]
+    places += [str((home or Path.home()) / name) for name in ("Dropbox", "Google Drive", "iCloudDrive")]
+    synced = [os.path.normcase(str(Path(place).resolve())).rstrip("\\/") for place in places if place]
+    found = []
+    for folder in sorted(known.worked_folders()):
+        if any(folder == place or folder.startswith(place + os.sep) for place in synced):
+            try:
+                found.append(str(Path(folder).resolve(strict=True)))
+            except OSError:
+                found.append(folder)
+    if not found:
+        return []
+    return [Check("project folders", True,
+                  f"{len(found)} project folder{'s are' if len(found) > 1 else ' is'} in a folder that a cloud "
+                  f"service keeps in sync: {'; '.join(found)}",
+                  f"Move {'these projects' if len(found) > 1 else 'this project'} to a folder on this computer that "
+                  "is not synced, and open it from there.")]
 
 
 def _python_check() -> Check:

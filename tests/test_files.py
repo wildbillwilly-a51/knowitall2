@@ -75,6 +75,27 @@ class ReplacingTests(FilesTestCase):
         self.assertEqual(0, defaults, f"{defaults} of {reads} reads fell back to the defaults")
         self.assertEqual([], failures[:3])
 
+    def test_the_text_is_on_disk_before_it_replaces_the_file(self) -> None:
+        # Release-candidate review (R-M3): a crash after the replace but before the text reached the disk left
+        # seven README.md files as zeros, and the folders were refused from then on.
+        target = self.root / "README.md"
+        text = "# What KnowItAll2 knows\n"
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(handle: int) -> None:
+            events.append(("fsync", os.fstat(handle).st_size))
+            real_fsync(handle)
+
+        def replace(source, destination) -> None:
+            events.append(("replace", Path(destination).name))
+            real_replace(source, destination)
+
+        with mock.patch("os.fsync", fsync), mock.patch("os.replace", replace):
+            write_text_atomic(target, text)
+        self.assertEqual([("fsync", len(text)), ("replace", "README.md")], events[:2])
+        self.assertEqual(text, target.read_text(encoding="utf-8"))
+
     def test_reading_text_accepts_a_byte_order_mark(self) -> None:
         path = self.root / "notes.txt"
         path.write_bytes((BOM + "first\r\nsecond\n").encode("utf-8"))
@@ -93,6 +114,23 @@ class ReplacingTests(FilesTestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual("after\n", real.read_text(encoding="utf-8"))
         self.assertEqual(["CLAUDE.md"], [path.name for path in real.parent.iterdir()])
+
+    def test_without_following_links_the_link_itself_is_replaced(self) -> None:
+        # For files in repositories, where a cloned link could point anywhere (review 2026-10-11).
+        real = self.root / "outside" / "important.conf"
+        real.parent.mkdir()
+        real.write_text("before\n", encoding="utf-8")
+        link = self.root / "general.md"
+        try:
+            os.symlink(real, link)
+        except OSError as exc:
+            self.skipTest(f"symbolic links cannot be created here: {exc}")
+        write_text_atomic(link, "after\n", follow_links=False)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual("after\n", link.read_text(encoding="utf-8"))
+        self.assertEqual("before\n", real.read_text(encoding="utf-8"))
+        if sys.platform != "win32":
+            self.assertEqual(0o600, stat.S_IMODE(link.stat().st_mode))   # not the link's own mode
 
     @unittest.skipIf(sys.platform == "win32", "POSIX file modes")
     def test_a_rewrite_keeps_the_files_mode(self) -> None:

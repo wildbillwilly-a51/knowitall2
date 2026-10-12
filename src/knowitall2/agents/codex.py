@@ -1,6 +1,9 @@
 """Codex adapter: an MCP entry in ``config.toml``, the knowitall2 Skill, session hooks, and a block in AGENTS.md.
 
-- In ``config.toml``, KnowItAll2 edits only its own marked block. Every other
+- In ``config.toml``, KnowItAll2 edits only its own marked block, and tables
+  of its server entry found outside it (setup moves them into the block,
+  uninstall removes them). Keys and tables of the entry that setup does not
+  write, such as ``enabled`` or a tool's approval, are kept. Every other
   byte of the file is preserved, and the edited file is validated before it
   replaces the original. No copy of the file is made, because agent
   configuration can hold other servers' credentials.
@@ -14,11 +17,15 @@
   a path has a character that one of those shells would misread (such as
   ``'`` or ``&``), no command works in both, and the hooks are left out.
   Codex runs a hook only after the user has trusted it once with ``/hooks``.
+  Such a command cannot test for a missing launcher, so uninstalling leaves
+  the launcher in place, doing nothing, for chats still open with the hooks.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
+import math
 import os
 import re
 import shlex
@@ -56,6 +63,8 @@ HOOK_LAUNCHER = "codex_session_start.py"
 HOOK_MATCHER = "startup|resume|clear|compact"
 HOOK_TIMEOUT_SECONDS = 30
 HOOK_STATUS = "Loading KnowItAll2 memory"
+INERT_LAUNCHER = ('"""Left by `knowitall2 uninstall codex` for Codex chats still open with its hooks: '
+                  'it does nothing."""\nraise SystemExit(0)\n')
 # Session start adds the briefing; a turn's end learns after a commit and shows
 # what was learned; the user's message adds what is new since the chat began.
 # Codex has no hook for a session's end.
@@ -72,6 +81,7 @@ class CodexAdapter(AgentAdapter):
     display_name = "Codex"
 
     def __init__(self, *, user_home: Path | None = None) -> None:
+        self.user_home = user_home
         if user_home is not None:
             self.home = user_home / ".codex"
         else:
@@ -128,7 +138,14 @@ class CodexAdapter(AgentAdapter):
         instruction_files = [self.home / "AGENTS.override.md", self.home / "AGENTS.md"]
         for path in instruction_files:
             instructions.ensure_editable(path)
-        changes = [change for change in (self._unregister_server(), self._remove_hook()) if change]
+        server_change = self._unregister_server()
+        hook_change = self._remove_hook()
+        if hook_change and self.user_home is None:
+            # A Codex chat open since before keeps running the hooks until Codex reloads them, and the Windows
+            # command cannot test for a missing file: the launcher stays, doing nothing. The data home is left
+            # alone when testing against another home.
+            write_text_atomic(hook_launcher_path(), INERT_LAUNCHER)
+        changes = [change for change in (server_change, hook_change) if change]
         skill_change = remove_skill(self.skills_dir)
         if skill_change:
             changes.append(skill_change)
@@ -142,28 +159,35 @@ class CodexAdapter(AgentAdapter):
         for _ in range(_WRITE_ATTEMPTS):
             text = self._read_config()
             original = _parse(text, self.config_path)
-            span = _block_span(text, self.config_path)
-            newline = "\r\n" if "\r\n" in text else "\n"
-            block = render_block(launch, newline)
-            if span is None:
+            if _block_span(text, self.config_path) is None:
                 _foreign_server_check(original, self.config_path)
-                if not text or text.endswith(newline * 2):
+            newline = "\r\n" if "\r\n" in text else "\n"
+            # Keys and tables of the entry that setup does not write (such as `enabled`, or a tool's approval) are
+            # the user's or Codex's: they are written into the block again, and any outside it (Codex adds a table
+            # at the end of the file) move into it.
+            kept = _kept_settings(original)
+            block = render_block(launch, newline, kept)
+            base = _without_stray_tables(text)
+            span = _block_span(base, self.config_path)
+            if span is None:
+                if not base or base.endswith(newline * 2):
                     separator = ""
-                elif text.endswith(newline):
+                elif base.endswith(newline):
                     separator = newline
                 else:
                     separator = newline * 2
-                updated = text + separator + block + newline
+                updated = base + separator + block + newline
             else:
                 # Codex appends new tables (such as a hook's trust record) at the end of
                 # the file, which can be inside this block; keep them, after the block.
-                foreign = _foreign_lines(text[span[0]:span[1]], newline)
-                kept = newline * 2 + newline.join(foreign) if foreign else ""
-                updated = text[: span[0]] + block + kept + text[span[1]:]
+                foreign = _foreign_lines(base[span[0]:span[1]], newline)
+                after = newline * 2 + newline.join(foreign) if foreign else ""
+                updated = base[: span[0]] + block + after + base[span[1]:]
             if updated == text:
                 return None
             parsed = _parse(updated, self.config_path, after_edit=True)
-            if not launch_matches((parsed.get("mcp_servers") or {}).get(SERVER_NAME), launch):
+            if (not launch_matches((parsed.get("mcp_servers") or {}).get(SERVER_NAME), launch)
+                    or _kept_settings(parsed) != kept):
                 raise AgentError("The rendered Codex entry did not read back as expected; nothing was changed.")
             if _without_ours(parsed) != _without_ours(original):
                 raise AgentError("Editing the Codex settings would change more than KnowItAll2's entry; nothing was changed.")
@@ -178,22 +202,32 @@ class CodexAdapter(AgentAdapter):
             if not self.config_path.is_file():
                 return None
             text = self._read_config()
-            span = _block_span(text, self.config_path)
-            if span is None:
+            original = _parse(text, self.config_path)
+            entry = (original.get("mcp_servers") or {}).get(SERVER_NAME)
+            had_block = _block_span(text, self.config_path) is not None
+            if not had_block and (entry is None or _foreign_entry(entry)):
                 return None
-            start, end = span
             newline = "\r\n" if "\r\n" in text else "\n"
-            foreign = _foreign_lines(text[start:end], newline)
-            if foreign:
-                updated = text[:start] + newline.join(foreign) + text[end:]
-            else:
-                if text[end:].startswith(newline):
-                    end += len(newline)
-                if text[:start].endswith(newline * 2):
-                    start -= len(newline)
-                updated = text[:start] + text[end:]
+            # Tables of the entry outside the block go too: left with no command, they would stop Codex from
+            # loading its settings at all.
+            updated = _without_stray_tables(text)
+            span = _block_span(updated, self.config_path)
+            if span is not None:
+                start, end = span
+                foreign = _foreign_lines(updated[start:end], newline)
+                if foreign:
+                    updated = updated[:start] + newline.join(foreign) + updated[end:]
+                else:
+                    if updated[end:].startswith(newline):
+                        end += len(newline)
+                    if updated[:start].endswith(newline * 2):
+                        start -= len(newline)
+                    updated = updated[:start] + updated[end:]
             parsed = _parse(updated, self.config_path, after_edit=True)
-            if _without_ours(parsed) != _without_ours(_parse(text, self.config_path)):
+            if SERVER_NAME in (parsed.get("mcp_servers") or {}):
+                raise AgentError(f"Part of mcp_servers.{SERVER_NAME} in {self.config_path} is not in a table of its own, "
+                                 "so it cannot be removed safely; nothing was changed. Remove those lines by hand.")
+            if _without_ours(parsed) != _without_ours(original):
                 raise AgentError("Removing KnowItAll2 would change other Codex settings; nothing was changed.")
             if self._read_config() != text:
                 continue
@@ -203,7 +237,9 @@ class CodexAdapter(AgentAdapter):
                 # Only KnowItAll2's block was in the file; Codex treats a
                 # missing config the same as an empty one.
                 self.config_path.unlink()
-            return f"removed the knowitall2 MCP server from {self.config_path}"
+            if had_block:
+                return f"removed the knowitall2 MCP server from {self.config_path}"
+            return f"removed the mcp_servers.{SERVER_NAME} settings left in {self.config_path}"
         raise AgentError(f"{self.config_path} kept changing; close Codex and run uninstall again.")
 
     def checks(self, launch: ServerLaunch) -> list[Check]:
@@ -247,6 +283,7 @@ class CodexAdapter(AgentAdapter):
         if self._hooks_skipped:
             # A hook command that one of Codex's shells would misread could run something else.
             removed = self._remove_hook()
+            hook_launcher_path().unlink(missing_ok=True)
             skipped = (f"did not add the KnowItAll2 session hooks: {self._hooks_skipped}. Codex still reaches "
                        "KnowItAll2 through its tools, but without the automatic briefing or learning after a commit")
             return f"{removed}; {skipped}" if removed else skipped
@@ -293,7 +330,6 @@ class CodexAdapter(AgentAdapter):
                     break
             else:
                 raise AgentError(f"{self.hooks_path} kept changing; close Codex and run uninstall again.")
-        hook_launcher_path().unlink(missing_ok=True)
         return change
 
     def _hook_check(self, launch: ServerLaunch) -> Check:
@@ -499,18 +535,70 @@ def _drop_our_hooks(groups: list[Any]) -> None:
                 groups.remove(group)
 
 
-def render_block(launch: ServerLaunch, newline: str = "\n") -> str:
+def render_block(launch: ServerLaunch, newline: str = "\n", kept: dict[str, Any] | None = None) -> str:
+    """KnowItAll2's block: its server entry for ``launch``, with ``kept``, the entry's other keys and tables."""
+
+    kept = kept or {}
     lines = [
         BEGIN,
         f"[mcp_servers.{SERVER_NAME}]",
         f"command = {_toml_string(launch.command)}",
         "args = [" + ", ".join(_toml_string(argument) for argument in launch.args) + "]",
+        *(f"{_toml_key(key)} = {_toml_value(value)}" for key, value in kept.items() if not isinstance(value, dict)),
     ]
     if launch.env:
         lines.append(f"[mcp_servers.{SERVER_NAME}.env]")
         lines.extend(f"{key} = {_toml_string(value)}" for key, value in sorted(launch.env.items()))
+    for key, value in kept.items():
+        if isinstance(value, dict):
+            lines.extend(_toml_table(("mcp_servers", SERVER_NAME, key), value))
     lines.append(END)
     return newline.join(lines)
+
+
+# The keys of the server entry that setup writes; any other key or table in it is kept.
+_OWN_KEYS = ("command", "args", "env")
+
+
+def _kept_settings(parsed: dict) -> dict[str, Any]:
+    entry = (parsed.get("mcp_servers") or {}).get(SERVER_NAME)
+    return {key: value for key, value in entry.items() if key not in _OWN_KEYS} if isinstance(entry, dict) else {}
+
+
+def _toml_table(path: tuple[str, ...], table: dict) -> list[str]:
+    values = {key: value for key, value in table.items() if not isinstance(value, dict)}
+    lines = []
+    if values or not table:  # a table holding only tables needs no header of its own
+        lines.append("[" + ".".join(_toml_key(part) for part in path) + "]")
+        lines.extend(f"{_toml_key(key)} = {_toml_value(value)}" for key, value in values.items())
+    for key, value in table.items():
+        if isinstance(value, dict):
+            lines.extend(_toml_table((*path, key), value))
+    return lines
+
+
+def _toml_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _toml_string(key)
+
+
+def _toml_value(value: Any) -> str:
+    """A value as ``tomllib`` read it, written back in TOML; the edited file is read again to check it."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf") if math.isinf(value) else repr(value)
+    if isinstance(value, str):
+        return _toml_string(value)
+    if isinstance(value, (datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{_toml_key(key)} = {_toml_value(item)}" for key, item in value.items()) + "}"
+    raise AgentError(f"KnowItAll2's Codex entry holds a value it cannot write again ({value!r}); nothing was changed.")
 
 
 _TABLE_HEADER = re.compile(r"^\s*\[\[?\s*(.+?)\s*\]\]?\s*(#.*)?$")
@@ -537,13 +625,83 @@ def _foreign_lines(block_text: str, newline: str) -> list[str]:
 
 
 def _foreign_server_check(parsed: dict, path: Path) -> None:
-    """Refuse a knowitall2 server entry outside KnowItAll2's managed block."""
+    """Refuse a server named knowitall2 outside KnowItAll2's managed block that is not KnowItAll2's. Tables of
+    KnowItAll2's own entry left there (such as a tool's approval, with no command) are taken into the block."""
 
-    if SERVER_NAME in (parsed.get("mcp_servers") or {}):
+    entry = (parsed.get("mcp_servers") or {}).get(SERVER_NAME)
+    if entry is not None and _foreign_entry(entry):
         raise AgentError(
             f"{path} already defines mcp_servers.{SERVER_NAME} outside KnowItAll2's managed "
             "block. Remove that entry, then run setup again."
         )
+
+
+def _foreign_entry(entry: object) -> bool:
+    """Whether an entry named knowitall2 starts some other server."""
+
+    if not isinstance(entry, dict):
+        return True
+    if "command" not in entry and "url" not in entry:
+        return False
+    args = entry.get("args")
+    return not (isinstance(args, list) and "knowitall2" in args and "serve" in args)
+
+
+def _without_stray_tables(text: str) -> str:
+    """``text`` without the tables of KnowItAll2's entry outside its block.
+
+    Each goes from its header to its last line before the next table or the
+    block, with the blank lines after it (at the end of the file, before it);
+    comments just before the next table stay with that table.
+    """
+
+    lines = text.splitlines(keepends=True)
+    keep = [True] * len(lines)
+
+    def drop(start: int, last: int) -> None:
+        end = last + 1
+        while end < len(lines) and not lines[end].strip():
+            end += 1
+        if end == len(lines):
+            while start > 0 and not lines[start - 1].strip():
+                start -= 1
+        keep[start:end] = [False] * (end - start)
+
+    inside, start, last = False, None, 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        path = _table_path(line)
+        if path is None and stripped not in (BEGIN, END):
+            if start is not None and stripped and not stripped.startswith("#"):
+                last = index
+            continue
+        if start is not None:
+            drop(start, last)
+            start = None
+        if stripped in (BEGIN, END):
+            inside = stripped == BEGIN
+        elif not inside and path[:2] == ("mcp_servers", SERVER_NAME):
+            start = last = index
+    if start is not None:
+        drop(start, last)
+    return "".join(line for line, kept in zip(lines, keep) if kept)
+
+
+def _table_path(line: str) -> tuple[str, ...] | None:
+    """The keys a table header names (``[a."b".c]`` names a, b, c), or None for any other line."""
+
+    header = _TABLE_HEADER.match(line.rstrip("\r\n"))
+    if header is None:
+        return None
+    try:
+        table: object = tomllib.loads(f"[{header.group(1)}]")
+    except tomllib.TOMLDecodeError:
+        return None
+    path = []
+    while isinstance(table, dict) and len(table) == 1:
+        key, table = next(iter(table.items()))
+        path.append(key)
+    return tuple(path)
 
 
 def _without_ours(parsed: dict) -> dict:
@@ -559,8 +717,8 @@ def _without_ours(parsed: dict) -> dict:
 
 
 def _toml_string(value: str) -> str:
-    # A JSON string without ASCII escaping is a valid TOML basic string.
-    return json.dumps(value, ensure_ascii=False)
+    # A JSON string without ASCII escaping is a valid TOML basic string, once DEL is escaped too.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def _block_span(text: str, path: Path) -> tuple[int, int] | None:

@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.10.6 (2026-10-12)
+
+From a full review of 0.10.5 on 2026-10-11, with your decisions about where
+KnowItAll2 may write.
+
+- **Knowledge files only where you work now.** A project moved to a new
+  folder no longer has its old copy written: files go only to the copy of
+  each project an agent last worked in (and its worktrees), and a folder no
+  agent has used for 30 days stops too. KnowItAll2 takes its own files out of
+  the folders it stops writing, once, and never touches them again. A
+  leftover empty `.git` folder no longer counts as a repository.
+- **Each project's folder holds what concerns it.** The project's own
+  memories and those of the systems it uses, not everything KnowItAll2
+  knows; agents still reach the rest with recall. `doctor` names projects
+  that live in a folder OneDrive or the like keeps in sync.
+- **KnowItAll2 tidies itself again.** Merging repeated memories had made no
+  call in two weeks, because learning from your work used up the day's
+  calls. Tidying now has its own few calls a day that nothing else can use,
+  `doctor` says when it stalls, and `knowitall2 maintain --max-calls N`
+  catches up. Background learning takes the newest chats first and sets
+  aside those quiet for 14 days (`learn --catch-up` still takes them).
+- **Tidying is careful with what you said.** Two memories merge only when
+  they say the same thing, your own words nearly word for word; one is
+  marked outdated only by a newer memory at least as well supported.
+- **When you change your mind, the newer words win.** "Never squash
+  commits" after "Always squash commits" replaces the old preference instead
+  of counting as saying it again; which words are newer follows when you
+  said them, not when the chat was learned. A preference is saved in your
+  own words, counted once per chat, and one that contradicts one of your
+  rules is kept and asked about.
+- **A rule only from your own plain words.** "Make that a rule" counts, and
+  "from now on" at the start of an instruction; "don't make that a rule",
+  "as a rule of thumb", and text you pasted or quoted do not.
+- **Claude Code can never be blocked by KnowItAll2.** If KnowItAll2's files
+  are missing (deleted, or mid-uninstall), its hooks now do nothing instead
+  of stopping every message. Uninstalling one agent no longer touches what
+  the other uses, says to delete the folder only when nothing uses it, and a
+  test uninstall never touches the real data home.
+- **A busy memory no longer costs a new chat its briefing.** The briefing is
+  read without waiting for another process that is writing.
+- **Codex keeps its settings for KnowItAll2.** Settings you add to
+  KnowItAll2's server entry survive an update, and uninstalling leaves
+  nothing that stops Codex from starting.
+- **Only checked lessons when a command fails.** The reminder after a failed
+  command now uses only lessons that were observed or that you stated.
+- **More passwords caught.** About 40 more shapes are kept out of memory and
+  out of what learning sends to the model, among them `sqlcmd -P`,
+  `redis-cli -a`, piped `ConvertTo-SecureString`, XML and Docker
+  credentials, Cisco and OpenWrt passwords, and Tailscale, Vault, and Docker
+  Hub tokens; placeholders and prose that only look like secrets are no
+  longer flagged.
+- **A leftover rule question closes.** "Should it be a rule?" questions made
+  before 0.10.5 are settled as notes.
+
 ## 0.10.5 (2026-10-11)
 
 From your review of how KnowItAll2 weighs what you say: something said once in

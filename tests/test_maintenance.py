@@ -103,7 +103,7 @@ class PlanTests(MaintenanceTestCase):
 class GateTests(MaintenanceTestCase):
     def test_the_fullest_copy_replaces_duplicates_with_no_stronger_evidence(self) -> None:
         full = self.save("The NAS is nas01 at 10.0.0.5, reached over SSH.", source="observed")
-        short = self.save("nas01 (10.0.0.5) is the NAS.")
+        short = self.save("The NAS is nas01 at 10.0.0.5 and is reached over SSH.")
         self.save("The router is rtr01.")
         report = self.run_maintenance(FakeReviewer([[
             {"kind": "duplicate", "keep_id": full.id, "ids": [f"[{short.id}]"], "reason": "Same NAS address."},
@@ -120,7 +120,7 @@ class GateTests(MaintenanceTestCase):
     def test_a_better_verified_copy_is_never_retired_by_a_fuller_one(self) -> None:
         full = self.save("The NAS is nas01 at 10.0.0.5, reached over SSH as admin.")
         stated = self.save("The NAS is nas01.", source="user")
-        also = self.save("nas01 is the NAS.")
+        also = self.save("The NAS is nas01 at 10.0.0.5; reached over SSH as admin.")
         report = self.run_maintenance(FakeReviewer([[
             {"kind": "duplicate", "keep_id": full.id, "ids": [stated.id, also.id], "reason": "Same NAS."},
         ]]))
@@ -129,8 +129,9 @@ class GateTests(MaintenanceTestCase):
 
     def test_outdated_memories_follow_the_evidence_gates(self) -> None:
         old_seen = self.save("The CI runner is ci01.", source="observed")
-        new_guess = self.save("The CI runner moved to ci02.")
         old_guess = self.save("The wiki is at wiki-old.example.test.")
+        self.clock.value = "2026-09-27T13:00:00Z"
+        new_guess = self.save("The CI runner moved to ci02.")
         new_seen = self.save("The wiki is at wiki.example.test.", source="observed")
         report = self.run_maintenance(FakeReviewer([[
             {"kind": "outdated", "keep_id": new_guess.id, "ids": [old_seen.id], "reason": "Moved."},
@@ -158,21 +159,38 @@ class GateTests(MaintenanceTestCase):
                          tuple(map(self.status, (stated.id, wanted.id, status.id, lesson.id))))
         self.assertEqual(0, self.store.count_open_questions())
 
-    def test_merged_copies_of_a_preference_count_the_chats_they_came_from(self) -> None:
-        first = self.memory.remember("Keep deploy notes short.", tags=["preference"], source="user",
-                                     project_path=self.project, session="chat-1").record
-        second = self.memory.remember("Deploy notes should be short.", tags=["preference"], source="user",
-                                      project_path=self.project, session="chat-2").record
+    def test_merged_copies_of_a_preference_count_each_chat_once(self) -> None:
+        # Review 2026-10-11, R-L3: the user's preference said in two chats counted one chat once merged, and when
+        # the newer words took over the merge, the older words' chat dropped out. A copy from the same chat, or one
+        # saved without a chat (an agent's remember), still adds none (N-M2).
+        def said(text: str, session: str | None):
+            return self.memory.remember(text, kind="note", tags=["preference"], source="user",
+                                        project_path=self.project, session=session).record
+
+        self.clock.value = "2026-09-01T10:00:00Z"
+        first = said("Keep deploy notes short.", "chat-1")
+        same_chat = said("Keep deploy notes: short.", "chat-1")
+        no_chat = said("Keep deploy notes, short.", None)
+        empty = said("Keep deploy notes; short.", "")
+        second = said("Keep deploy-notes short.", "chat-2")
+        older = said("Squash fixup commits before merging.", "chat-4")
+        self.clock.value = "2026-10-01T10:00:00Z"
+        newer = said("Squash fixup commits, before merging.", "chat-5")
         report = self.run_maintenance(FakeReviewer([[
-            {"kind": "duplicate", "keep_id": first.id, "ids": [second.id], "reason": "Same preference."},
+            {"kind": "duplicate", "keep_id": first.id, "ids": [same_chat.id, no_chat.id, empty.id, second.id],
+             "reason": "Same preference."},
+            {"kind": "duplicate", "keep_id": older.id, "ids": [newer.id], "reason": "Same preference."},
         ]]))
-        self.assertEqual({"merged duplicate": 1}, dict(report.changes))
-        self.assertEqual(2, self.store.times_said(first.id))
+        self.assertEqual({"merged duplicate": 5}, dict(report.changes))
+        self.assertEqual(("active", "superseded"), (self.status(first.id), self.status(older.id)))
+        self.assertEqual({"chat-1", "chat-2"}, self.store.said_in_sessions(first.id))
+        self.assertEqual({"chat-4", "chat-5"}, self.store.said_in_sessions(newer.id))
 
     def test_the_users_rules_merge_and_a_newer_one_replaces_an_older(self) -> None:
         tag = self.save("Always tag releases before deploying them.", kind="rule", source="user")
-        tag_again = self.save("Tag every release in Git.", kind="rule", source="user")
+        tag_again = self.save("Always tag releases, before deploying them.", kind="rule", source="user")
         old_host = self.save("Deploy from the build01 host.", kind="rule", source="user")
+        self.clock.value = "2026-09-27T13:00:00Z"
         new_host = self.save("Deploy from the build02 host from now on.", kind="rule", source="user")
         signed_tags = self.save("Sign every tag, with GPG", kind="rule", source="user")
         noted = self.save("Sign every tag with GPG.", kind="note", source="user")  # the same words, but a note
@@ -192,6 +210,108 @@ class GateTests(MaintenanceTestCase):
             self.assertEqual("superseded", self.status(record.id))
         self.assertEqual(signed_tags.id, self.store.get(noted.id).superseded_by)
         self.assertEqual(0, self.store.count_open_questions())
+
+    def test_a_memory_is_outdated_only_by_a_newer_one_at_least_as_strong(self) -> None:
+        # Review 2026-10-11, L-M4 and N-M5: the model took the September preference for the newer one, and the
+        # user's October words, which say the opposite, were replaced by it.
+        self.clock.value = "2026-09-01T10:00:00Z"
+        september = self.save("Use merge commits for feature branches in the homelab repo.", kind="note",
+                              source="user", tags=["preference"])
+        stated = self.save("The build server is build01.", source="user")
+        self.clock.value = "2026-10-10T10:00:00Z"
+        october = self.save("Use rebase, not merge commits, for feature branches in the homelab repo.", kind="note",
+                            source="user", tags=["preference"])
+        seen = self.save("The build server is build02.", source="observed")
+        report = self.run_maintenance(FakeReviewer([[
+            {"kind": "outdated", "keep_id": september.id, "ids": [october.id], "reason": "The older one is current."},
+            {"kind": "outdated", "keep_id": seen.id, "ids": [stated.id], "reason": "Moved."},
+        ]]))
+        self.assertEqual({"kept (not newer)": 1, "question": 1}, dict(report.changes))
+        self.assertEqual(["active"] * 4, [self.status(item.id) for item in (september, october, stated, seen)])
+        self.assertEqual([f"outdated [{october.id}] by [{september.id}] left alone: not newer "
+                          "(the model said: The older one is current.)"], report.left_alone)
+
+    def test_duplicates_merge_only_when_they_say_the_same_thing(self) -> None:
+        # Review 2026-10-11, L-M4: two different rules of the user's were merged as duplicates, and one was lost.
+        force = self.save("Always ask before force-pushing any branch.", kind="rule", source="user")
+        main = self.save("Never push directly to the main branch of a repository with CI.", kind="rule",
+                         source="user")
+        early = self.save("The nightly backup of the build server to the NAS share starts at 02:00 every day, "
+                          "keeps fourteen daily copies, and mails a short report to the admin mailbox afterwards.")
+        late = self.save("The nightly backup of the build server to the NAS share starts at 04:00 every day, "
+                         "keeps fourteen daily copies, and mails a short report to the admin mailbox afterwards.")
+        squash = self.save("In the homelab repo, squash fixup commits before opening a merge request, so the "
+                           "history stays short and readable for every reviewer who looks at it later.",
+                           kind="note", source="user", tags=["preference"])
+        never = self.save("In the homelab repo, never squash fixup commits before opening a merge request, so the "
+                          "history stays short and readable for every reviewer who looks at it later.",
+                          kind="note", source="user", tags=["preference"])
+        sign = self.save("Sign every commit with GPG.", kind="rule", source="user")
+        sign_again = self.save("Sign every commit, with GPG", kind="rule", source="user")
+        report = self.run_maintenance(FakeReviewer([[
+            {"kind": "duplicate", "keep_id": force.id, "ids": [main.id], "reason": "Both are about pushing."},
+            {"kind": "duplicate", "keep_id": early.id, "ids": [late.id], "reason": "Same backup."},
+            {"kind": "duplicate", "keep_id": squash.id, "ids": [never.id], "reason": "Same preference."},
+            {"kind": "duplicate", "keep_id": sign.id, "ids": [sign_again.id], "reason": "Same rule."},
+        ]]))
+        self.assertEqual({"kept (not the same statement)": 3, "merged duplicate": 1}, dict(report.changes))
+        self.assertEqual(["active"] * 7, [self.status(item.id) for item in (force, main, early, late, squash, never,
+                                                                              sign)])
+        self.assertEqual("superseded", self.status(sign_again.id))
+        self.assertEqual([f"duplicate [{main.id}] of [{force.id}]", f"duplicate [{late.id}] of [{early.id}]",
+                          f"duplicate [{never.id}] of [{squash.id}]"],
+                         [item.split(" left alone")[0] for item in report.left_alone])
+
+    def test_learned_copies_in_other_words_merge_unless_a_number_or_a_not_differs(self) -> None:
+        # One quirk was learned 66 times in different words (2026-10-11): learned copies merge on the model's word,
+        # as long as the copy's numbers are in the kept memory and neither turns the other around.
+        full = self.save("The build host's Docker daemon listens on port 2376 with TLS; connect with "
+                         "`docker --tlsverify -H build1.example.test:2376`.")
+        terse = self.save("Docker on build1.example.test is reached over TLS on port 2376.")
+        other_port = self.save("Docker on build1.example.test is reached over TLS on port 2377.")
+        turned = self.save("The build host's Docker daemon does not listen on port 2376 with TLS.")
+        report = self.run_maintenance(FakeReviewer([[
+            {"kind": "duplicate", "keep_id": full.id, "ids": [terse.id, other_port.id, turned.id],
+             "reason": "Same daemon."},
+        ]]))
+        self.assertEqual({"merged duplicate": 1, "kept (not the same statement)": 2}, dict(report.changes))
+        self.assertEqual(["active", "superseded", "active", "active"],
+                         [self.status(item.id) for item in (full, terse, other_port, turned)])
+
+    def test_copies_naming_another_product_are_no_duplicates(self) -> None:
+        # Review 2026-10-11, R-L2: learned copies naming PostgreSQL and MySQL merged on the model's word, so a fact
+        # that contradicts another was retired as a duplicate instead of raising a conflict. A copy's proper names
+        # must all be in the kept memory, in any case.
+        postgres = self.save("The inventory service stores its data in PostgreSQL on the shared database host.")
+        mysql = self.save("The inventory service keeps its data in MySQL.")
+        lower = self.save("The inventory service keeps its data in postgresql.")
+        coral = self.save("The NVR runs Frigate with the Coral TPU detector.")
+        openvino = self.save("The NVR runs Frigate with the OpenVINO detector.")
+        # In nearly the same words too: the copy names another product.
+        long_postgres = self.save("The inventory service in the homelab stores all of its order and customer data in "
+                                  "PostgreSQL on the shared database host, with nightly dumps kept for a week.")
+        long_mysql = self.save("The inventory service in the homelab stores all of its order and customer data in "
+                               "MySQL on the shared database host, with nightly dumps kept for a week.")
+        report = self.run_maintenance(FakeReviewer([[
+            {"kind": "duplicate", "keep_id": postgres.id, "ids": [mysql.id, lower.id], "reason": "Same database."},
+            {"kind": "duplicate", "keep_id": coral.id, "ids": [openvino.id], "reason": "Same detector."},
+            {"kind": "duplicate", "keep_id": long_postgres.id, "ids": [long_mysql.id], "reason": "Same database."},
+        ]]))
+        self.assertEqual({"merged duplicate": 1, "kept (not the same statement)": 3}, dict(report.changes))
+        self.assertEqual(["active", "active", "superseded", "active", "active", "active", "active"],
+                         [self.status(item.id) for item in (postgres, mysql, lower, coral, openvino, long_postgres,
+                                                            long_mysql)])
+
+    def test_the_users_newer_words_hold_a_duplicate_of_theirs(self) -> None:
+        self.clock.value = "2026-09-01T10:00:00Z"
+        older = self.save("Keep deploy notes short.", kind="note", source="user", tags=["preference"])
+        self.clock.value = "2026-10-01T10:00:00Z"
+        newer = self.save("Keep deploy-notes short.", kind="note", source="user", tags=["preference"])
+        report = self.run_maintenance(FakeReviewer([[
+            {"kind": "duplicate", "keep_id": older.id, "ids": [newer.id], "reason": "Same preference."},
+        ]]))
+        self.assertEqual({"merged duplicate": 1}, dict(report.changes))
+        self.assertEqual(("superseded", newer.id), (self.status(older.id), self.store.get(older.id).superseded_by))
 
     def test_conflicts_become_questions_with_the_older_memory_first(self) -> None:
         first = self.save("Backups run at 02:00.")
@@ -341,6 +461,24 @@ class CommandTests(unittest.TestCase):
         code, output = self.run_cli("stats")
         self.assertIn("Maintenance: 0 memories merged or retired in the last 30 days; last review never", output)
 
+    def test_stats_shows_when_maintenance_last_reviewed_and_not_when_commands_were_noted(self) -> None:
+        # 2026-10-11: stats showed the command-tagging pass of that morning; maintenance last reviewed on 09-28.
+        from knowitall2 import journal
+        from knowitall2.paths import database_path
+
+        self.run_cli("remember", "The NAS is nas01.", "--source", "inferred")
+        store = Store.open(database_path())
+        try:
+            journal.record(store, "learning", "run", details={"maintenance": {"calls": 2, "groups": {"review": 3}}},
+                           at="2026-09-28T19:18:27Z")
+            journal.record(store, "learning", "run", details={"maintenance": {"calls": 0, "groups": {"review": 9}}},
+                           at="2026-10-11T05:00:00Z")
+            store.record_review("f" * 64, scope_key="commands", outcome="reviewed", now="2026-10-11T04:45:09Z")
+        finally:
+            store.close()
+        code, output = self.run_cli("stats")
+        self.assertIn("last review 2026-09-28 19:18 UTC", output)
+
     def test_learning_runs_maintenance_with_the_budget_left(self) -> None:
         self.run_cli("remember", "The NAS is nas01.", "--source", "inferred")
         self.run_cli("remember", "The router is rtr01.", "--source", "inferred")
@@ -386,6 +524,110 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual(1, len(reviewer.texts))
         self.assertEqual([({"requests": True}, False)], launches)  # started once the lock was free
+
+    def enable_learning(self) -> None:
+        self.run_cli("remember", "The NAS is nas01.", "--source", "inferred")
+        self.run_cli("remember", "The router is rtr01.", "--source", "inferred")
+        with mock.patch("knowitall2.learning.command.find_claude_cli", return_value=Path("claude.exe")), \
+                mock.patch("knowitall2.learning.command.find_codex_cli", return_value=None):
+            self.run_cli("learn", "--enable")
+
+    @staticmethod
+    def calls_made(count: int, origin: str) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        state = LearnerState()
+        moment = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        state.calls.extend({"at": moment, "session": f"s-{number}", "outcome": "ok", "origin": origin}
+                           for number in range(count))
+        state.save()
+
+    def run_with_reviewer(self, *arguments: str, reviewer) -> str:
+        with mock.patch("knowitall2.learning.command.find_claude_cli", return_value=Path("claude.exe")), \
+                mock.patch("knowitall2.learning.command.EngineReviewer", return_value=reviewer):
+            code, output = self.run_cli(*arguments)
+        self.assertEqual(0, code)
+        return output
+
+    def test_a_day_of_work_learning_still_leaves_maintenance_its_calls(self) -> None:
+        # 2026-10-11: learning from the user's work used up the day's 60 calls, and maintenance made none in 13 days.
+        self.enable_learning()
+        self.calls_made(60, "work")
+        output = self.run_with_reviewer("learn", reviewer=FakeReviewer([[]]))
+        self.assertIn("Review calls: 1.", output)
+
+    def test_background_maintenance_stops_at_its_own_daily_allowance(self) -> None:
+        self.enable_learning()
+        self.calls_made(8, "maintenance")
+        output = self.run_with_reviewer("learn", reviewer=FakeReviewer([]))
+        self.assertIn("Review calls: 0; groups deferred by the budget: 1.", output)
+
+    def test_maintain_is_not_held_back_by_the_day_and_leaves_the_background_allowance(self) -> None:
+        self.enable_learning()
+        self.calls_made(60, "work")
+        self.calls_made(8, "maintenance")
+        output = self.run_with_reviewer("maintain", reviewer=FakeReviewer([[]]))
+        self.assertIn("Review calls: 1.", output)
+        self.assertEqual("user", LearnerState().calls[-1].get("origin"))
+
+    def test_maintain_takes_as_many_calls_as_the_user_allows(self) -> None:
+        # Catching up on 181 waiting groups should not need 19 runs of 10 calls.
+        from knowitall2.learning import command
+        from knowitall2.learning.maintenance import MaintenanceReport
+
+        self.enable_learning()
+        budgets = []
+
+        def review(**keywords):
+            budgets.append(keywords["budget"])
+            return MaintenanceReport()
+
+        with mock.patch.object(command, "maintain", side_effect=review):
+            self.run_with_reviewer("maintain", "--max-calls", "40", reviewer=FakeReviewer([]))
+            self.run_with_reviewer("maintain", reviewer=FakeReviewer([]))
+        self.assertEqual([40, 10], budgets)
+
+    def test_a_finding_the_gates_leave_alone_is_kept_in_the_journal(self) -> None:
+        from knowitall2.paths import database_path
+
+        self.enable_learning()
+        store = Store.open(database_path())
+        try:
+            first, second = (record.id for record in store.list_active(project_id=None, scope="global", limit=5))
+        finally:
+            store.close()
+        finding = {"kind": "duplicate", "keep_id": first, "ids": [second], "reason": "Both are hosts."}
+        output = self.run_with_reviewer("maintain", reviewer=FakeReviewer([[finding]]))
+        self.assertIn("kept (not the same statement) 1", output)
+        store = Store.open(database_path())
+        try:
+            [event] = store.events(kinds=["maintenance"])
+        finally:
+            store.close()
+        self.assertEqual([f"duplicate [{second}] of [{first}] left alone: not the same statement "
+                          "(the model said: Both are hosts.)"], event["details"]["left_alone"])
+
+    def test_what_the_user_asks_the_catalog_for_waits_for_no_limit_and_leaves_the_allowance(self) -> None:
+        from knowitall2.learning.cataloguer import FILE_PROMPT
+
+        self.enable_learning()
+        self.run_cli("remember", "The deploy script hangs unless --no-prompt is passed; always pass it.", "--kind",
+                     "lesson")
+        self.calls_made(60, "work")
+        self.calls_made(2, "catalog")
+        self.calls_made(2, "commands")
+        prompts = []
+
+        class Engine:
+            def run(self, text, *, schema, system_prompt):
+                prompts.append(system_prompt)
+                return {"notes": []} if system_prompt == FILE_PROMPT else {"lessons": []}
+
+        with mock.patch("knowitall2.learning.command.build_engine", return_value=Engine()):
+            self.assertEqual(0, self.run_cli("catalog", "--commands", "3")[0])
+            self.assertEqual(0, self.run_cli("catalog")[0])
+        self.assertEqual(2, len(prompts))
+        self.assertEqual(["user", "user"], [call.get("origin") for call in LearnerState().calls[64:]])
 
     def test_the_catalog_follows_maintenance_only_while_this_computer_keeps_its_turn(self) -> None:
         from knowitall2.learning.cataloguer import CatalogReport

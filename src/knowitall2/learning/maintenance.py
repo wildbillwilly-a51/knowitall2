@@ -13,13 +13,16 @@ from __future__ import annotations
 import hashlib
 import heapq
 import math
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from .. import journal, review
-from ..memory import VERIFICATION_STRENGTH, Memory, is_users_choice, may_replace_unasked, significant_words
+from ..memory import (
+    VERIFICATION_STRENGTH, Memory, is_users_choice, may_replace_unasked, same_statement, significant_words,
+)
 from ..store import RecordRow
 from .extractor import ClaudeCliExtractor, CodexCliExtractor, ExtractionError, payload_items
 from .state import MAX_FAILURES, LearnerState
@@ -39,6 +42,13 @@ FINDING_KINDS = ("duplicate", "outdated", "snapshot", "conflict")
 # Only memories of these kinds are retired as temporary status; decisions,
 # procedures, lessons, and rules are never treated as snapshots.
 SNAPSHOT_KINDS = ("fact", "note")
+# Duplicates say the same thing: the same numbers, and the same words that turn a statement around.
+_NUMBERS = re.compile(r"\d+(?:[.,:]\d+)*")
+# Words and sentences, for the proper names a copy must share with the memory it merges into.
+_WORD = re.compile(r"[^\W_]+")
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
+_POLARITY = re.compile(r"\b(?:not|no|never|without|instead|avoid(?:s|ed|ing)?|stop(?:s|ped|ping)?|cannot|"
+                       r"\w+n't)\b")
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -117,6 +127,8 @@ class MaintenanceReport:
     changes: Counter = field(default_factory=Counter)
     blocked: str | None = None
     usage: Counter = field(default_factory=Counter)
+    # Findings the gates left alone, with why, for the run's journal entry.
+    left_alone: list[str] = field(default_factory=list)
 
     def statuses(self) -> Counter:
         return Counter(status for _, status in self.plan)
@@ -153,8 +165,9 @@ def maintain(
     budget: int,
     dry_run: bool,
     run: str | None = None,
+    origin: str = "maintenance",
 ) -> MaintenanceReport:
-    """Review the groups that need it; ``run`` labels the journal entries of this run."""
+    """Review the groups that need it; ``run`` labels the journal entries of this run, and ``origin`` its calls."""
 
     report = MaintenanceReport(plan=plan(memory))
     if dry_run:
@@ -181,16 +194,17 @@ def maintain(
                 budget -= 1
                 report.calls += 1
                 report.failed += 1
-                _record_call(state, "failed")
+                _record_call(state, "failed", origin)
                 store.record_review(group.fingerprint, scope_key=group.scope_key, outcome="failed", now=memory.now())
                 continue
             report.usage.update(getattr(reviewer, "last_usage", None) or {})
             budget -= 1
             report.calls += 1
-            _record_call(state, "ok")
+            _record_call(state, "ok", origin)
             with store.transaction():
                 for finding in findings:
-                    report.changes.update(apply_finding(memory, finding, group, busy, run=run))
+                    report.changes.update(apply_finding(memory, finding, group, busy, run=run,
+                                                        left_alone=report.left_alone))
                 # The group as it now stands is reviewed too, so its changes cost no second look.
                 remaining = [record for record in (store.get(item.id) for item in group.members)
                              if record is not None and record.status == "active"]
@@ -317,10 +331,12 @@ def render_group(group: Group) -> str:
 
 def apply_finding(
     memory: Memory, finding: dict[str, Any], group: Group, busy: set[str], *, run: str | None = None,
+    left_alone: list[str] | None = None,
 ) -> list[str]:
     """Apply one finding through the gates; returns an outcome name per affected memory.
 
-    Each change is recorded in the journal, with the memory it keeps.
+    Each change is recorded in the journal, with the memory it keeps; a finding the gates turn down goes into
+    ``left_alone``, which the run's journal entry keeps.
     """
 
     def changed(outcome: str, record: RecordRow, keep: RecordRow | None, why: str) -> str:
@@ -331,6 +347,12 @@ def apply_finding(
         )
         return outcome
 
+    def kept(why: str, record: RecordRow, other: RecordRow) -> str:
+        if left_alone is not None:
+            relation = "of" if kind == "duplicate" else "by"
+            left_alone.append(f"{kind} [{record.id}] {relation} [{other.id}] left alone: {why}"
+                              + (f" (the model said: {reason})" if reason else ""))
+        return f"kept ({why})"
 
     kind = finding.get("kind")
     if kind not in FINDING_KINDS:
@@ -356,18 +378,24 @@ def apply_finding(
     now = memory.now()
     outcomes: list[str] = []
     if kind == "duplicate":
-        # The model's choice is the most complete copy. It replaces only copies whose
-        # evidence is no stronger: weaker evidence never retires a better-verified
+        # The model's choice is the most complete copy. It replaces only copies that say
+        # the same thing (two different rules of the user's were merged, 2026-10-11) and
+        # whose evidence is no stronger: weaker evidence never retires a better-verified
         # memory, and a terser verified copy never retires a fuller one. The user's
         # words merge like any others (each copy still counts toward how often the
-        # user said it, ``Store.times_said``); a rule is never merged into a
-        # preference that says the same: the preference goes into the rule.
+        # user said it, ``Store.times_said``), and their newer words hold the merge; a
+        # rule is never merged into a preference that says the same: the preference goes
+        # into the rule.
         keep = current[keep_id]
         for item in ids:
             record = current[item]
             if VERIFICATION_STRENGTH[record.verification] > VERIFICATION_STRENGTH[keep.verification]:
                 outcomes.append("kept (better verified)")
-            elif record.kind == "rule" and keep.kind != "rule":
+            elif not may_merge(record, keep):
+                outcomes.append(kept("not the same statement", record, keep))
+            elif (record.kind == "rule" and keep.kind != "rule") or (
+                    record.kind == keep.kind and record.verification == keep.verification == "user_stated"
+                    and record.created_at > keep.created_at):
                 memory.store.supersede(
                     keep.id, record.id, now=now, reason=f"{REASON_PREFIX}duplicate of [{record.id}]{detail}",
                 )
@@ -379,10 +407,15 @@ def apply_finding(
                 )
                 outcomes.append(changed("merged duplicate", record, keep, reason))
     elif kind == "outdated":
+        # Only a memory saved later, with evidence at least as strong, makes another outdated: the model alone
+        # once kept the older of the user's two preferences (2026-10-11).
         newer = current[keep_id]
         for item in ids:
             older = current[item]
-            if may_replace_unasked(older, kind=newer.kind, text=newer.text, verification=newer.verification):
+            if newer.created_at <= older.created_at:
+                outcomes.append(kept("not newer", older, newer))
+            elif (VERIFICATION_STRENGTH[newer.verification] >= VERIFICATION_STRENGTH[older.verification]
+                  and may_replace_unasked(older, kind=newer.kind, text=newer.text, verification=newer.verification)):
                 memory.store.supersede(
                     older.id, newer.id, now=now, reason=f"{REASON_PREFIX}outdated by [{newer.id}]{detail}",
                 )
@@ -407,13 +440,77 @@ def apply_finding(
     return outcomes
 
 
+def may_merge(copy: RecordRow, keep: RecordRow) -> bool:
+    """Whether ``copy`` may be merged into ``keep`` as a duplicate. Never when the copy names a thing ``keep``
+    does not ("in PostgreSQL" is no duplicate of "in MySQL", even in otherwise the same words). The user's own
+    words only when both say the same thing (``says_the_same``); learned copies also in other words, on the
+    model's finding, as long as every name, address, path, and number in the copy is in ``keep`` and neither has
+    a "not" or "never" the other lacks ("the NAS is nas01" is no duplicate of "the router is rtr01")."""
+
+    if not _proper_names(copy.text) <= {word.casefold() for word in _WORD.findall(keep.text)}:
+        return False
+    if says_the_same(copy, keep):
+        return True
+    if any(record.verification == "user_stated" or is_users_choice(record) for record in (copy, keep)):
+        return False
+    kept = keep.text.casefold()
+    return (all(name in kept for name in _names(copy.text))
+            and set(_NUMBERS.findall(copy.text)) <= set(_NUMBERS.findall(keep.text))
+            and _polarity(copy.text) == _polarity(keep.text))
+
+
+def _proper_names(text: str) -> set[str]:
+    """The proper names in ``text``, casefolded: words with an uppercase letter other than the first letter of a
+    sentence ("PostgreSQL", "MySQL", "GitLab", "Docker", "Frigate"; "Docker" only when it does not begin one)."""
+
+    names = set()
+    for sentence in _SENTENCE_BREAK.split(text):
+        for index, word in enumerate(_WORD.findall(sentence)):
+            if any(character.isupper() for character in (word[1:] if index == 0 else word)):
+                names.add(word.casefold())
+    return names
+
+
+def _names(text: str) -> set[str]:
+    """Words that name one thing: with a digit, or a dot, slash, colon, or at sign inside (hosts, addresses, paths)."""
+
+    names = set()
+    for token in text.split():
+        bare = token.strip(".,;:!?()[]{}\"'`").casefold()
+        if any(character.isdigit() for character in bare) or any(mark in bare for mark in "./\\:@"):
+            names.add(bare)
+    return names
+
+
+def says_the_same(first: RecordRow, second: RecordRow) -> bool:
+    """Whether two memories say the same thing: nearly the same words, the same numbers, and the same words that
+    turn a statement around (not, no, never, don't, without, instead, avoid, stop)."""
+
+    return (same_statement(first, kind=first.kind, text=second.text)
+            and set(_NUMBERS.findall(first.text)) == set(_NUMBERS.findall(second.text))
+            and _polarity(first.text) == _polarity(second.text))
+
+
+def _polarity(text: str) -> set[str]:
+    words = set()
+    for word in _POLARITY.findall(text.casefold().replace("\u2019", "'")):
+        if word == "cannot" or word.endswith("n't"):
+            word = "not"
+        elif word.startswith("avoid"):
+            word = "avoid"
+        elif word.startswith("stop"):
+            word = "stop"
+        words.add(word)
+    return words
+
+
 def _asked(added: bool) -> str:
     return "question" if added else "question already open"
 
 
-def _record_call(state: LearnerState | None, outcome: str) -> None:
+def _record_call(state: LearnerState | None, outcome: str, origin: str) -> None:
     if state is not None:
-        state.record_call(at=datetime.now(timezone.utc), session="maintenance", outcome=outcome)
+        state.record_call(at=datetime.now(timezone.utc), session="maintenance", outcome=outcome, origin=origin)
 
 
 def _signature(record: RecordRow) -> set[str]:

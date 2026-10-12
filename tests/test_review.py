@@ -319,6 +319,31 @@ class NoticeTests(ReviewTestCase):
         self.assertNotEqual("open", self.store.question(question_id)["status"])
         self.assertEqual(("active", "active"), (self.store.get(stated.id).status, self.store.get(newer.id).status))
 
+    def test_a_rule_question_left_from_before_0_10_5_is_settled_as_a_note(self) -> None:
+        # Review 2026-10-11, D-M2: 0.10.5 stopped asking "Should it be a rule?", but a question asked before it
+        # stayed open, to be raised in the next chat about its project.
+        stated, newer, conflict_id = self.conflict()
+        guessed = self.save(review.UNCONFIRMED_RULE_PREFIX + "Always tag releases.", kind="note")
+        said = self.save(review.UNCONFIRMED_RULE_PREFIX + "Always sign commits.", kind="note", source="user")
+        for note in (guessed, said):
+            self.assertTrue(review.ask_rule(self.memory, note))
+        rule_questions = [review.open_question(self.store, "confirm_rule", [note.id])["id"] for note in (guessed, said)]
+        self.clock.value = "2026-09-27T12:05:00Z"
+        self.assertEqual(2, review.expire_unanswered(self.memory))
+        self.assertEqual("open", self.store.question(conflict_id)["status"])   # a recent conflict waits
+        for question_id, note in zip(rule_questions, (guessed, said)):
+            question = self.store.question(question_id)
+            self.assertEqual(("answered", "keep_note (settled by KnowItAll2)"), (question["status"], question["answer"]))
+            record = self.store.get(note.id)
+            self.assertEqual(("active", "note", note.verification), (record.status, record.kind, record.verification))
+        settled = {event["details"]["question"]: event for event in self.store.events(kinds=["settle"])}
+        self.assertEqual(set(rule_questions), set(settled))
+        self.assertEqual([("keep_note", "KnowItAll2", [guessed.id])],
+                         [(event["outcome"], event["agent"], event["record_ids"]) for event in
+                          [settled[rule_questions[0]]]])
+        self.assertEqual(0, review.expire_unanswered(self.memory))
+        self.assertEqual(0, self.store.stats()["by_kind"].get("rule", 0))
+
     def test_no_questions(self) -> None:
         self.assertEqual("KnowItAll2 has no questions for the user.", review.list_questions(self.memory))
         self.assertNotIn("question", self.memory.briefing(project_path=self.project))

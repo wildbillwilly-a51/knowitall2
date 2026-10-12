@@ -72,5 +72,101 @@ class StoredSecretsTests(unittest.TestCase):
         self.assertTrue(describe_checks([secrets]).startswith("OK   secrets in memories: no active memory"))
 
 
+class CloudFolderTests(unittest.TestCase):
+    """doctor notes projects agents work in that a cloud service keeps in sync, so they can be moved."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        environment = {key: value for key, value in os.environ.items()
+                       if key.casefold() not in ("onedrive", "onedriveconsumer", "onedrivecommercial")}
+        environment.update({"KNOWITALL2_HOME": str(self.root / "data"), "OneDriveCommercial": str(self.root / "Work Sync")})
+        patch = mock.patch.dict(os.environ, environment, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_project_in_a_synced_folder_is_a_note_with_a_suggestion(self) -> None:
+        from _support import make_repository
+        from knowitall2 import known
+
+        synced = make_repository(self.root / "Work Sync" / "Documents" / "Projects" / "lab")
+        boxed = make_repository(self.home / "Dropbox" / "tools")
+        local = make_repository(self.root / "work" / "alpha")
+        for folder in (synced, boxed, local):
+            known.worked_in(folder)
+        [check] = doctor._cloud_folder_checks(home=self.home)
+        self.assertTrue(check.ok)   # a note: nothing is broken
+        self.assertIsNotNone(check.fix)
+        for folder in (synced, boxed):
+            self.assertIn(os.path.normcase(str(folder.resolve())), os.path.normcase(check.detail))
+        self.assertNotIn("alpha", check.detail)
+        self.assertTrue(describe_checks([check]).startswith("NOTE "), describe_checks([check]))
+        self.assertIn("Move", check.fix)
+
+    def test_no_note_when_no_project_is_in_a_synced_folder(self) -> None:
+        from _support import make_repository
+        from knowitall2 import known
+
+        known.worked_in(make_repository(self.root / "work" / "alpha"))
+        self.assertEqual([], doctor._cloud_folder_checks(home=self.home))
+
+
+class StalledMaintenanceTests(unittest.TestCase):
+    """doctor notes when maintenance has made no model call for days while groups of memories wait for it."""
+
+    def setUp(self) -> None:
+        from knowitall2.learning.state import LearnerSettings, save_settings
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.environment = mock.patch.dict(os.environ, {"KNOWITALL2_HOME": str(Path(self.temporary.name) / "data")})
+        self.environment.start()
+        save_settings(LearnerSettings(enabled=True))
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def runs(self, *runs: tuple[float, int, int]) -> None:
+        """Learning runs, each (days ago, maintenance calls, groups waiting for review)."""
+
+        from datetime import datetime, timedelta, timezone
+
+        from knowitall2 import journal
+
+        store = Store.open(database_path())
+        try:
+            for days, calls, waiting in runs:
+                at = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                journal.record(store, "learning", "run", at=at,
+                               details={"maintenance": {"calls": calls, "groups": {"review": waiting}}})
+        finally:
+            store.close()
+
+    def test_a_note_when_groups_wait_and_maintenance_made_no_call_for_three_days(self) -> None:
+        # 2026-10-11: maintenance made no call for 13 days while 181 groups waited, and nothing said so.
+        self.runs((5, 1, 18), (2, 0, 170), (0.1, 0, 181))
+        check = doctor._maintenance_check()
+        self.assertTrue(check.ok)
+        self.assertIn("no model call", check.detail)
+        self.assertIn("181 groups", check.detail)
+        self.assertIn("knowitall2 maintain", check.fix)
+        self.assertTrue(describe_checks([check]).startswith("NOTE maintenance:"))
+
+    def test_no_note_when_maintenance_ran_lately_nothing_waits_learning_is_new_or_off(self) -> None:
+        from knowitall2.learning.state import LearnerSettings, save_settings
+
+        for number, runs in enumerate((((5, 0, 9), (1, 2, 9)), ((5, 1, 0), (0.1, 0, 0)), ((1, 0, 9),))):
+            home = str(Path(self.temporary.name) / f"data-{number}")
+            with self.subTest(runs=runs), mock.patch.dict(os.environ, {"KNOWITALL2_HOME": home}):
+                save_settings(LearnerSettings(enabled=True))
+                self.runs(*runs)
+                self.assertIsNone(doctor._maintenance_check().fix)
+        self.runs((5, 0, 9))
+        save_settings(LearnerSettings(enabled=False))
+        self.assertIsNone(doctor._maintenance_check().fix)
+
+
 if __name__ == "__main__":
     unittest.main()

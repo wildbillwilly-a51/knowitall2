@@ -57,6 +57,8 @@ NEW_HEADER = "New in KnowItAll2 since this chat started (recall with a few of th
 CATCH_UP_HEADER = ("KnowItAll2's table of contents for project {name}, which this chat's briefing did not have "
                    "(recall with a few of these words for the details):")
 SPAWN_INTERVAL_SECONDS = 30 * 60
+# How long the session start's writes wait for another process's write lock before they are dropped.
+WRITE_TIMEOUT_SECONDS = 0.5
 
 
 def main(argv: Sequence[str] | None = None, *, stdin: str | None = None) -> int:
@@ -115,22 +117,14 @@ def session_start(
 ) -> str:
     """Return what the SessionStart hook prints: briefing JSON, or nothing."""
 
-    from .memory import Memory
-    from .store import Store
-
     payload = _payload(stdin_text)
     cwd = _text(payload, "cwd")
+    from .known import worked_in
+
+    worked_in(cwd)   # knowledge files go only to folders agent sessions run in
     context = ""
     try:
-        store = Store.open(database_path())
-        try:
-            memory = Memory(store, agent=agent)
-            since = memory.now()
-            context = memory.briefing(project_path=cwd or Path.cwd())
-            project = memory.project_for(cwd or Path.cwd())
-            journal.tidy(store)
-        finally:
-            store.close()
+        context, project, since = _briefing(agent, cwd or Path.cwd())
     except Exception as exc:
         context = ""
         journal.problem(f"session start ({agent})", f"no briefing was added: {exc}")
@@ -158,6 +152,61 @@ def session_start(
     if context:
         output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
     return json.dumps(output) if output else ""
+
+
+def _briefing(agent: str, folder: str | Path) -> tuple[str, Any, str]:
+    """The briefing, its project, and when it was made.
+
+    It is read on the store opened only to read, so another process holding
+    the write lock (a long import, a sync, a learning run) cannot hold it up.
+    What it records (its use, the project's last use, what it offered) is
+    written after, waiting at most ``WRITE_TIMEOUT_SECONDS``: when the store is
+    still busy, those writes are dropped, never the briefing.
+    """
+
+    from .memory import Memory
+    from .store import Store, StoreError
+
+    try:
+        reader = Store.open_read_only(database_path())
+    except StoreError:
+        reader = None  # not created yet, or to be upgraded: the usual opening below does that
+    if reader is not None:
+        memory = None
+        try:
+            memory = Memory(reader, agent=agent)
+            memory.put_off_writes()
+            since = memory.now()
+            context = memory.briefing(project_path=folder)
+            project = memory.project_for(folder)
+        except Exception as exc:
+            memory = None
+            journal.problem(f"session start ({agent})", "the briefing could not be made on the store opened to "
+                                                        f"read, so it was made as before: {type(exc).__name__}: {exc}")
+        finally:
+            reader.close()
+        if memory is not None:
+            try:
+                store = Store.open(database_path(), timeout=WRITE_TIMEOUT_SECONDS)
+                try:
+                    memory.make_writes(store)
+                    journal.tidy(store)
+                finally:
+                    store.close()
+            except Exception as exc:
+                journal.problem(f"session start ({agent})", "what the briefing records (its use, the project's last "
+                                                            f"use) was not kept: {type(exc).__name__}: {exc}")
+            return context, project, since
+    store = Store.open(database_path())
+    try:
+        memory = Memory(store, agent=agent)
+        since = memory.now()
+        context = memory.briefing(project_path=folder)
+        project = memory.project_for(folder)
+        journal.tidy(store)
+    finally:
+        store.close()
+    return context, project, since
 
 
 def stop(stdin_text: str, *, agent: str = "claude-code", start_learner: Callable[..., object] | None = None) -> str:
@@ -194,6 +243,9 @@ def prompt_submit(stdin_text: str, *, agent: str = "claude-code") -> str:
 
     payload = _payload(stdin_text)
     transcript = _transcript(payload, agent)
+    from .known import worked_in
+
+    worked_in(_text(payload, "cwd"))
     blocks = []
     try:
         background = _chat_background(payload, agent, transcript)

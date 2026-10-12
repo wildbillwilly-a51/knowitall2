@@ -176,6 +176,34 @@ class FilingTests(CatalogTestCase):
         self.assertEqual(1, self.run_catalog(engine).profiled)
         self.assertEqual("Runs the virtual machines.", self.store.system(system_id)["summary"])
 
+    def test_a_refused_filing_batch_is_tried_in_small_groups_and_never_holds_up_the_rest(self) -> None:
+        # Review 2026-10-11, L-M6: the oldest memory without a note was one the model refused, and every run spent
+        # its filing call on that same batch, so nothing was filed.
+        refused = self.save("The access point join fails until the controller certificate is issued again.",
+                            kind="lesson")
+        others = [self.save(f"Host number {number} runs Debian 12 with unattended upgrades.") for number in range(30)]
+        batches = []
+
+        class Engine:
+            def run(self, text, *, schema, system_prompt):
+                if system_prompt != cataloguer.FILE_PROMPT:
+                    return {step_key("profile" if system_prompt == cataloguer.PROFILE_PROMPT else "review"): []}
+                ids = [line.split("]")[0][3:] for line in text.splitlines() if line.startswith("- [k-")]
+                batches.append(len(ids))
+                if refused.id in ids:
+                    raise ExtractionError("the model refused: this session was flagged")
+                return {"notes": [{"id": record_id, "headline": "A host", "system_id": "", "system_name": "",
+                                   "system_area": "Other", "system_kind": "other", "system_aliases": [],
+                                   "facet": "about"} for record_id in ids]}
+
+        for _ in range(3):
+            self.run_catalog(Engine(), budget=3)
+        self.assertEqual(0, self.store.count_unnoted())
+        self.assertEqual([25, 6, 5, 5, 5, 5, 5], batches)   # the refused, five at a time
+        given_up = self.store.notes_for([refused.id])[refused.id]
+        self.assertEqual((None, "other"), (given_up["system_id"], given_up["facet"]))
+        self.assertEqual("A host", self.store.notes_for([others[-1].id])[others[-1].id]["headline"])
+
     def test_calls_count_toward_the_daily_budget(self) -> None:
         self.save("vCenter vc01 is at 10.9.15.16.")
         state = LearnerState(self.root / "state.json")
@@ -296,10 +324,11 @@ class QuestionFlowTests(CatalogTestCase):
         save_settings(LearnerSettings(enabled=True))
         self.now = datetime.fromisoformat(self.clock().replace("Z", "+00:00"))
 
-    def conflict(self, *, older_source="observed", older_kind="fact"):
+    def conflict(self, *, older_source="observed", older_kind="fact", newer_source="inferred"):
         older = self.save("The Cisco access points reject the controller certificate at depth 0.", source=older_source,
                           kind=older_kind)
-        newer = self.save("The Cisco access points were tested with a two-certificate chain without logs.")
+        newer = self.save("The Cisco access points were tested with a two-certificate chain without logs.",
+                          source=newer_source)
         review.ask_conflict(self.memory, older, newer)
         [question] = self.store.open_questions(limit=5)
         return older, newer, question
@@ -312,13 +341,29 @@ class QuestionFlowTests(CatalogTestCase):
         }]}
 
     def test_a_clear_conflict_is_settled_without_anyone(self) -> None:
-        older, newer, question = self.conflict()
+        older, newer, question = self.conflict(newer_source="observed")
         self.assertEqual([], review.for_user(self.store, now=self.now))
         report = self.run_catalog(FakeEngine(review=[self.decide(question, "use_new", certain=True)]))
         self.assertEqual({"settled": 1}, dict(report.questions))
         self.assertEqual("superseded", self.store.get(older.id).status)
         [event] = self.store.events(kinds=["settle"])
         self.assertEqual(("KnowItAll2", "use_new"), (event["agent"], event["outcome"]))
+
+    def test_the_review_never_settles_a_conflict_for_the_weaker_memory(self) -> None:
+        # Review 2026-10-11, L-M5: an unverified memory that only claimed to be a later observation replaced an
+        # observed one, on the model's word alone.
+        older, newer, question = self.conflict()
+        self.run_catalog(FakeEngine(review=[self.decide(question, "use_new", certain=True)]))
+        self.assertEqual(("active", "active"), (self.store.get(older.id).status, self.store.get(newer.id).status))
+        self.assertEqual("checking", review.stage(self.store, question["id"]))
+        guess = self.save("The Cisco access points accept any controller certificate chain.")
+        seen = self.save("The Cisco access points accept only the controller certificate signed by the lab CA.",
+                         source="observed")
+        review.ask_conflict(self.memory, guess, seen)
+        about = next(item for item in self.store.open_questions(limit=5) if item["record_ids"][0] == guess.id)
+        self.run_catalog(FakeEngine(review=[self.decide(about, "keep_mine", certain=True)]))
+        self.assertEqual(("active", "active"), (self.store.get(guess.id).status, self.store.get(seen.id).status))
+        self.assertEqual("checking", review.stage(self.store, about["id"]))
 
     def test_an_unclear_conflict_goes_to_the_next_agent_and_then_is_settled_by_it(self) -> None:
         older, newer, question = self.conflict()
@@ -364,38 +409,24 @@ class QuestionFlowTests(CatalogTestCase):
         self.run_catalog(FakeEngine(review=[self.decide(about, "use_new", certain=True)]))
         self.assertEqual("ask_user", review.stage(self.store, about["id"]))
         self.assertEqual("active", self.store.get(wanted.id).status)
-        note = self.save(review.UNCONFIRMED_RULE_PREFIX + "Never downgrade the camera controller mid-run.", kind="note")
-        review.ask_rule(self.memory, note)
-        rule = [item for item in self.store.open_questions(limit=5) if item["kind"] == "confirm_rule"][0]
-        self.run_catalog(FakeEngine(review=[self.decide(rule, "use_new", certain=True,
-                                                        plain="Should agents never downgrade the camera controller?")]))
-        waiting = {item["id"]: item for item in review.for_user(self.store, now=self.now)}
-        self.assertEqual("Should agents never downgrade the camera controller?", waiting[rule["id"]]["plain"])
 
-    def test_a_possible_rule_that_needs_no_answer_is_settled_but_never_made_a_rule(self) -> None:
-        # All 17 questions waiting for the user on 2026-10-11 were possible rules; the review had already found
-        # some repeated a rule the user stated, or were one-offs, but could not close them.
-        def possible(text):
-            note = self.save(review.UNCONFIRMED_RULE_PREFIX + text, kind="note")
-            review.ask_rule(self.memory, note)
-            return note, next(item for item in self.store.open_questions(limit=10) if item["record_ids"] == [note.id])
-
-        repeated, about_repeated = possible("Credentials are referenced from Vaultwarden, never stored.")
-        one_off, about_one_off = possible("Use the blue receipt template for the October trip report.")
-        new, about_new = possible("Never downgrade the camera controller mid-run.")
-        engine = FakeEngine(review=[{"questions": [
-            {**self.decide(about_repeated, "forget", certain=True, reason="The user's own rule says the same.")
-             ["questions"][0]},
-            {**self.decide(about_one_off, "keep_note", certain=True, reason="It applied to one report.")
-             ["questions"][0]},
-            {**self.decide(about_new, "unsure", certain=False, reason="Only the user can make it a rule.")
-             ["questions"][0]},
-        ]}])
+    def test_a_possible_rule_from_before_0_10_5_is_kept_as_a_note_and_never_made_a_rule(self) -> None:
+        # All 17 questions waiting for the user on 2026-10-11 were possible rules. 0.10.5 stopped asking them; one
+        # asked before it is settled as a note at the next run, with no model call, and never reaches the user
+        # (review 2026-10-11, D-M2).
+        possible = []
+        for text in ("Credentials are referenced from Vaultwarden, never stored.",
+                     "Use the blue receipt template for the October trip report.",
+                     "Never downgrade the camera controller mid-run."):
+            possible.append(self.save(review.UNCONFIRMED_RULE_PREFIX + text, kind="note"))
+            review.ask_rule(self.memory, possible[-1])
+        engine = FakeEngine()
         report = self.run_catalog(engine)
-        self.assertEqual({"settled": 2, "for you": 1}, dict(report.questions))
-        self.assertEqual(("retired", "active"), (self.store.get(repeated.id).status, self.store.get(one_off.id).status))
-        self.assertEqual("note", self.store.get(one_off.id).kind)   # kept as a note, not a rule
-        self.assertEqual([about_new["id"]], [item["id"] for item in review.for_user(self.store, now=self.now)])
+        self.assertEqual({"closed unanswered": 3}, dict(report.questions))
+        self.assertNotIn("review", [step for step, _ in engine.inputs])
+        self.assertEqual([("active", "note")] * 3,
+                         [(self.store.get(record.id).status, self.store.get(record.id).kind) for record in possible])
+        self.assertEqual((0, []), (self.store.count_open_questions(), review.for_user(self.store, now=self.now)))
 
     def test_checks_nobody_can_do_reach_the_user_and_old_unreviewed_questions_too(self) -> None:
         older, newer, question = self.conflict()
@@ -413,12 +444,37 @@ class QuestionFlowTests(CatalogTestCase):
 
     def test_questions_are_reviewed_even_when_filing_always_has_work(self) -> None:
         # From 2026-09-28 to 10-08 every run spent its two calls filing and describing, and the review never ran.
-        older, newer, question = self.conflict()
+        older, newer, question = self.conflict(newer_source="observed")
         engine = FakeEngine(review=[self.decide(question, "use_new", certain=True)])
         with mock.patch.object(cataloguer, "FILE_BATCH", 1):  # the two unfiled memories alone fill the budget
             report = self.run_catalog(engine, budget=2)
         self.assertEqual({"settled": 1}, dict(report.questions))
         self.assertEqual(["review", "file"], [step for step, _ in engine.inputs])
+
+    def test_the_first_look_at_questions_never_takes_the_runs_last_call(self) -> None:
+        # Review 2026-10-11, N-M9: with one call a run, the question review took it every time and nothing was filed.
+        self.conflict()
+        engine = FakeEngine()
+        self.run_catalog(engine, budget=1)
+        self.assertEqual(["file"], [step for step, _ in engine.inputs])
+
+    def test_a_question_the_model_refuses_or_leaves_out_twice_goes_to_the_user(self) -> None:
+        older, newer, question = self.conflict()
+        refusal = ExtractionError("the model declined to answer")
+        engine = FakeEngine(review=[refusal, refusal])
+        for _ in range(2):
+            self.assertEqual("review", review.stage(self.store, question["id"]))
+            self.run_catalog(engine, budget=3)
+        self.assertEqual("ask_user", review.stage(self.store, question["id"]))
+        self.assertEqual(["review", "file", "review", "file"], [step for step, _ in engine.inputs][:4])
+        early = self.save("The NAS backup runs at 02:00 every night.")
+        review.ask_conflict(self.memory, early, self.save("The NAS backup runs at 04:00 every night."))
+        about = next(item for item in self.store.open_questions(limit=5) if item["record_ids"][0] == early.id)
+        for _ in range(2):
+            self.assertEqual("review", review.stage(self.store, about["id"]))
+            self.run_catalog(FakeEngine(review=[{"questions": []}]), budget=3)
+        self.assertEqual("ask_user", review.stage(self.store, about["id"]))
+        self.assertEqual("active", self.store.get(early.id).status)
 
     def test_listed_questions_say_what_was_found_and_which_were_never_looked_into(self) -> None:
         older, newer, question = self.conflict(older_source="user", older_kind="note")

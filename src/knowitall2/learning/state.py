@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Collection, Iterator
 
 from ..files import read_text, write_text_atomic
 from ..paths import data_home
@@ -41,6 +41,29 @@ class LearnerSettings:
     max_calls_per_run: int = 10
     max_calls_per_day: int = 60
     idle_minutes: int = 20
+    # Background upkeep's own calls a day, apart from the daily limit, which learning from the user's work can use
+    # up: maintenance made no call for 13 days while it did (2026-10-11).
+    maintenance_calls_per_day: int = 8
+    catalog_calls_per_day: int = 2
+    command_calls_per_day: int = 2
+
+
+# Where a model call came from. Background upkeep counts against its own daily allowance, everything else toward
+# the daily limit: learning from the user's work and its filing ("work"), background learning ("learning"), and
+# what the user started ("user").
+UPKEEP_ORIGINS = ("maintenance", "catalog", "commands")
+
+
+def upkeep_allowance(settings: LearnerSettings, origin: str) -> int:
+    return {"maintenance": settings.maintenance_calls_per_day, "catalog": settings.catalog_calls_per_day,
+            "commands": settings.command_calls_per_day}[origin]
+
+
+def call_origin(call: dict[str, Any]) -> str:
+    """Where ``call`` came from; one recorded before origins were kept counts toward the daily limit, as it did."""
+
+    origin = call.get("origin") if isinstance(call, dict) else None
+    return origin if isinstance(origin, str) and origin else "learning"
 
 
 def config_path() -> Path:
@@ -55,8 +78,18 @@ def load_settings() -> LearnerSettings:
     learning = data.get("learning") if isinstance(data, dict) else None
     if not isinstance(learning, dict):
         return LearnerSettings()
-    known = {item.name for item in fields(LearnerSettings)}
-    return LearnerSettings(**{key: value for key, value in learning.items() if key in known})
+    defaults = LearnerSettings()
+    chosen = {}
+    for item in fields(LearnerSettings):
+        if item.name not in learning:
+            continue
+        value, default = learning[item.name], getattr(defaults, item.name)
+        # A count edited by hand into something else keeps its default.
+        if isinstance(default, int) and not isinstance(default, bool) and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            continue
+        chosen[item.name] = value
+    return LearnerSettings(**chosen)
 
 
 def save_settings(settings: LearnerSettings) -> None:
@@ -103,21 +136,34 @@ class LearnerState:
         key = os.path.normcase(str(log))
         return self.logs.setdefault(key, {"offset": 0, "status": "new", "failures": 0})
 
-    def record_call(self, *, at: datetime, session: str, outcome: str) -> None:
-        self.calls.append({"at": at.isoformat(), "session": session, "outcome": outcome})
+    def record_call(self, *, at: datetime, session: str, outcome: str, origin: str | None = None) -> None:
+        call = {"at": at.isoformat(), "session": session, "outcome": outcome}
+        if origin:
+            call["origin"] = origin
+        self.calls.append(call)
         del self.calls[:-CALL_HISTORY_KEPT]
 
-    def calls_since(self, moment: datetime) -> int:
-        """Model calls since ``moment``: the learner's, and those the user started (they count, but wait for no limit)."""
+    def calls_since(self, moment: datetime, *, origins: Collection[str] | None = None) -> int:
+        """Model calls since ``moment``: the learner's, and those the user started (they count, but wait for no limit).
+
+        With ``origins``, only the calls that came from one of them.
+        """
 
         count = 0
         for call in [*self.calls, *other_calls(self.path.parent)]:
+            if origins is not None and call_origin(call) not in origins:
+                continue
             try:
                 if datetime.fromisoformat(call["at"]) >= moment:
                     count += 1
             except (KeyError, TypeError, ValueError):
                 continue
         return count
+
+    def limited_calls_since(self, moment: datetime) -> int:
+        """The calls since ``moment`` that count toward the daily limit: all but background upkeep's."""
+
+        return self.calls_since(moment) - self.calls_since(moment, origins=UPKEEP_ORIGINS)
 
     def save(self) -> None:
         # A log deleted long ago (an agent's old sessions cleaned up) needs no entry: the file stays small.

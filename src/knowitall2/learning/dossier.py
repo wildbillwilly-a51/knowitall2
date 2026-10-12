@@ -57,6 +57,8 @@ class Dossier:
     tool_inputs: list[str] = field(default_factory=list)  # commands, paths, and folders its tool calls used
     worked_elsewhere: bool = False  # filed under the project its work was in, not the session folder's
     from_documents: bool = False  # a project's own documents, not a session: what it teaches stays with that project
+    user_times: list = field(default_factory=list)  # when each of ``user_texts`` was said, as the log recorded it
+    ended_at: str | None = None  # when its last event was recorded
 
     @property
     def known_ids(self) -> set[str]:
@@ -93,8 +95,10 @@ def build_dossiers(
             current = _new_dossier(session, project, header, len(dossiers))
         current.text += entry
         current.end_offset = max(current.end_offset, event.end)
+        current.ended_at = event.at or current.ended_at
         if user_text:
             current.user_texts.append(user_text)
+            current.user_times.append(event.at)
         if output:
             current.tool_outputs.append(output)
             if _trusted_output(event, session.cwd):

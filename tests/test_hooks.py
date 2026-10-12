@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,46 @@ class SessionStartTests(HookTestCase):
         self.assertIn("briefing for project alpha", context["additionalContext"])
         self.assertIn("Store credentials in Vaultwarden.", context["additionalContext"])
         self.assertEqual([True], started)
+
+    def test_a_busy_store_still_gives_the_briefing_at_once(self) -> None:
+        # Review 2026-10-11, H-M3: while another process held the store's write lock (a long import, a sync, a
+        # learning run), the hook waited out the busy timeout and then gave no briefing at all.
+        store = Store.open(database_path())
+        Memory(store, agent="cli").remember("Store credentials in Vaultwarden.", kind="rule", source="user",
+                                            project_path=self.project)
+        store.close()
+        holder = sqlite3.connect(str(database_path()), isolation_level=None, timeout=1)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            output = hooks.session_start(self.payload(), start_learner=lambda: None)
+            elapsed = time.monotonic() - started
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertIn("Store credentials in Vaultwarden.", json.loads(output)["hookSpecificOutput"]["additionalContext"])
+        self.assertLess(elapsed, 2.5)
+        problems = journal.problems_path().read_text(encoding="utf-8")
+        self.assertIn("was not kept", problems)
+        self.assertNotIn("made as before", problems)
+        # Only its record of the briefing was dropped; with the store free, it is kept.
+        store = Store.open(database_path())
+        try:
+            self.assertEqual([], store.events(kinds=["briefing"], limit=10))
+            hooks.session_start(self.payload(), start_learner=lambda: None)
+            [event] = store.events(kinds=["briefing"], limit=10)
+            self.assertIn("project alpha", event["summary"])
+            self.assertEqual(1, len(store.project_paths(event["project_id"])))
+        finally:
+            store.close()
+
+    def test_a_briefing_that_cannot_be_read_on_its_own_is_made_as_before(self) -> None:
+        Store.open(database_path()).close()
+        # As if a write were added to the briefing and not put off: the store opened to read refuses it.
+        with mock.patch.object(Memory, "put_off_writes"):
+            output = hooks.session_start(self.payload(), start_learner=lambda: None)
+        self.assertIn("briefing for project alpha", json.loads(output)["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("made as before", journal.problems_path().read_text(encoding="utf-8"))
 
     def test_never_fails_the_session(self) -> None:
         def broken_learner() -> None:

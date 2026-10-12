@@ -124,10 +124,19 @@ def render(batch: Sequence[RecordRow]) -> str:
     return "\n".join(lines)
 
 
-def tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: Any = None) -> TagReport:
+def tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: Any = None,
+                 origin: str = SCOPE_KEY) -> TagReport:
     """Ask the model, in batches, which command each waiting memory is about, and tag it; ``state`` counts the
-    calls toward the daily budget."""
+    calls, as from ``origin``."""
 
+    try:
+        return _tag_commands(store, engine, budget=budget, now=now, state=state, origin=origin)
+    finally:
+        if state is not None:   # the calls made, even when a run ends with an error
+            state.save()
+
+
+def _tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: Any, origin: str) -> TagReport:
     report = TagReport()
     batches = _batches(store, waiting(store))
     for number, batch in enumerate(batches):
@@ -138,7 +147,7 @@ def tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: Any
             answer = engine.run(render(batch), schema=SCHEMA, system_prompt=SYSTEM_PROMPT)
         except Exception as exc:
             if state is not None:
-                state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="failed")
+                state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="failed", origin=origin)
             if getattr(exc, "blocking", True):
                 # The engine itself (signed out, a usage limit): nothing in this batch is marked looked at.
                 report.blocked = str(exc)[:300]
@@ -152,7 +161,7 @@ def tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: Any
             continue
         report.calls += 1
         if state is not None:
-            state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="ok")
+            state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="ok", origin=origin)
         given = {str(item.get("id", "")).strip("[] "): item for item in answer.get("lessons", [])
                  if isinstance(item, dict)}
         with store.transaction():

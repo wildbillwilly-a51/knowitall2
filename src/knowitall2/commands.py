@@ -4,9 +4,12 @@ A lesson about how a command behaves here carries a tag ``command:<key>``: the p
 when the lesson is about one ("git archive", "rmm.py command", "sleep"), or "python heredoc"; with
 ``command:<key> @ <word>`` it applies only to a command containing that word (a host, a target, a path). The
 learner writes the tags (``learning.command_tags``). The knowledge-file refresh writes ``commands.json`` in the
-data home: each key and its newest lessons, a project's lesson with that project's folders. The agent's hook
-(Claude Code: after a Bash or PowerShell command fails) reads only that file: for each key once in a chat, the
-two newest lessons that apply in that folder and to that command.
+data home: each key and its newest checked lessons (seen in tool output or stated by the user), a project's
+lesson with that project's folders. The agent's hook (Claude Code: after a Bash or PowerShell command fails)
+reads only that file: for each key once in a chat, the two newest lessons that apply in that folder and to that
+command. A guess is never given at a failure, where an agent looking for a fix may act on it at once (review
+2026-10-11: a lesson planted in a cloned repository's README reached every project); recall and the knowledge
+files still show it, marked unverified.
 
 Why: in five days of real use, a quarter of what agents needed was held and not delivered, mostly quirks met
 while running a command, often the same quirk in several chats (2026-10-10 measurement). Replayed on those
@@ -50,6 +53,8 @@ GENERAL = frozenset({
 })
 # Lessons kept per command in the index; the hook shows the newest that apply here.
 INDEXED_PER_KEY = 8
+# Only these are given at a failure; an index entry without one (written before 0.10.6) is never given.
+CHECKED = ("observed", "user_stated")
 _SEGMENT = re.compile(r"&&|\|\||[;|\n(){}]|\$\(|`")
 # Words that only run what follows them.
 _WRAPPERS = frozenset({"sudo", "env", "time", "nohup", "exec", "then", "do", "else", "elif", "if", "while", "until",
@@ -220,8 +225,8 @@ def tagged_keys(tags: Iterable[str]) -> list[tuple[str, str]]:
 # --- The index the hook reads ------------------------------------------------------------------------------------
 
 def build_index(connection: Any) -> dict[str, list[dict[str, Any]]]:
-    """Each key and its newest active lessons (redacted), with where each applies: the word its command must
-    contain, and for a project's lesson, that project's folders."""
+    """Each key and its newest active, checked lessons (redacted), with where each applies: the word its command
+    must contain, and for a project's lesson, that project's folders."""
 
     from .secrets import redact
 
@@ -230,10 +235,11 @@ def build_index(connection: Any) -> dict[str, list[dict[str, Any]]]:
         folders.setdefault(project_id, []).append(str(path))
     index: dict[str, list[dict[str, Any]]] = {}
     rows = connection.execute(
-        "SELECT id, text, tags, scope, project_id FROM records WHERE status = 'active' AND tags LIKE ? "
-        "ORDER BY created_at DESC, seq DESC", (f"%{COMMAND_TAG}%",),
+        "SELECT id, text, tags, scope, project_id, verification FROM records WHERE status = 'active' "
+        f"AND tags LIKE ? AND verification IN ({', '.join('?' * len(CHECKED))}) ORDER BY created_at DESC, seq DESC",
+        (f"%{COMMAND_TAG}%", *CHECKED),
     )
-    for record_id, text, raw, scope, project_id in rows:
+    for record_id, text, raw, scope, project_id, verification in rows:
         try:
             tags = json.loads(raw or "[]")
         except ValueError:
@@ -241,7 +247,8 @@ def build_index(connection: Any) -> dict[str, list[dict[str, Any]]]:
         for key, where in tagged_keys(tags if isinstance(tags, list) else []):
             lessons = index.setdefault(key, [])
             if len(lessons) < INDEXED_PER_KEY:
-                lesson: dict[str, Any] = {"id": record_id, "text": redact(" ".join(str(text).split()))[:TEXT_LIMIT]}
+                lesson: dict[str, Any] = {"id": record_id, "text": redact(" ".join(str(text).split()))[:TEXT_LIMIT],
+                                          "verification": verification}
                 if where:
                     lesson["where"] = where
                 if scope == "project":
@@ -253,6 +260,8 @@ def build_index(connection: Any) -> dict[str, list[dict[str, Any]]]:
 def applies(lesson: dict[str, Any], command: str, cwd: str) -> bool:
     """Whether a lesson applies to this command in this folder."""
 
+    if lesson.get("verification") not in CHECKED:
+        return False
     where = lesson.get("where")
     if where and where not in command.casefold():
         return False

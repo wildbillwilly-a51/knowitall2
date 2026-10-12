@@ -139,12 +139,25 @@ class ServerSetupTests(unittest.TestCase):
             store.close()
 
     def test_uninstalling_the_last_agent_disconnects_the_computer(self) -> None:
-        self.run_cli("setup", "codex", "--server", self.address, "--join-code", self.code())
-        self.run_cli("setup", "claude-code", "--join-code", self.code("Workstation - Claude Code"))
+        # The agents as set up on this computer; an uninstall against another home leaves the keys alone (A-M4).
+        claude, codex = self.root / "claude", self.root / "codex"
+        claude.mkdir()
+        codex.mkdir()
+        (claude / ".claude.json").write_text(json.dumps({"numStartups": 1}) + "\n", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude), "CODEX_HOME": str(codex)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.run_cli("setup", "codex", "--no-app-shortcut", "--server", self.address, "--join-code", self.code(),
+                     user_home=False)
+        self.run_cli("setup", "claude-code", "--no-app-shortcut", "--join-code", self.code("Workstation - Claude Code"),
+                     user_home=False)
         code, output, _ = self.run_cli("uninstall", "claude-code")
+        self.assertNotIn("key for the KnowItAll2 server", output)
+        self.assertTrue(connected.is_connected())
+        code, output, _ = self.run_cli("uninstall", "claude-code", user_home=False)
         self.assertIn("removed claude-code's key", output)
         self.assertTrue(connected.is_connected())
-        code, output, _ = self.run_cli("uninstall", "codex")
+        code, output, _ = self.run_cli("uninstall", "codex", user_home=False)
         self.assertIn("keeps its memory here only again", output)
         self.assertFalse(connected.is_connected())
 

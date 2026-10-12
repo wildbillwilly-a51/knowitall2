@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -71,7 +72,7 @@ def identify_remote(url: str, name: str | None = None) -> ProjectIdentity | None
 
 
 def find_git_root(start: Path) -> Path | None:
-    """The repository holding ``start``: the nearest folder at or above it with a ``.git``.
+    """The repository holding ``start``: the nearest folder at or above it with a ``.git`` Git can use.
 
     An empty folder belongs to no repository, even inside one: it is most often
     what a project left behind when it moved, and the repository above is some
@@ -84,13 +85,49 @@ def find_git_root(start: Path) -> Path | None:
         current = start.resolve()
     except OSError:
         return None
-    if (current / ".git").exists():
+    if repository_dirs(current) is not None:
         return current
     if _vacant(current):
         return None
     for candidate in current.parents:
-        if (candidate / ".git").exists():
+        if repository_dirs(candidate) is not None:
             return candidate
+    return None
+
+
+def repository_dirs(root: Path) -> tuple[Path, Path] | None:
+    """The Git folder of the working tree at ``root``, and the one it shares with its other worktrees.
+
+    None unless Git could use them: the Git folder holds ``HEAD`` and the shared one ``objects``. A ``.git``
+    folder with nothing else in it (the live case: one holding only ``info/`` made a parent folder of
+    projects a project), or a worktree whose repository moved away, is not a repository.
+    """
+
+    marker = root / ".git"
+    try:
+        mode = marker.stat().st_mode
+        if stat.S_ISDIR(mode):
+            git_dir = marker
+        elif stat.S_ISREG(mode):
+            content = marker.read_text(encoding="utf-8", errors="replace").strip()
+            if not content.lower().startswith("gitdir:"):
+                return None
+            git_dir = Path(content[len("gitdir:"):].strip())
+            if not git_dir.is_absolute():
+                git_dir = root / git_dir
+        else:
+            return None
+        common = git_dir
+        pointer = git_dir / "commondir"
+        if pointer.is_file():
+            relative = pointer.read_text(encoding="utf-8", errors="replace").strip()
+            if relative:
+                candidate = Path(relative)
+                common = candidate if candidate.is_absolute() else git_dir / candidate
+        if (git_dir / "HEAD").is_file() and (common / "objects").is_dir():
+            return git_dir, common
+    except OSError:
+        pass
     return None
 
 
@@ -168,31 +205,8 @@ def normalize_remote(url: str | None) -> str | None:
 
 
 def _config_path(root: Path) -> Path | None:
-    marker = root / ".git"
-    if marker.is_dir():
-        git_dir = marker
-    elif marker.is_file():
-        try:
-            content = marker.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            return None
-        if not content.lower().startswith("gitdir:"):
-            return None
-        git_dir = Path(content[len("gitdir:"):].strip())
-        if not git_dir.is_absolute():
-            git_dir = root / git_dir
-    else:
-        return None
-    common = git_dir / "commondir"
-    if common.is_file():
-        try:
-            relative = common.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            relative = ""
-        if relative:
-            candidate = Path(relative)
-            git_dir = candidate if candidate.is_absolute() else git_dir / candidate
-    return git_dir / "config"
+    found = repository_dirs(root)
+    return found[1] / "config" if found else None
 
 
 def _display_name(raw_remote: str | None) -> str | None:

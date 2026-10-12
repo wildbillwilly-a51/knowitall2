@@ -212,6 +212,27 @@ class FinishTests(unittest.TestCase):
         self.assertNotIn(update.TRUST_HOOKS, text)
         self.assertNotIn("so it keeps the new settings", text)
 
+    def test_claude_code_hooks_registered_the_earlier_way_are_registered_again(self) -> None:
+        # Up to 0.10.5 the launcher was Python's script, and a missing launcher blocked every prompt (H-H2).
+        from knowitall2.agents import claude_code
+
+        settings = self.root / "claude" / "settings.json"
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        words = {"SessionStart": [], "Stop": ["stop"], "SessionEnd": ["session-end"], "UserPromptSubmit": ["prompt-submit"],
+                 "PostToolUseFailure": ["command"]}
+        for event, groups in data["hooks"].items():
+            for group in groups:
+                for hook in group["hooks"]:
+                    hook["args"] = ["-B", str(claude_code.hook_launcher_path()), *words[event]]
+        settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        text = self.finish(codex_running=True)
+        registered = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
+        for event in claude_code.HOOK_EVENTS:
+            [hook] = [hook for group in registered[event] for hook in group["hooks"]]
+            self.assertEqual(claude_code.hook_entry(server_launch(), event), hook)
+            self.assertEqual("-c", hook["args"][2])
+        self.assertIn("Quit and reopen Claude Code so it keeps the new settings.", text)
+
     def test_changed_hooks_are_trusted_again_in_codex(self) -> None:
         (self.root / "codex" / "hooks.json").unlink()
         text = self.finish(codex_running=False)

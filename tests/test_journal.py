@@ -323,7 +323,7 @@ class MaintenanceJournalTests(unittest.TestCase):
         try:
             memory = Memory(store, agent="maintenance", clock=Clock("2026-09-28T12:00:00Z"))
             kept = memory.remember("The NAS nas01 serves backups over SMB.").record
-            copy = memory.remember("nas01 serves backups.").record
+            copy = memory.remember("The NAS nas01 serves the backups over SMB.").record   # says the same
 
             class Reviewer:
                 last_usage = {"input_tokens": 500}

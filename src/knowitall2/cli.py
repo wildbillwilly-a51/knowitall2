@@ -166,6 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     maintain.add_argument("--dry-run", action="store_true", help="show the groups and which would be reviewed")
     maintain.add_argument("--model", help="model used for the review (default: the learning model)")
+    maintain.add_argument("--max-calls", type=int, metavar="CALLS",
+                          help="at most CALLS model calls, one for each group reviewed (default: 10, as a run)")
 
     cataloguing = commands.add_parser(
         "catalog", help="file memories under systems and review questions (also runs after learning)",
@@ -500,10 +502,9 @@ def _run_agent_command(arguments: argparse.Namespace) -> int:
     except (AgentError, OSError) as exc:
         print(f"knowitall2: {exc}", file=sys.stderr)
         return 1
-    if arguments.command == "uninstall":
-        shared = _forget_agent_key(arguments.agent)
-        if arguments.user_home is None:
-            shared = [*shared, *_remove_knowledge_files_if_last()]
+    if arguments.command == "uninstall" and arguments.user_home is None:
+        # Testing against another home leaves the data home alone: its server keys, connection, and knowledge files.
+        shared = [*_forget_agent_key(arguments.agent), *_remove_knowledge_files_if_last()]
     verb = "setup" if arguments.command == "setup" else "uninstall"
     # The app is installed with KnowItAll2; testing against another home leaves the real shortcut alone.
     app_changes: list[str] = []
@@ -520,11 +521,37 @@ def _run_agent_command(arguments: argparse.Namespace) -> int:
     if changes and verb == "setup":
         lines.append(adapter.restart_hint())
     elif changes:
-        lines.append(f"Your memories were kept in {data_home()}; delete that folder to remove them.")
-        if arguments.user_home is None:
-            lines.append("The KnowItAll2 app stays for your other agents; remove it with: knowitall2 app --remove-shortcut")
+        lines.extend(_after_uninstall(adapter.display_name, arguments.user_home))
     print("\n".join(lines))
     return 0
+
+
+def _after_uninstall(display_name: str, user_home: Path | None) -> list[str]:
+    """What to do after an uninstall. The data home holds the memories, the hook launchers and the clone agents
+    run, so deleting it is offered only when no agent here is still set up with KnowItAll2."""
+
+    from .agents.base import cli_command, was_set_up
+
+    # Testing against another home: that home's agents, and this computer's own, which use the same data home.
+    homes = [None] if user_home is None else [user_home, None]
+    users: list[str] = []
+    for name in AGENT_NAMES:
+        adapters = [adapter_for(name, user_home=home) for home in homes]
+        if any(was_set_up(adapter) for adapter in adapters):
+            users.append(adapters[0].display_name)
+    lines = [f"Close and reopen {display_name}: chats open now keep using KnowItAll2 until then."]
+    app = cli_command("app", "--remove-shortcut")
+    if users:
+        verb = "uses" if len(users) == 1 else "use"
+        lines.append(f"Your memories were kept in {data_home()}; {' and '.join(users)} still {verb} it, so keep "
+                     "that folder.")
+        if user_home is None:
+            lines.append(f"The KnowItAll2 app stays for your other agents; remove it with: {app}")
+        return lines
+    if user_home is None:
+        lines.append(f"The KnowItAll2 app is still installed; remove it with: {app}")
+    lines.append(f"Your memories were kept in {data_home()}; delete that folder to remove them.")
+    return lines
 
 
 def _connect_agent(arguments: argparse.Namespace) -> tuple[bool, list[str]]:
@@ -701,7 +728,7 @@ def _format_stats(store: Store) -> str:
         f"Learner: {learner.calls_since(now - timedelta(days=1))} calls in the last 24 hours, "
         f"{learner.calls_since(now - timedelta(days=30))} in the last 30 days"
     )
-    last_review = store.last_review()
+    last_review = store.last_maintenance()
     lines.append(
         f"Maintenance: {store.count_changed_by(REASON_PREFIX, since=month_ago)} memories merged or retired "
         f"in the last 30 days; last review {last_review[:16].replace('T', ' ') + ' UTC' if last_review else 'never'}"

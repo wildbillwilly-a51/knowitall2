@@ -128,7 +128,7 @@ def overview(query, body, match) -> dict[str, Any]:
         "engine": _ENGINE_NAMES.get(settings.backend, settings.backend), "model": settings.model or "",
         "engine_found": engine is not None, "running": RunLock().busy(),
         "last_run": last_runs[0] if last_runs else None, "last_start": _last_start(),
-        "calls_today": state.calls_since(now - timedelta(days=1)), "calls_per_day": settings.max_calls_per_day,
+        "calls_today": state.limited_calls_since(now - timedelta(days=1)), "calls_per_day": settings.max_calls_per_day,
         "now": _now_view(), "latest": next((_news_view(item) for item in moments.news()[:1]), None),
     }
     sharing = _sharing()
@@ -329,7 +329,7 @@ def learning(query, body, match) -> dict[str, Any]:
                            "path": str(engine_path(name) or "")} for name in _ENGINE_NAMES},
         "running": RunLock().busy(),
         "last_start": _last_start(),
-        "calls_today": LearnerState().calls_since(now - timedelta(days=1)),
+        "calls_today": LearnerState().limited_calls_since(now - timedelta(days=1)),
         "now": _now_view(),
         "news": [_news_view(item) for item in moments.news()[:NEWS_SHOWN]],
         "waiting": _waiting(settings),

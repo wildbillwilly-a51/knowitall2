@@ -58,6 +58,7 @@ class Event:
     output: str | None = None
     end: int = 0  # byte offset just past the log record that produced this event
     cwd: str | None = None  # the folder a command ran in, when the log records it apart from the command
+    at: str | None = None  # when the log recorded it
 
 
 @dataclass
@@ -151,6 +152,21 @@ def is_codex_log(path: Path) -> bool:
     return path.name.startswith("rollout-")
 
 
+def line_boundary(path: Path, *, window: int = 1 << 16) -> int:
+    """The offset just past the last complete line, so a later read starts on a record."""
+
+    end = path.stat().st_size
+    with path.open("rb") as stream:
+        while end > 0:
+            start = max(0, end - window)
+            stream.seek(start)
+            index = stream.read(end - start).rfind(b"\n")
+            if index >= 0:
+                return start + index + 1
+            end = start
+    return 0
+
+
 def read_session(path: Path, *, start: int = 0, stop: int | None = None) -> tuple[Session, int]:
     """Read a session log from byte offset ``start``, and no further than the line that reaches ``stop``."""
 
@@ -218,8 +234,9 @@ def read_claude_code_session(path: Path, *, start: int = 0, stop: int | None = N
             if isinstance(record, dict):
                 before = len(session.events)
                 _consume(record, session, pending)
+                at = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
                 for index in range(before, len(session.events)):
-                    session.events[index] = replace(session.events[index], end=offset)
+                    session.events[index] = replace(session.events[index], end=offset, at=at)
     return session, offset
 
 
@@ -364,8 +381,9 @@ def read_codex_session(path: Path, *, start: int = 0, stop: int | None = None) -
             if isinstance(record, dict):
                 before = len(session.events)
                 _consume_codex(record, session)
+                at = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
                 for index in range(before, len(session.events)):
-                    session.events[index] = replace(session.events[index], end=offset)
+                    session.events[index] = replace(session.events[index], end=offset, at=at)
     return session, offset
 
 

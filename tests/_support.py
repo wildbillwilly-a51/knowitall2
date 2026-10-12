@@ -30,6 +30,9 @@ def make_repository(root: Path, remote: str | None = None, *, remote_name: str =
 
     git_dir = root / ".git"
     git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "objects").mkdir()
+    (git_dir / "refs").mkdir()
     lines = ["[core]", "\trepositoryformatversion = 0"]
     if remote is not None:
         lines += [f'[remote "{remote_name}"]', f"\turl = {remote}", "\tfetch = +refs/heads/*:refs/remotes/origin/*"]

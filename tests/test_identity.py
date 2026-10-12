@@ -40,6 +40,7 @@ class IdentityTests(unittest.TestCase):
         worktree_git = main / ".git" / "worktrees" / "feature"
         worktree_git.mkdir(parents=True)
         (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
+        (worktree_git / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
         tree = self.root / "feature"
         tree.mkdir()
         (tree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
@@ -67,6 +68,26 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(identify(parent).id, identify(parent / "not-made-yet").id)
         empty_repo = make_repository(parent / "fresh")
         self.assertEqual(empty_repo.resolve(), find_git_root(empty_repo))  # a repository root is never "empty"
+
+    def test_a_git_folder_git_cannot_use_makes_no_project(self) -> None:
+        # The live case: a .git folder holding only info/ made a parent folder of projects a project.
+        parent = self.root / "Projects"
+        (parent / ".git" / "info").mkdir(parents=True)
+        (parent / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
+        notes = parent / "notes"
+        notes.mkdir()
+        (notes / "todo.md").write_text("later\n", encoding="utf-8")
+        if find_git_root(self.root) is not None:
+            self.skipTest("the temporary folder is inside a Git repository")
+        self.assertIsNone(find_git_root(parent))
+        self.assertIsNone(identify(notes))
+        moved = self.root / "moved-worktree"   # its repository is gone
+        moved.mkdir()
+        (moved / ".git").write_text(f"gitdir: {self.root / 'gone' / '.git' / 'worktrees' / 'x'}\n", encoding="utf-8")
+        self.assertIsNone(identify(moved))
+        real = make_repository(parent / "real", "https://gitlab.example.test/group/real.git")
+        self.assertEqual(real.resolve(), find_git_root(real / "src"))
+        self.assertEqual("gitlab.example.test/group/real", identify(real / "src").remote)
 
     def test_folder_outside_git_has_no_project(self) -> None:
         plain = self.root / "plain"

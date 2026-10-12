@@ -13,7 +13,7 @@ from _support import make_repository
 from knowitall2.agents import AgentError, ServerLaunch, server_launch
 from knowitall2.agents.base import JsonFile, render_hook_launcher
 from knowitall2.agents.claude_code import ClaudeCodeAdapter, hook_launcher_path
-from knowitall2.agents import codex, instructions
+from knowitall2.agents import claude_code, codex, instructions
 from knowitall2.agents.codex import BEGIN, CodexAdapter, windows_command
 from knowitall2.memory import Memory
 from knowitall2.paths import database_path
@@ -69,7 +69,8 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertFalse((self.codex_home / "AGENTS.md").exists())
         self.assertFalse((self.codex_home / "skills" / "knowitall2").exists())
         self.assertFalse((self.codex_home / "hooks.json").exists())
-        self.assertFalse(codex.hook_launcher_path().exists())
+        # The launcher is in the data home, which an uninstall against another home leaves alone (A-M4).
+        self.assertEqual(render_hook_launcher(LAUNCH, "codex"), codex.hook_launcher_path().read_text(encoding="utf-8"))
         self.assertEqual([], self.adapter.uninstall())
 
     def test_windows_line_endings_are_kept(self) -> None:
@@ -86,6 +87,65 @@ class CodexAdapterTests(unittest.TestCase):
         with self.assertRaises(AgentError):
             self.adapter.setup(LAUNCH)
         self.assertEqual(foreign, self.config.read_text(encoding="utf-8"))
+        self.adapter.uninstall()
+        self.assertEqual(foreign, self.config.read_text(encoding="utf-8"))
+
+    def test_settings_added_to_its_server_entry_are_kept_when_the_block_is_written_again(self) -> None:
+        # Review 2026-10-11, H-M2: the user's or Codex's own keys and tables for KnowItAll2's server were dropped.
+        self.adapter.setup(LAUNCH)
+        text = self.config.read_text(encoding="utf-8")
+        text = text.replace('args = ["-B"', 'enabled = false\ntool_timeout_sec = 90.5\nargs = ["-B"', 1).replace(
+            "# END knowitall2", '[mcp_servers.knowitall2.tools.recall]\napproval_mode = "approve"\n'
+                               '[mcp_servers.knowitall2.tools."my tool"]\nnotes = ["a \\"b\\"", 1979-05-27T07:32:00Z]\n'
+                               "# END knowitall2")
+        self.config.write_bytes(text.encode("utf-8"))
+        added = tomllib.loads(text)["mcp_servers"]["knowitall2"]
+        self.assertEqual({"PYTHONPATH", "enabled", "tool_timeout_sec", "tools"},
+                         {*added["env"], *added} - {"command", "args", "env"})
+        moved = ServerLaunch(command=LAUNCH.command, args=LAUNCH.args, env={})
+        self.assertTrue(any("registered the knowitall2 MCP server" in change for change in self.adapter.setup(moved)))
+        text = self.config.read_text(encoding="utf-8")
+        # KnowItAll2's own keys follow the new launch (no env any more); every other key and table is as it was.
+        self.assertEqual({key: value for key, value in added.items() if key != "env"},
+                         tomllib.loads(text)["mcp_servers"]["knowitall2"])
+        self.assertTrue(text.startswith(self.ORIGINAL))
+        self.assertLess(text.index("approval_mode"), text.index("# END knowitall2"))
+        self.assertEqual([], self.adapter.setup(moved))
+        self.assertTrue(all(check.ok for check in self.adapter.checks(moved)))
+        self.adapter.uninstall()
+        self.assertEqual(self.ORIGINAL.encode("utf-8"), self.config.read_bytes())
+
+    def test_uninstall_also_removes_its_tables_outside_the_block(self) -> None:
+        # Left behind with no command, such a table made Codex refuse its whole configuration ("invalid transport").
+        self.adapter.setup(LAUNCH)
+        with self.config.open("ab") as stream:
+            stream.write(b'\n[mcp_servers.knowitall2.tools.remember]\napproval_mode = "approve"\n')
+        self.adapter.uninstall()
+        self.assertEqual(self.ORIGINAL.encode("utf-8"), self.config.read_bytes())
+        # Without the block, as an earlier uninstall left it: the leftover table goes, and nothing else.
+        profile = '# my profile\n[profiles.fast]\nmodel = "gpt-5-mini"\n'
+        stray = '[mcp_servers.knowitall2.tools.remember]\napproval_mode = "approve"\n\n'
+        self.config.write_bytes((self.ORIGINAL + "\n" + stray + profile).encode("utf-8"))
+        changes = self.adapter.uninstall()
+        self.assertTrue(any("mcp_servers.knowitall2" in change for change in changes), changes)
+        self.assertEqual((self.ORIGINAL + "\n" + profile).encode("utf-8"), self.config.read_bytes())
+
+    def test_setup_takes_its_tables_outside_the_block_into_it(self) -> None:
+        profile = '# my profile\n[profiles.fast]\nmodel = "gpt-5-mini"\n'
+        stray = '[mcp_servers.knowitall2.tools.remember]\napproval_mode = "approve"\n\n'
+        self.config.write_bytes((self.ORIGINAL + "\n" + stray + profile).encode("utf-8"))
+        self.assertTrue(any("registered the knowitall2 MCP server" in change for change in self.adapter.setup(LAUNCH)))
+        text = self.config.read_text(encoding="utf-8")
+        parsed = tomllib.loads(text)
+        self.assertEqual({"remember": {"approval_mode": "approve"}}, parsed["mcp_servers"]["knowitall2"]["tools"])
+        self.assertEqual(LAUNCH.command, parsed["mcp_servers"]["knowitall2"]["command"])
+        self.assertEqual("gpt-5-mini", parsed["profiles"]["fast"]["model"])
+        self.assertEqual(1, text.count("approval_mode"))
+        self.assertGreater(text.index("approval_mode"), text.index(BEGIN))
+        self.assertTrue(text.startswith(self.ORIGINAL + "\n" + profile))
+        self.assertEqual([], self.adapter.setup(LAUNCH))
+        self.adapter.uninstall()
+        self.assertEqual((self.ORIGINAL + "\n" + profile).encode("utf-8"), self.config.read_bytes())
 
     def test_refuses_invalid_toml_without_changing_it(self) -> None:
         self.config.write_text("model = \n", encoding="utf-8")
@@ -366,7 +426,8 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
         self.assertFalse((self.user_home / ".claude" / "CLAUDE.md").exists())
         self.assertFalse((self.user_home / ".claude" / "skills" / "knowitall2").exists())
         self.assertFalse(self.settings.exists())
-        self.assertFalse(hook_launcher_path().exists())
+        # The launcher is in the data home, which an uninstall against another home leaves alone (A-M4).
+        self.assertTrue(hook_launcher_path().is_file())
 
     def test_the_session_hook_is_exec_form_and_keeps_other_hooks(self) -> None:
         other_start = {"matcher": "startup", "hooks": [{"type": "command", "command": "other.exe"}]}
@@ -377,24 +438,79 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
         data = json.loads(self.settings.read_text(encoding="utf-8"))
         self.assertEqual(other_start, data["hooks"]["SessionStart"][0])
         ours = data["hooks"]["SessionStart"][1]["hooks"][0]
-        self.assertEqual((LAUNCH.command, "-B"), (ours["command"], ours["args"][0]))
-        self.assertEqual(str(hook_launcher_path()), ours["args"][1])
+        # Python runs a few words of its own that run the launcher only when it is there (H-H2).
+        self.assertEqual((LAUNCH.command, ["-B", "-P", "-c"]), (ours["command"], ours["args"][:3]))
+        self.assertIn(f"p={str(hook_launcher_path())!r}; sys.argv=[p]", ours["args"][3])
+        self.assertEqual(30, ours["timeout"])
         self.assertNotIn("shell", ours)
         # The end of each turn and the end of the session run the same launcher with their event.
-        self.assertEqual([str(hook_launcher_path()), "stop"], data["hooks"]["Stop"][0]["hooks"][0]["args"][1:])
-        self.assertEqual([str(hook_launcher_path()), "session-end"],
-                         data["hooks"]["SessionEnd"][0]["hooks"][0]["args"][1:])
-        self.assertEqual([str(hook_launcher_path()), "prompt-submit"],
-                         data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1:])
+        for event, word in (("Stop", "stop"), ("SessionEnd", "session-end"), ("UserPromptSubmit", "prompt-submit")):
+            [hook] = data["hooks"][event][0]["hooks"]
+            self.assertIn(f"p={str(hook_launcher_path())!r}; sys.argv=[p, {word!r}]", hook["args"][3])
         self.assertEqual(guard, data["hooks"]["PreToolUse"])
         # After a shell command fails: what is known about that command.
         failed = data["hooks"]["PostToolUseFailure"][0]
         self.assertEqual("Bash|PowerShell", failed["matcher"])
-        self.assertEqual(["-B", str(hook_launcher_path()), "command"], failed["hooks"][0]["args"])
+        self.assertIn("sys.argv=[p, 'command']", failed["hooks"][0]["args"][3])
+        self.assertEqual(5, failed["hooks"][0]["timeout"])
         self.assertTrue(data["switchModelsOnFlag"])
         self.assertIn(repr("C:\\src dir"), hook_launcher_path().read_text(encoding="utf-8"))
         self.adapter.uninstall()
         self.assertEqual(original, json.loads(self.settings.read_text(encoding="utf-8")))
+
+    def test_every_registered_hook_exits_zero_when_the_launcher_is_gone(self) -> None:
+        # Review 2026-10-11, H-H2: Python exits 2 when it cannot open a script, and Claude Code takes exit 2 as a
+        # blocking error: no prompt would reach Claude. A data home whose path has a space and an apostrophe.
+        with mock.patch.dict(os.environ, {"KNOWITALL2_HOME": str(self.user_home / "Jane's data")}):
+            self.adapter.setup(server_launch())
+            registered = json.loads(self.settings.read_text(encoding="utf-8"))["hooks"]
+            payload = json.dumps({"session_id": "s1", "cwd": str(self.user_home), "prompt": "hello"}).encode()
+            environment = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.user_home / ".claude"))
+
+            def run(event):
+                [hook] = [hook for group in registered[event] for hook in group["hooks"]]
+                return subprocess.run([hook["command"], *hook["args"]], input=payload, capture_output=True,
+                                      env=environment, timeout=60)
+
+            done = run("SessionStart")
+            self.assertEqual(0, done.returncode, done.stderr)
+            self.assertIn(b"KnowItAll2 briefing", done.stdout)
+            hook_launcher_path().unlink()
+            for event in claude_code.HOOK_EVENTS:
+                with self.subTest(event=event):
+                    done = run(event)
+                    self.assertEqual((0, b"", b""), (done.returncode, done.stdout, done.stderr))
+
+    def test_hooks_registered_the_earlier_way_are_recognized_and_registered_again(self) -> None:
+        # Up to 0.10.5 the launcher itself was Python's script, which a missing launcher made exit 2.
+        launcher = str(hook_launcher_path())
+        words = {"SessionStart": [], "Stop": ["stop"], "SessionEnd": ["session-end"], "UserPromptSubmit": ["prompt-submit"],
+                 "PostToolUseFailure": ["command"]}
+        timeouts = {"SessionStart": 30, "Stop": 15, "SessionEnd": 15, "UserPromptSubmit": 10, "PostToolUseFailure": 5}
+        other = {"type": "command", "command": "other.exe"}
+        hooks = {event: [{"matcher": "Bash|PowerShell" if event == "PostToolUseFailure" else "", "hooks": [
+            {"type": "command", "command": LAUNCH.command, "args": ["-B", launcher, *words[event]],
+             "timeout": timeouts[event]}]}] for event in words}
+        hooks["Stop"].insert(0, {"hooks": [other]})
+        self.settings.write_text(json.dumps({"hooks": hooks}, indent=2) + "\n", encoding="utf-8")
+
+        def hook_check():
+            return next(check for check in self.adapter.checks(LAUNCH) if check.name == "Claude Code session hook")
+
+        self.assertFalse(hook_check().ok)
+        self.assertIn("registered the way earlier versions did", hook_check().detail)
+        self.adapter.setup(LAUNCH)
+        registered = json.loads(self.settings.read_text(encoding="utf-8"))["hooks"]
+        for event in words:
+            ours = [hook for group in registered[event] for hook in group["hooks"] if hook != other]
+            self.assertEqual([claude_code.hook_entry(LAUNCH, event)], ours)
+            self.assertEqual(["-B", "-P", "-c"], ours[0]["args"][:3])
+            self.assertEqual(timeouts[event], ours[0]["timeout"])
+        self.assertEqual([{"hooks": [other]}], registered["Stop"][:1])
+        self.assertEqual("Bash|PowerShell", registered["PostToolUseFailure"][0]["matcher"])
+        self.assertTrue(hook_check().ok, hook_check().detail)
+        self.adapter.uninstall()
+        self.assertEqual({"hooks": {"Stop": [{"hooks": [other]}]}}, json.loads(self.settings.read_text(encoding="utf-8")))
 
     def test_a_removed_hook_is_detected(self) -> None:
         self.adapter.setup(LAUNCH)

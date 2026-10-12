@@ -237,19 +237,53 @@ class Memory:
     def now(self) -> str:
         return self._clock()
 
+    # While a briefing is built on a store opened only to read (the session-start hook): the writes it would
+    # make, as (whether the write runs its own transactions, the write), for ``make_writes``.
+    _later: list[tuple[bool, Callable[[], object]]] | None = None
+
+    def put_off_writes(self) -> None:
+        """Keep the writes that reading would make (the project's last use, a briefing's record of use, and
+        the questions and requests it offered) for :meth:`make_writes`, so a store opened only to read will do."""
+
+        self._later = []
+
+    def make_writes(self, store: Store) -> None:
+        """Make the writes put off, on ``store``: in one transaction, which raises when the store stays busy
+        past its timeout, and then none are made; after it, a project's rejoining, which takes its own."""
+
+        later, self._later = self._later or [], None
+        self.store = store
+        with store.transaction():
+            for alone, write in later:
+                if not alone:
+                    write()
+        for alone, write in later:
+            if alone:
+                write()
+
+    def _write(self, write: Callable[[], object], *, alone: bool = False) -> None:
+        if self._later is None:
+            write()
+        else:
+            self._later.append((alone, write))
+
     def project_for(self, project_path: str | Path | None) -> ProjectIdentity | None:
         identity = identify(Path(project_path) if project_path else Path.cwd())
         if identity is not None and (identity.id, identity.path_key) not in self._touched:
-            self.store.touch_project(identity, self._clock())
+            now = self._clock()
+            self._write(lambda: self.store.touch_project(identity, now))
             self._touched.add((identity.id, identity.path_key))
-            try:
-                # Not inside another change (an import), which would keep half of it if this one failed.
-                if not self.store.connection.in_transaction:
-                    self.rejoin(identity)
-            except Exception as exc:  # never in the way of the work that asked for the project
-                journal.problem("project", f"what was saved before {identity.name} had a remote was not "
-                                           f"rejoined: {type(exc).__name__}: {exc}")
+            self._write(lambda: self._rejoin_quietly(identity), alone=True)
         return identity
+
+    def _rejoin_quietly(self, identity: ProjectIdentity) -> None:
+        try:
+            # Not inside another change (an import), which would keep half of it if this one failed.
+            if not self.store.connection.in_transaction:
+                self.rejoin(identity)
+        except Exception as exc:  # never in the way of the work that asked for the project
+            journal.problem("project", f"what was saved before {identity.name} had a remote was not "
+                                       f"rejoined: {type(exc).__name__}: {exc}")
 
     def remember(
         self,
@@ -483,25 +517,39 @@ class Memory:
 
         The words are kept as a memory replaced at once by ``known`` (``SAID_AGAIN``), so they sync, keep their
         date, and count toward how many chats the preference was said in (``Store.said_in_sessions``), even when
-        they are word for word the same.
+        they are word for word the same. When the words are the user's own and ``known`` is not (an agent's
+        paraphrase), the user's words take its place instead: they hold the preference and its count, and
+        ``known`` is counted on them.
         """
 
         body = _clean_text(text)
         now = self._clock()
         record_id = self._new_id()
+        verification = VERIFICATION_FOR_SOURCE[source]
+        holds = verification == "user_stated" and known.verification != "user_stated"
+        subject_list, tag_list = _clean_labels(subjects, "subjects"), [PREFERENCE_TAG]
+        if holds:
+            have = {label.casefold() for label in known.subjects}
+            subject_list = [*known.subjects, *(label for label in subject_list if label.casefold() not in have)]
+            tag_list = [*known.tags, *([] if PREFERENCE_TAG in known.tags else [PREFERENCE_TAG])]
         with self.store.transaction():
             self.store.insert_record(
-                record_id=record_id, kind="note", text=body, subjects=_clean_labels(subjects, "subjects"),
-                tags=[PREFERENCE_TAG], scope=known.scope, project_id=known.project_id,
-                verification=VERIFICATION_FOR_SOURCE[source], source_kind="user" if source == "user" else "agent",
-                source_agent=self.agent, source_session=session,
+                record_id=record_id, kind="decision" if holds and known.kind == "decision" else "note", text=body,
+                subjects=subject_list[:MAX_LABELS], tags=tag_list,
+                scope=known.scope, project_id=known.project_id, verification=verification,
+                source_kind="user" if source == "user" else "agent", source_agent=self.agent, source_session=session,
                 content_hash=_content_hash(body, known.scope, known.project_id), now=now,
             )
-            self.store.supersede(record_id, known.id, now=now, reason=f"{SAID_AGAIN} [{known.id}]")
-            if PREFERENCE_TAG not in known.tags:
-                self.store.set_tags(known.id, [*known.tags, PREFERENCE_TAG], now=now)
+            if holds:
+                self.store.supersede(known.id, record_id, now=now, reason=f"{SAID_AGAIN} [{record_id}]")
+            else:
+                self.store.supersede(record_id, known.id, now=now, reason=f"{SAID_AGAIN} [{known.id}]")
+                if PREFERENCE_TAG not in known.tags:
+                    self.store.set_tags(known.id, [*known.tags, PREFERENCE_TAG], now=now)
+            # The memory that holds the preference first.
             self.record_event("remember", body, outcome="said again", project_id=known.project_id, session=session,
-                              record_ids=[known.id, record_id], details={"kind": "note", "source": source})
+                              record_ids=[record_id, known.id] if holds else [known.id, record_id],
+                              details={"kind": "note", "source": source})
         record = self.store.get(record_id)
         assert record is not None
         return record
@@ -908,7 +956,9 @@ class Memory:
         from . import review
 
         try:
-            tasks = review.offer_tasks(self.store, project_id=project_id, record_ids=record_ids, now=self._clock())
+            now = self._clock()
+            tasks = review.offer_tasks(self.store, project_id=project_id, record_ids=record_ids, now=now, count=False)
+            self._write(lambda: review.count_offers(self.store, tasks, now=now))
         except Exception:
             return []
         if not tasks:
@@ -936,11 +986,12 @@ class Memory:
         """The user's preferences said in enough chats to last, global or this project's, most often said first.
 
         Said once, a preference is one memory among others; said again in other chats, it is how the user works.
+        Only one held in the user's own words is theirs: an agent's paraphrase is not listed.
         """
 
         found = []
         for row in self.store.list_active(project_id=project_id, scope="all", kinds=("note", "decision"), limit=500):
-            if PREFERENCE_TAG in row.tags:
+            if PREFERENCE_TAG in row.tags and row.verification == "user_stated":
                 times = self.store.times_said(row.id)
                 if times >= LASTING_PREFERENCE_CHATS:
                     found.append((row, times))
@@ -957,7 +1008,7 @@ class Memory:
             questions = review.for_chat(self.store, project_id, now=_parse_time(self._clock()))
             if not questions:
                 return None
-            review.offer_in_chat(self.store, questions)
+            self._write(lambda: review.offer_in_chat(self.store, questions))
         except Exception:
             return None
         noun = "question" if len(questions) == 1 else "questions"
@@ -981,11 +1032,17 @@ class Memory:
     ) -> None:
         """Count this use for the usefulness report; a metrics problem never breaks a lookup."""
 
+        at, record_ids = self._clock(), list(record_ids)
+        self._write(lambda: self._record_use(operation, project, query, record_ids, at))
+
+    def _record_use(
+        self, operation: str, project: ProjectIdentity | None, query: str | None, record_ids: list[str], at: str,
+    ) -> None:
         project_id = project.id if project is not None else None
         query = _shorten(redact(query), 200) if query else None
         try:
             self.store.log_usage(
-                at=self._clock(), operation=operation, agent=self.agent, project_id=project_id,
+                at=at, operation=operation, agent=self.agent, project_id=project_id,
                 query=query, record_ids=record_ids,
             )
         except Exception:

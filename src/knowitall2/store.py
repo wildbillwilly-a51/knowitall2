@@ -357,8 +357,9 @@ class StoreError(RuntimeError):
     ``reason`` says why, so the fix offered can fit: ``newer_schema`` (a newer
     KnowItAll2 upgraded it), ``no_fts5`` (this Python's SQLite lacks full-text
     search), ``busy`` (another process held it too long), ``unreadable`` (not
-    a database, or damaged), or ``io`` (it could not be opened, read or
-    written: permissions, disk space, or the path).
+    a database, or damaged), ``older_schema`` (opened only to read, it needs
+    an upgrade first), or ``io`` (it could not be opened, read or written:
+    permissions, disk space, or the path).
     """
 
     def __init__(self, message: str, *, reason: str = "io") -> None:
@@ -389,6 +390,48 @@ def _newer_schema(version: object) -> StoreError:
         "KnowItAll2 (see docs/install-for-agents.md)",
         reason="newer_schema",
     )
+
+
+# A journal entry of a learning run whose maintenance made a model call, or of a manual maintenance run that did.
+_MAINTENANCE_CALLED = (
+    "json_valid(details) AND ((kind = 'learning' AND CAST(json_extract(details, '$.maintenance.calls') AS INTEGER) > 0)"
+    " OR (kind = 'maintenance' AND CAST(json_extract(details, '$.calls') AS INTEGER) > 0))"
+)
+
+
+def maintenance_record(connection: sqlite3.Connection) -> dict[str, Any]:
+    """From the journal: when maintenance last made a model call, how many groups waited for it at its newest
+    run, and when the oldest learning run still in the journal was."""
+
+    last_call = connection.execute(f"SELECT MAX(at) FROM events WHERE {_MAINTENANCE_CALLED}").fetchone()[0]
+    newest = connection.execute(
+        "SELECT kind, details FROM events WHERE json_valid(details) AND ((kind = 'learning' "
+        "AND json_type(details, '$.maintenance') = 'object') OR kind = 'maintenance') ORDER BY seq DESC LIMIT 1"
+    ).fetchone()
+    waiting = 0
+    if newest is not None:
+        details = json.loads(newest[1])
+        part = details.get("maintenance") if newest[0] == "learning" else details
+        groups = part.get("groups") if isinstance(part, dict) else None
+        count = groups.get("review") if isinstance(groups, dict) else None
+        waiting = count if isinstance(count, int) and not isinstance(count, bool) else 0
+    first_run = connection.execute("SELECT MIN(at) FROM events WHERE kind = 'learning'").fetchone()[0]
+    return {"last_call": last_call, "waiting": waiting, "first_run": first_run}
+
+
+def inspect_maintenance(path: Path) -> dict[str, Any]:
+    """``maintenance_record`` of a database file, opened read-only, for ``doctor``."""
+
+    try:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        raise StoreError(f"cannot open the memory store at {path}: {exc}", reason=error_reason(exc)) from exc
+    try:
+        return maintenance_record(connection)
+    except sqlite3.Error as exc:
+        raise StoreError(f"the journal cannot be read: {exc}", reason=error_reason(exc)) from exc
+    finally:
+        connection.close()
 
 
 def inspect_database(path: Path) -> dict[str, Any]:
@@ -493,16 +536,47 @@ class Store:
         self.path = path
 
     @classmethod
-    def open(cls, path: Path) -> "Store":
+    def open(cls, path: Path, *, timeout: float = 5.0) -> "Store":
+        """The store, created or upgraded as needed; ``timeout`` is how long a write waits for another process."""
+
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(str(path), timeout=5.0, isolation_level=None)
+            connection = sqlite3.connect(str(path), timeout=timeout, isolation_level=None)
         except (OSError, sqlite3.Error) as exc:
             reason = error_reason(exc) if isinstance(exc, sqlite3.Error) else "io"
             raise StoreError(f"cannot open the memory store at {path}: {exc}", reason=reason) from exc
         store = cls(connection, path)
         try:
-            store._initialize(file_backed=True)
+            store._initialize(file_backed=True, timeout=timeout)
+        except BaseException:
+            connection.close()
+            raise
+        return store
+
+    @classmethod
+    def open_read_only(cls, path: Path, *, timeout: float = 1.0) -> "Store":
+        """The store opened only to read: nothing is created, upgraded or written, so another process holding
+        the write lock does not hold it up. Raises :class:`StoreError` when the store is missing or needs the
+        upgrade :meth:`open` makes."""
+
+        if not path.is_file():
+            raise StoreError(f"there is no memory store at {path} yet")
+        try:
+            connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout,
+                                         isolation_level=None)
+        except sqlite3.Error as exc:
+            raise StoreError(f"cannot open the memory store at {path}: {exc}", reason=error_reason(exc)) from exc
+        store = cls(connection, path)
+        try:
+            row = connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            version = int(row["value"]) if row is not None else None
+            if version is not None and version > SCHEMA_VERSION:
+                raise _newer_schema(version)
+            if version != SCHEMA_VERSION:
+                raise StoreError(f"the memory store at {path} needs an upgrade first", reason="older_schema")
+        except sqlite3.Error as exc:
+            connection.close()
+            raise StoreError(f"cannot read the memory store at {path}: {exc}", reason=error_reason(exc)) from exc
         except BaseException:
             connection.close()
             raise
@@ -523,10 +597,10 @@ class Store:
 
         return self._connection
 
-    def _initialize(self, *, file_backed: bool) -> None:
+    def _initialize(self, *, file_backed: bool, timeout: float = 5.0) -> None:
         read_version = "SELECT value FROM meta WHERE key = 'schema_version'"
         try:
-            self._connection.execute("PRAGMA busy_timeout = 5000")
+            self._connection.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
             self._connection.execute("PRAGMA foreign_keys = ON")
             if file_backed:
                 self._use_wal()
@@ -709,20 +783,23 @@ class Store:
         )
 
     def said_in_sessions(self, record_id: str) -> set[str]:
-        """The chats a preference was said in: its own, and those of the user's words counted on it.
+        """The chats a preference was said in: the learned chat it came from, and those of the user's words
+        said again (reason ``memory.SAID_AGAIN``) and of the copies maintenance merged into it as duplicates,
+        through any number of steps.
 
-        Words said again (reason ``memory.SAID_AGAIN``) and copies maintenance merged as duplicates count,
-        through any number of steps; a preference the user changed does not. A memory saved without a chat
-        counts as one of its own.
+        Each chat counts once: a copy from a chat already counted adds nothing, and a memory saved without
+        one (an agent's remember) adds none (N-M2), while a copy learned in another chat adds its own, even
+        when it held the preference before newer words took over (R-L3). A preference the user changed does
+        not count.
         """
 
         rows = self._connection.execute(
             "WITH RECURSIVE chain(id, session) AS ("
-            " SELECT id, COALESCE(source_session, id) FROM records WHERE id = ?"
-            " UNION SELECT r.id, COALESCE(r.source_session, r.id) FROM records r JOIN chain c ON r.superseded_by = c.id"
+            " SELECT id, source_session FROM records WHERE id = ?"
+            " UNION SELECT r.id, r.source_session FROM records r JOIN chain c ON r.superseded_by = c.id"
             "  WHERE r.status = 'superseded' AND (r.retired_reason LIKE 'said again by the user%'"
             "   OR r.retired_reason LIKE 'maintenance: duplicate of%'))"
-            " SELECT DISTINCT session FROM chain",
+            " SELECT DISTINCT session FROM chain WHERE session IS NOT NULL AND session != ''",
             (record_id,),
         ).fetchall()
         return {row[0] for row in rows}
@@ -1329,6 +1406,19 @@ class Store:
             sql += " AND scope_key = ?"
             parameters = (scope_key,)
         return self._connection.execute(sql, parameters).fetchone()[0]
+
+    def last_maintenance(self) -> str | None:
+        """When maintenance last made a model call: from the journal, else from its own reviews, never from those
+        of command tagging (2026-10-11: ``stats`` showed that morning's tagging, and maintenance had made no call
+        in 13 days)."""
+
+        found = maintenance_record(self._connection)["last_call"]
+        if found:
+            return found
+        return self._connection.execute(
+            "SELECT MAX(reviewed_at) FROM reviews WHERE outcome = 'reviewed' "
+            "AND (scope_key = 'global' OR scope_key LIKE 'project:%')"
+        ).fetchone()[0]
 
     def record_review(self, fingerprint: str, *, scope_key: str, outcome: str, now: str) -> None:
         """Remember a group's review; a failure counts toward giving up on that exact group."""

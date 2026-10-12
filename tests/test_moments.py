@@ -510,6 +510,21 @@ class RequestLearningTests(MomentTestCase):
         self.assertEqual("done", entry["status"])
         self.assertEqual(2, LearnerState().calls_since(datetime.now(timezone.utc) - timedelta(days=1)))
 
+    def test_work_and_the_filing_after_it_count_as_work_not_against_upkeeps_allowance(self) -> None:
+        self.learning_on()
+        self.log().write(self.log_path, idle=False)
+        self.stop()
+        extractor = FakeExtractor([[
+            {"text": "The homelab router runs OpenWrt 23.05.3.", "kind": "fact", "subjects": ["router"],
+             "scope": "global", "evidence": "DISTRIB_RELEASE='23.05.3'"},
+        ]])
+        with redirect_stdout(io.StringIO()), \
+                mock.patch("knowitall2.learning.command.build_engine", return_value=extractor), \
+                mock.patch("knowitall2.learning.command.run_catalog", return_value=CatalogReport()) as filing:
+            self.assertEqual(0, main(["learn", "--requests"]))
+        self.assertEqual("work", filing.call_args.kwargs.get("origin"))
+        self.assertEqual(["work"], [call.get("origin") for call in LearnerState().calls])
+
     def test_what_is_learned_is_filed_under_the_project_the_work_was_in(self) -> None:
         self.learning_on()
         other = make_repository(self.root / "work" / "beta", "https://gitlab.example.com/me/beta.git")

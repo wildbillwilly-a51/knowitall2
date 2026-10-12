@@ -2,6 +2,8 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -11,7 +13,8 @@ from unittest import mock
 import _support  # noqa: F401
 
 from knowitall2 import doctor
-from knowitall2.agents import instructions
+from knowitall2.agents import adapter_for, claude_code, codex, instructions, server_launch
+from knowitall2.agents.base import cli_command, render_hook_launcher
 from knowitall2.cli import main
 from knowitall2.paths import database_path
 from knowitall2.store import Store, StoreError
@@ -110,6 +113,106 @@ class SetupCommandTests(unittest.TestCase):
         self.assertIn("markers", errors)
         self.assertEqual(json.dumps({"numStartups": 1}) + "\n",
                          (self.user_home / ".claude.json").read_text(encoding="utf-8"))
+
+
+class UninstallTests(unittest.TestCase):
+    """Uninstall changes only the agent it names, and leaves the data home alone when testing against another home."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.claude, self.codex, self.data = root / "claude", root / "codex", root / "data"
+        self.test_home = root / "test home"
+        for folder in (self.claude, self.codex, self.test_home / ".claude"):
+            folder.mkdir(parents=True)
+        for config in (self.claude / ".claude.json", self.test_home / ".claude.json"):
+            config.write_text(json.dumps({"numStartups": 1}) + "\n", encoding="utf-8")
+        self.environment = mock.patch.dict(os.environ, {
+            "KNOWITALL2_HOME": str(self.data), "CLAUDE_CONFIG_DIR": str(self.claude), "CODEX_HOME": str(self.codex)})
+        self.environment.start()
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def run_cli(self, *arguments: str) -> tuple[int, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = main(list(arguments))
+        return code, output.getvalue() + errors.getvalue()
+
+    def run_hook(self, launcher: Path, event: str) -> subprocess.CompletedProcess:
+        payload = json.dumps({"session_id": "s1", "cwd": str(self.test_home), "prompt": "hello"}).encode()
+        return subprocess.run([sys.executable, "-B", str(launcher), event], input=payload, capture_output=True,
+                              timeout=60)
+
+    def test_uninstall_against_another_home_leaves_the_data_home_alone(self) -> None:
+        # Review 2026-10-11, A-M4: the real agent's launcher, its server key and the connection stay.
+        self.assertEqual(0, self.run_cli("setup", "claude-code", "--no-app-shortcut")[0])
+        self.assertEqual(0, self.run_cli("setup", "claude-code", "--user-home", str(self.test_home))[0])
+        keys = self.data / "server" / "keys"
+        keys.mkdir(parents=True)
+        connection = self.data / "server" / "connection.json"
+        connection.write_text(json.dumps({"address": "http://127.0.0.1:9"}), encoding="utf-8")
+        for agent in ("claude-code", "codex"):
+            (keys / f"{agent}.key").write_text("test-key\n", encoding="utf-8")
+        launcher = claude_code.hook_launcher_path()
+        before = launcher.read_bytes()
+        for _ in range(2):  # a test home with KnowItAll2's settings, then one without
+            code, output = self.run_cli("uninstall", "claude-code", "--user-home", str(self.test_home))
+            self.assertEqual(0, code, output)
+            self.assertEqual(before, launcher.read_bytes())
+            self.assertEqual(["claude-code.key", "codex.key"], sorted(path.name for path in keys.iterdir()))
+            self.assertTrue(connection.is_file())
+            self.assertNotIn("for the KnowItAll2 server", output)
+        self.assertTrue(all(check.ok for check in adapter_for("claude-code").checks(server_launch())))
+
+    def test_codex_leaves_a_launcher_that_does_nothing_and_claude_code_keeps_its_own(self) -> None:
+        for agent in ("codex", "claude-code"):
+            self.assertEqual(0, self.run_cli("setup", agent, "--no-app-shortcut")[0])
+        code, output = self.run_cli("uninstall", "codex")
+        self.assertEqual(0, code, output)
+        # A Codex chat open since before keeps its hooks until Codex reloads them, and its Windows command
+        # cannot test for a missing file: the launcher stays, and does nothing.
+        stub = codex.hook_launcher_path()
+        self.assertNotIn("knowitall2", stub.read_text(encoding="utf-8").split('"""')[-1])
+        for event in ("session-start", "stop", "prompt-submit"):
+            done = self.run_hook(stub, event)
+            self.assertEqual((0, b"", b""), (done.returncode, done.stdout, done.stderr))
+        self.assertEqual(render_hook_launcher(server_launch(), "claude-code"),
+                         claude_code.hook_launcher_path().read_text(encoding="utf-8"))
+        self.assertIn(b"KnowItAll2 briefing", self.run_hook(claude_code.hook_launcher_path(), "session-start").stdout)
+        code, output = self.run_cli("uninstall", "claude-code")
+        self.assertEqual(0, code, output)
+        self.assertFalse(claude_code.hook_launcher_path().exists())
+        # Set up again, Codex gets its launcher back, and uninstalling Claude Code leaves it alone.
+        for agent in ("codex", "claude-code"):
+            self.assertEqual(0, self.run_cli("setup", agent, "--no-app-shortcut")[0])
+        self.assertEqual(render_hook_launcher(server_launch(), "codex"), stub.read_text(encoding="utf-8"))
+        self.assertEqual(0, self.run_cli("uninstall", "claude-code")[0])
+        self.assertEqual(render_hook_launcher(server_launch(), "codex"), stub.read_text(encoding="utf-8"))
+
+    def test_the_folder_is_offered_for_deletion_only_when_no_agent_uses_it(self) -> None:
+        for agent in ("codex", "claude-code"):
+            self.assertEqual(0, self.run_cli("setup", agent, "--no-app-shortcut")[0])
+        code, output = self.run_cli("uninstall", "codex")
+        self.assertEqual(0, code, output)
+        self.assertNotIn("delete that folder", output)
+        self.assertIn("Claude Code still uses it", output)
+        self.assertIn("Close and reopen Codex", output)
+        # A clone has no knowitall2 program on PATH: the advice is the command that runs this installation.
+        self.assertIn(cli_command("app", "--remove-shortcut"), output)
+        code, output = self.run_cli("uninstall", "claude-code")
+        self.assertEqual(0, code, output)
+        self.assertIn(f"Your memories were kept in {self.data}; delete that folder to remove them.", output)
+        self.assertIn("Close and reopen Claude Code", output)
+        # Testing against another home, the agents set up here count too.
+        self.assertEqual(0, self.run_cli("setup", "codex", "--no-app-shortcut")[0])
+        self.assertEqual(0, self.run_cli("setup", "claude-code", "--user-home", str(self.test_home))[0])
+        code, output = self.run_cli("uninstall", "claude-code", "--user-home", str(self.test_home))
+        self.assertEqual(0, code, output)
+        self.assertNotIn("delete that folder", output)
+        self.assertIn("Codex still uses it", output)
 
 
 class DoctorStoreTests(unittest.TestCase):
