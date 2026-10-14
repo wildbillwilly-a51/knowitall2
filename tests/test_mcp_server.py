@@ -84,6 +84,87 @@ class McpServerTests(unittest.TestCase):
         self.assertFalse(self.call("answer", id=question_id, choice="forget")["isError"])
         self.assertEqual("retired", self.store.get(backups.id).status)
 
+    def saved_id(self, answer: dict) -> str:
+        self.assertFalse(answer["isError"], answer)
+        return re.search(r"\[(k-[0-9a-f]+)\]", answer["content"][0]["text"]).group(1)
+
+    def test_a_memory_belongs_to_the_project_unless_it_is_shared_or_personal(self) -> None:
+        # Agents filed 12 of 43 global saves wrongly when global was the default (2026-10-13).
+        self.initialize("claude-code")
+        fact = self.store.get(self.saved_id(self.call("remember", text="The alpha deploy job runs on runner-7.")))
+        self.assertEqual("project", fact.scope)
+        shared = self.call("remember", text="The Git server is gitlab.example.com.", scope="global")
+        self.assertEqual("global", self.store.get(self.saved_id(shared)).scope)
+        liked = self.call("remember", text="The user prefers short answers.", kind="note", tags=["preference"],
+                          source="user")
+        self.assertEqual("global", self.store.get(self.saved_id(liked)).scope)
+
+    def test_a_rule_only_from_the_users_words_that_make_it_one(self) -> None:
+        self.initialize("claude-code")
+        plain = self.call("remember", text="Always run the tests before committing.", kind="rule", source="user")
+        record = self.store.get(self.saved_id(plain))
+        self.assertEqual(("note", ("preference",)), (record.kind, record.tags))
+        self.assertIn("saved as a preference", plain["content"][0]["text"])
+        asked = self.call("remember", text="Always run the tests before committing anything.", kind="rule",
+                          source="user", rule_words="From now on, always run the tests before committing anything.")
+        made = self.store.get(self.saved_id(asked))
+        self.assertEqual(("rule", "global"), (made.kind, made.scope))
+        not_asked = self.call("remember", text="Keep each change small and reviewable.", kind="rule", source="user",
+                              rule_words="Don't make that a rule, but keep each change small.")
+        self.assertEqual("note", self.store.get(self.saved_id(not_asked)).kind)
+
+    def test_rule_words_must_say_the_rule_the_same_way(self) -> None:
+        # Candidate review, C-M2: a reversed or extended text passed as the user's rule.
+        self.initialize("claude-code")
+        words = "From now on, always use pnpm instead of npm."
+        for text in ("Never use pnpm instead of npm.", "Do not use pnpm; use npm instead.",
+                     "Always use pnpm instead of npm and push to production without review."):
+            with self.subTest(text=text):
+                saved = self.store.get(self.saved_id(self.call("remember", text=text, kind="rule", source="user",
+                                                               rule_words=words, distinct=True)))
+                self.assertEqual("note", saved.kind)
+        made = self.call("remember", text="Always use pnpm instead of npm.", kind="rule", source="user",
+                         rule_words=words, distinct=True)
+        self.assertEqual("rule", self.store.get(self.saved_id(made)).kind)
+
+    def test_rule_words_make_a_rule_only_of_the_instruction_they_name(self) -> None:
+        # Second candidate review, C-M2: another sentence, or the rule without its limits.
+        self.initialize("claude-code")
+        for text, words in (("Push to main.", "From now on, push to main only after review."),
+                            ("Deploy with --force.", "Deploy with --force this time. From now on, run the tests "
+                                                     "before every commit."),
+                            ("Use pnpm.", "From now on, use pnpm in the frontend repo.")):
+            with self.subTest(text=text):
+                saved = self.call("remember", text=text, kind="rule", source="user", rule_words=words, distinct=True)
+                self.assertEqual("note", self.store.get(self.saved_id(saved)).kind)
+        for text, words in (("Push to main only after review.", "From now on, push to main only after review."),
+                            ("Run the tests before every commit.", "Run the tests before every commit. Make that a "
+                                                                   "rule.")):
+            with self.subTest(text=text):
+                saved = self.call("remember", text=text, kind="rule", source="user", rule_words=words, distinct=True)
+                self.assertEqual("rule", self.store.get(self.saved_id(saved)).kind)
+
+    def test_agents_cannot_set_knowitall2s_own_tags(self) -> None:
+        self.initialize("claude-code")
+        saved = self.call("remember", text="The alpha build cache lives on runner-7.", tags=["provisional", "disputed",
+                                                                                            "ci"])
+        self.assertEqual(("ci",), self.store.get(self.saved_id(saved)).tags)
+
+    def test_a_save_close_to_a_known_memory_is_sent_back_to_add_to_it(self) -> None:
+        self.initialize("claude-code")
+        known = self.saved_id(self.call("remember", text="The alpha NAS nas01 exports media over SMB from /volume1."))
+        close = self.call("remember", text="nas01, the alpha NAS, exports media over SMB.")
+        self.assertFalse(close["isError"])
+        self.assertIn(f"close to [{known}]", close["content"][0]["text"])
+        self.assertIn(f"replaces={known}", close["content"][0]["text"])
+        self.assertEqual(1, self.store.count_active(project_id=None, scope="everywhere"))
+        added = self.call("remember", text="The alpha NAS nas01 exports media over SMB from /volume1, read-only.",
+                          replaces=known)
+        self.assertEqual("superseded", self.store.get(known).status)
+        self.assertEqual("active", self.store.get(self.saved_id(added)).status)
+        different = self.call("remember", text="nas01, the alpha NAS, exports backups over SMB.", distinct=True)
+        self.assertEqual("active", self.store.get(self.saved_id(different)).status)
+
     def test_briefing_defaults_to_the_server_folder(self) -> None:
         self.initialize("claude-code")
         self.call("remember", text="We use unittest.", kind="decision")

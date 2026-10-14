@@ -15,6 +15,8 @@ from typing import Any, Iterator, Sequence
 from .identity import ProjectIdentity
 
 SCHEMA_VERSION = 3
+# The tag of a memory a question is checking (``memory.DISPUTED_TAG``); closing the question takes it off.
+DISPUTED = "disputed"
 
 # Statements that bring an existing database up to each schema version. A new
 # database gets the current schema directly from _SCHEMA.
@@ -906,6 +908,37 @@ class Store:
         ).fetchall()
         return [RecordRow.from_row(row) for row in rows]
 
+    def tagged_active(self, tag: str, *, session: str | None = None, limit: int = 1000) -> list[RecordRow]:
+        """Active memories carrying ``tag``, oldest first; only those learned from ``session`` when it is given."""
+
+        pattern = '%"' + tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + '"%'
+        where, parameters = "r.tags LIKE ? ESCAPE '\\'", [pattern]
+        if session is not None:
+            where, parameters = where + " AND r.source_session = ?", [*parameters, session]
+        rows = self._connection.execute(
+            f"SELECT {_COLUMNS} {_FROM} WHERE r.status = 'active' AND {where} ORDER BY r.seq LIMIT ?",
+            (*parameters, limit),
+        ).fetchall()
+        return [RecordRow.from_row(row) for row in rows]
+
+    def with_facet(self, facet: str) -> list[RecordRow]:
+        """Active memories the catalog filed under ``facet``."""
+
+        rows = self._connection.execute(
+            f"SELECT {_COLUMNS} {_FROM} JOIN record_notes n ON n.record_id = r.id "
+            "WHERE r.status = 'active' AND n.facet = ? ORDER BY r.seq", (facet,),
+        ).fetchall()
+        return [RecordRow.from_row(row) for row in rows]
+
+    def from_session(self, session: str, *, limit: int) -> list[RecordRow]:
+        """The newest active memories learned from ``session``."""
+
+        rows = self._connection.execute(
+            f"SELECT {_COLUMNS} {_FROM} WHERE r.status = 'active' AND r.source_session = ? ORDER BY r.seq DESC "
+            "LIMIT ?", (session, limit),
+        ).fetchall()
+        return [RecordRow.from_row(row) for row in rows]
+
     def list_active(
         self,
         *,
@@ -993,7 +1026,16 @@ class Store:
             "UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'",
             (answer, now, question_id),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return False
+        # "disputed" (``memory.DISPUTED_TAG``) means a question is checking the memory: no question, no dispute.
+        row = self._connection.execute("SELECT record_ids FROM questions WHERE id = ?", (question_id,)).fetchone()
+        still_open = {record_id for question in self.open_questions(limit=1000) for record_id in question["record_ids"]}
+        for record_id in json.loads(row["record_ids"] or "[]") if row else []:
+            record = self.get(record_id)
+            if record is not None and DISPUTED in record.tags and record_id not in still_open:
+                self.set_tags(record_id, [tag for tag in record.tags if tag != DISPUTED], now=now)
+        return True
 
     def answered_questions(self, *, limit: int) -> list[dict[str, Any]]:
         rows = self._connection.execute(
@@ -1419,6 +1461,20 @@ class Store:
             "SELECT MAX(reviewed_at) FROM reviews WHERE outcome = 'reviewed' "
             "AND (scope_key = 'global' OR scope_key LIKE 'project:%')"
         ).fetchone()[0]
+
+    def reviewed(self, fingerprints: Sequence[str]) -> dict[str, str]:
+        """When each of ``fingerprints`` was last reviewed successfully, for those that were."""
+
+        found: dict[str, str] = {}
+        keys = list(dict.fromkeys(fingerprints))
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            rows = self._connection.execute(
+                f"SELECT fingerprint, reviewed_at FROM reviews WHERE outcome = 'reviewed' AND fingerprint IN "
+                f"({', '.join('?' for _ in chunk)})", chunk,
+            ).fetchall()
+            found.update((row["fingerprint"], row["reviewed_at"]) for row in rows)
+        return found
 
     def record_review(self, fingerprint: str, *, scope_key: str, outcome: str, now: str) -> None:
         """Remember a group's review; a failure counts toward giving up on that exact group."""

@@ -204,6 +204,19 @@ class MemoryTests(unittest.TestCase):
             self.remember("Always deploy on Fridays.", kind="rule")
         self.assertEqual("saved", self.remember("Never deploy on Fridays.", kind="rule", source="user").status)
 
+    def test_what_the_user_decided_for_a_project_is_project_information_not_their_choice(self) -> None:
+        from knowitall2.memory import in_users_words, is_users_choice
+
+        decided = self.remember("The connector must sync every switch change back into UniFi.", kind="decision",
+                                source="user").record
+        liked = self.remember("The user prefers short answers.", kind="note", tags=["preference"], source="user").record
+        rule = self.remember("Never store secrets in memories.", kind="rule", source="user").record
+        self.assertEqual([False, True, True], [is_users_choice(record) for record in (decided, liked, rule)])
+        # Still trusted: an agent does not retire it unasked.
+        self.assertTrue(in_users_words(decided))
+        self.assertIn("asks the user", self.memory.forget(decided.id, reason="looks outdated"))
+        self.assertEqual("active", self.store.get(decided.id).status)
+
     def test_project_memories_stay_in_their_project_unless_asked(self) -> None:
         decision = self.remember("We chose SQLite for storage.", kind="decision")
         self.assertEqual("project", decision.record.scope)

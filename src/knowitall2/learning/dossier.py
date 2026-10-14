@@ -51,6 +51,8 @@ class Dossier:
     tool_outputs: list[str] = field(default_factory=list)
     # The tool outputs that show what a command printed (see ``_trusted_output``); only these make a memory observed.
     trusted_outputs: list[str] = field(default_factory=list)
+    # The same calls as (command, output): a memory whose details a command printed is observed (``learner.validate``).
+    trusted_calls: list[tuple[str, str]] = field(default_factory=list)
     body_start: int = 0
     end_offset: int = 0  # log offset just past this dossier's last event, for resuming
     known: list = field(default_factory=list)  # related existing memories shown to the model
@@ -103,6 +105,7 @@ def build_dossiers(
             current.tool_outputs.append(output)
             if _trusted_output(event, session.cwd):
                 current.trusted_outputs.append(output)
+                current.trusted_calls.append((redact(event.text or ""), output))
         if event.kind == "tool":
             current.tool_inputs += [part for part in (event.text, event.cwd) if part]
     if current.text != header:

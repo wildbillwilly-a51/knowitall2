@@ -74,7 +74,7 @@ class CatalogTestCase(unittest.TestCase):
 
 class FilingTests(CatalogTestCase):
     def test_memories_are_filed_under_systems_with_plain_headlines(self) -> None:
-        address = self.save("vCenter vc01 is at 10.9.15.16 and manages two ESXi hosts.", source="observed")
+        address = self.save("vCenter vc01 is at 10.20.30.16 and manages two ESXi hosts.", source="observed")
         route = self.save("Use govc through jump01 for read-only vCenter inventory.")
         vault = self.save("Vaultwarden at https://vault.example.test holds homelab sign-ins.", source="user")
         stray = self.save("The office printer is on the second floor.")
@@ -99,7 +99,7 @@ class FilingTests(CatalogTestCase):
                       else engine.inputs[1][1])
 
     def test_systems_get_a_summary_and_gaps_once_until_their_memories_change(self) -> None:
-        address = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        address = self.save("vCenter vc01 is at 10.20.30.16.", source="observed")
         system_id = catalog.system_id_for("vCenter")
         engine = FakeEngine(
             file=[{"notes": [note(address, "Where vCenter is", name="vCenter", kind="service", facet="where")]}],
@@ -114,7 +114,7 @@ class FilingTests(CatalogTestCase):
         self.assertEqual(0, self.run_catalog(FakeEngine()).calls)
 
     def test_what_changed_while_the_model_filed_memories_is_kept(self) -> None:
-        told = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        told = self.save("vCenter vc01 is at 10.20.30.16.", source="observed")
         forgotten = self.save("The old NAS is nas00 in the basement.")
         plain = self.save("The office printer is on the second floor.")
         system_id = catalog.system_id_for("vCenter")
@@ -150,7 +150,7 @@ class FilingTests(CatalogTestCase):
 
     def test_a_memory_left_out_of_answers_is_filed_as_general_only_after_a_few_runs(self) -> None:
         # Review 2026-10-04, U-M1: one empty or short answer filed the whole batch as general, for good.
-        filed = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        filed = self.save("vCenter vc01 is at 10.20.30.16.", source="observed")
         left = self.save("The office printer is on the second floor.")
         engine = FakeEngine(file=[{"notes": [note(filed, "Where vCenter is", name="vCenter", kind="service",
                                                   facet="where")]}])
@@ -165,7 +165,7 @@ class FilingTests(CatalogTestCase):
         self.assertEqual(0, self.store.count_unnoted())
 
     def test_a_new_system_left_out_of_an_answer_is_described_later(self) -> None:
-        address = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        address = self.save("vCenter vc01 is at 10.20.30.16.", source="observed")
         system_id = catalog.system_id_for("vCenter")
         self.run_catalog(FakeEngine(
             file=[{"notes": [note(address, "Where vCenter is", name="vCenter", kind="service", facet="where")]}],
@@ -205,7 +205,7 @@ class FilingTests(CatalogTestCase):
         self.assertEqual("A host", self.store.notes_for([others[-1].id])[others[-1].id]["headline"])
 
     def test_calls_count_toward_the_daily_budget(self) -> None:
-        self.save("vCenter vc01 is at 10.9.15.16.")
+        self.save("vCenter vc01 is at 10.20.30.16.")
         state = LearnerState(self.root / "state.json")
         cataloguer.run_catalog(memory=self.memory, engine=FakeEngine(file=[{"notes": []}]), budget=5, state=state)
         self.assertEqual(1, LearnerState(self.root / "state.json").calls_since(datetime(2026, 1, 1, tzinfo=timezone.utc)))
@@ -221,7 +221,7 @@ class ProfileTests(CatalogTestCase):
         return self.store.system(system_id)
 
     def test_a_profile_shows_what_is_known_missing_and_last_seen_working(self) -> None:
-        self.file(self.save("vCenter is at 10.9.15.16.", source="observed"), "where")
+        self.file(self.save("vCenter is at 10.20.30.16.", source="observed"), "where")
         system = self.file(self.save("Agents use govc through jump01.", source="observed"), "access")
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
         shown = catalog.profile(self.store, system, now=now)
@@ -237,7 +237,7 @@ class ProfileTests(CatalogTestCase):
                                                                          area["systems"][0]["memories"]))
 
     def test_a_profile_changed_while_the_model_skipped_its_system_is_kept(self) -> None:
-        system = self.file(self.save("vCenter is at 10.9.15.16.", source="observed"), "where")
+        system = self.file(self.save("vCenter is at 10.20.30.16.", source="observed"), "where")
         self.store.set_system_profile(system["id"], summary="Runs the lab's virtual machines.",
                                       gaps=["Its license key", "How to renew its certificate"], profiled="old",
                                       now=self.clock())
@@ -261,7 +261,7 @@ class ProfileTests(CatalogTestCase):
                           system="Dell iDRAC", kind="device")
         self.store.upsert_system(system_id=idrac["id"], name="Dell iDRAC", area="Servers and virtual machines",
                                  kind="device", aliases=["iDRAC", "Redfish"], now=self.clock())
-        addresses = self.save("Homelab iDRAC endpoints: vhost1-mgmt 10.9.15.19 (helper profile vhost1-mgmt).")
+        addresses = self.save("Homelab iDRAC endpoints: vhost1-mgmt 10.20.30.19 (helper profile vhost1-mgmt).")
         self.file(addresses, "where", system="Homelab", kind="project")
         unrelated = self.save("The homelab printer is on the second floor.")
         self.file(unrelated, "where", system="Homelab", kind="project")
@@ -281,7 +281,7 @@ class ProfileTests(CatalogTestCase):
         self.run_catalog(engine)
         [profile_input] = [text for step, text in engine.inputs if step == "profile"]
         self.assertIn("Memories filed under something else that name it (1):", profile_input)
-        self.assertIn("10.9.15.19", profile_input)
+        self.assertIn("10.20.30.19", profile_input)
         described = self.store.system(idrac["id"])
         self.assertNotEqual(before, described["profiled"])
         again = FakeEngine()
@@ -295,24 +295,24 @@ class ProfileTests(CatalogTestCase):
     def test_describing_a_system_corrects_its_aliases(self) -> None:
         # 2026-10-05: aliases could only be added, so "workstation" kept pointing every workstation to one computer.
         self.file(self.save("Saltbox is the media server.", source="observed"), "about", system="Saltbox", kind="server")
-        vm = self.file(self.save("LAB-WIN10VM is at 10.9.15.28.", source="observed"), "where", system="LAB-WIN10VM",
+        vm = self.file(self.save("LAB-WIN10VM is at 10.20.30.28.", source="observed"), "where", system="LAB-WIN10VM",
                        kind="server")
         self.store.upsert_system(system_id=vm["id"], name="LAB-WIN10VM", area=vm["area"], kind="server",
                                  aliases=["workstation", "lab-win10vm"], now=self.clock())
         engine = FakeEngine(profile=[{"systems": [{"id": vm["id"], "summary": "The Windows VM agents run on.", "gaps": [],
-                                                   "aliases": ["lab-win10vm", "10.9.15.28", "Saltbox", "LAB WIN10VM",
+                                                   "aliases": ["lab-win10vm", "10.20.30.28", "Saltbox", "LAB WIN10VM",
                                                                "homelab"]}]}])
         self.run_catalog(engine)
         [profile_input] = [text for step, text in engine.inputs if step == "profile" and vm["id"] in text]
         self.assertIn("Its aliases now: workstation, lab-win10vm", profile_input)
         # Replaced, not added to; another system's or a project's name, or its own in any spelling, is never an alias.
-        self.assertEqual(["10.9.15.28"], self.store.system(vm["id"])["aliases"])
+        self.assertEqual(["10.20.30.28"], self.store.system(vm["id"])["aliases"])
 
     def test_projects_have_no_readiness_and_the_user_can_fill_a_gap(self) -> None:
         system = self.file(self.save("Releases are cut from main.", kind="decision"), "decision", system="Homelab",
                            kind="project")
         self.assertEqual("Project", catalog.profile(self.store, system)["status"]["label"])
-        vcenter = self.file(self.save("vCenter is at 10.9.15.16."), "where")
+        vcenter = self.file(self.save("vCenter is at 10.20.30.16."), "where")
         result = catalog.tell(self.memory, vcenter, "signin", "The vCenter sign-in is in Vaultwarden item vcenter-admin.")
         self.assertEqual(("user_stated", ["vCenter"]), (result.record.verification, list(result.record.subjects)))
         self.assertEqual("signin", self.store.notes_for([result.record.id])[result.record.id]["facet"])
@@ -428,19 +428,21 @@ class QuestionFlowTests(CatalogTestCase):
                          [(self.store.get(record.id).status, self.store.get(record.id).kind) for record in possible])
         self.assertEqual((0, []), (self.store.count_open_questions(), review.for_user(self.store, now=self.now)))
 
-    def test_checks_nobody_can_do_reach_the_user_and_old_unreviewed_questions_too(self) -> None:
+    def test_checks_nobody_does_are_settled_by_the_evidence_and_old_unreviewed_questions_reach_the_user(self) -> None:
+        # 2026-10-13: of 20 checks handed to agents, none was done, and each went to the user in the end. What the
+        # evidence settles (observed against unverified) no longer waits for anyone.
         older, newer, question = self.conflict()
         self.run_catalog(FakeEngine(review=[self.decide(question, "unsure", certain=False)]))
         for _ in range(review.CHECK_OFFERS):
             self.memory.briefing(project_path=self.project)
         self.run_catalog(FakeEngine())
-        self.assertEqual("ask_user", review.stage(self.store, question["id"]))
-        self.assertIn("none could tell", " ".join(review.for_user(self.store, now=self.now)[0]["findings"]))
+        self.assertEqual("answered", self.store.question(question["id"])["status"])
+        self.assertEqual(("active", "retired"), (self.store.get(older.id).status, self.store.get(newer.id).status))
         stale = self.save("Backups run nightly at 02:00.")
         other = self.save("Backups run nightly at 04:00.")
         review.ask_conflict(self.memory, stale, other)
         later = datetime(2026, 10, 5, tzinfo=timezone.utc)
-        self.assertEqual(2, len(review.for_user(self.store, now=later)))
+        self.assertEqual(1, len(review.for_user(self.store, now=later)))
 
     def test_questions_are_reviewed_even_when_filing_always_has_work(self) -> None:
         # From 2026-09-28 to 10-08 every run spent its two calls filing and describing, and the review never ran.
@@ -496,7 +498,7 @@ class QuestionFlowTests(CatalogTestCase):
 
 class FindOutTests(CatalogTestCase):
     def test_an_agent_is_asked_to_find_something_out_while_looking_at_that_system(self) -> None:
-        address = self.save("vCenter vc01 is at 10.9.15.16.", source="observed")
+        address = self.save("vCenter vc01 is at 10.20.30.16.", source="observed")
         system_id = catalog.system_id_for("vCenter")
         self.store.upsert_system(system_id=system_id, name="vCenter", area="Servers and virtual machines",
                                  kind="service", aliases=[], now=self.clock())

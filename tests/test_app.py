@@ -351,7 +351,7 @@ class LearningScreenTests(AppTestCase):
         self.assertEqual((True, "claude-cli", "sonnet", 30), tuple(data["settings"][key] for key in (
             "enabled", "backend", "model", "max_calls_per_day")))
         for bad in ({"max_calls_per_run": 0}, {"backend": "other-engine"}, {"model": "bad model!"}, {"enabled": "yes"},
-                    {"idle_minutes": True}):
+                    {"settle_minutes": True}):
             with self.subTest(body=bad):
                 self.assertEqual(400, self.request("POST", "/api/learning/settings", body=bad)[0])
         self.assertEqual(200, self.request("POST", "/api/learning/settings", body={"enabled": False})[0])
@@ -473,7 +473,7 @@ class KnowledgeScreenTests(AppTestCase):
 
         store, memory = self.memory()
         try:
-            record = memory.remember("vCenter vc01 is at 10.9.15.16.", source="observed").record
+            record = memory.remember("vCenter vc01 is at 10.20.30.16.", source="observed").record
             system_id = catalog.system_id_for("vCenter")
             store.upsert_system(system_id=system_id, name="vCenter", area="Servers and virtual machines",
                                 kind="service", aliases=["vc01"], now="2026-09-28T12:00:00Z")

@@ -1356,8 +1356,8 @@ function learningSettings(data) {
         <input class="input" id="learning-run" type="number" min="1" max="50" value="${s.max_calls_per_run}">
         <label for="learning-day" title="Learning from your own work (a commit, a session's end, or when you ask) is never held back by this limit.">Most calls per day for background learning</label>
         <input class="input" id="learning-day" type="number" min="1" max="500" value="${s.max_calls_per_day}">
-        <label for="learning-idle">Wait after a session goes quiet (minutes)</label>
-        <input class="input" id="learning-idle" type="number" min="5" max="240" value="${s.idle_minutes}">
+        <label for="learning-idle" title="What KnowItAll2 learns during a chat counts as provisional until the chat has been quiet this long; then it reviews the whole stretch.">Wait after a session goes quiet, before the final pass (minutes)</label>
+        <input class="input" id="learning-idle" type="number" min="15" max="480" value="${s.settle_minutes}">
       </div>`, { show: 'Advanced settings', hide: 'Hide advanced settings' })}
     <p class="notice info mt-12" id="learning-consent" ${s.enabled ? raw('hidden') : ''}>Turning learning on is your OK for KnowItAll2 to send cleaned-up excerpts of your finished sessions to your own Claude Code or Codex account. Nothing is sent anywhere else.</p>
     <div class="btn-row mt-12"><button type="button" class="btn primary" id="learning-save">Save</button></div>`;
@@ -1384,7 +1384,7 @@ function bindLearningSettings(data) {
         method: 'POST',
         body: {
           enabled: enabled.checked, backend: backend.value, model: model.value.trim(),
-          max_calls_per_run: whole('learning-run'), max_calls_per_day: whole('learning-day'), idle_minutes: whole('learning-idle'),
+          max_calls_per_run: whole('learning-run'), max_calls_per_day: whole('learning-day'), settle_minutes: whole('learning-idle'),
         },
       });
       toast(result.message);

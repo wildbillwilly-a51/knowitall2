@@ -105,6 +105,23 @@ class CloudFolderTests(unittest.TestCase):
         self.assertTrue(describe_checks([check]).startswith("NOTE "), describe_checks([check]))
         self.assertIn("Move", check.fix)
 
+    def test_a_synced_folder_since_deleted_is_not_listed(self) -> None:
+        # Seen 2026-10-12: after Homelab was removed, doctor still listed it.
+        import shutil
+
+        from _support import make_repository
+        from knowitall2 import known
+
+        gone = make_repository(self.root / "Work Sync" / "old")
+        kept = make_repository(self.root / "Work Sync" / "lab")
+        for folder in (gone, kept):
+            known.worked_in(folder)
+        shutil.rmtree(gone)
+        [check] = doctor._cloud_folder_checks(home=self.home)
+        self.assertIn("lab", check.detail)
+        self.assertNotIn("old", check.detail.replace("folder", ""))
+        self.assertIn("writes no knowledge files there", check.detail)
+
     def test_no_note_when_no_project_is_in_a_synced_folder(self) -> None:
         from _support import make_repository
         from knowitall2 import known

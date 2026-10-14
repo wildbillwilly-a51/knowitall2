@@ -7,6 +7,7 @@ bad excerpt can never block the rest of its session, other logs, or learning.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import sqlite3
 from collections import Counter
@@ -17,10 +18,11 @@ from typing import Any, Callable
 
 from .. import journal, review
 from ..memory import (
-    KINDS, PREFERENCE_TAG, VERIFICATION_FOR_SOURCE, VERIFICATION_STRENGTH, Memory, MemoryInputError, _stem, _tokens,
-    is_users_choice, keywords, may_replace_unasked, significant_words,
+    KINDS, PREFERENCE_TAG, PROVISIONAL_TAG, VERIFICATION_FOR_SOURCE, VERIFICATION_STRENGTH, Memory, MemoryInputError,
+    _stem, _tokens, in_users_words, is_users_choice, keywords, may_replace_unasked, significant_words,
 )
 from ..quotes import _ELISION, letters, nearly_quoted_in as _nearly_quoted_in, quoted_in as _quoted_in
+from ..quotes import short_quote_in, too_short
 from ..secrets import contains_secret, redact
 from ..store import RecordRow, StoreError
 from .dossier import Dossier, build_dossiers, file_by_work
@@ -58,6 +60,9 @@ _LASTING = re.compile(r"\bfrom\s+now\s+on\b|\balways\b|\bnever\b", re.IGNORECASE
 # A log's entry while its set-aside part is caught up: read up to here, then go on from ``RESUME_AT``.
 LEARN_TO = "learn_to"
 RESUME_AT = "resume_at"
+# How far into a log the final pass has read; the quick pass's progress is ``offset``.
+SETTLED = "settled"
+SETTLED_PRINT = "settled:"
 # Background learning sets aside a session quiet for this long, so a backlog cannot grow forever (about 100 sessions
 # waited on 2026-10-11); ``learn --catch-up`` still takes it.
 SET_ASIDE_DAYS = 14
@@ -130,6 +135,44 @@ def _made_a_rule(evidence: str, user_texts: list[str]) -> bool:
             if 0 <= index < len(sentences) and _says_make_it_a_rule(text, sentences[index][:2], excluded):
                 return True
     return False
+
+
+def makes_a_rule(words: str | None, text: str) -> bool:
+    """Whether ``words``, the user's own as an agent passes them to ``remember``, plainly make ``text`` a standing
+    rule: "make that a rule", or "from now on" and an instruction, said of what ``text`` says. Anything else the
+    user says about how to work is a preference (the user, 2026-10-13)."""
+
+    said = " ".join(str(words or "").split())
+    if not said or not _made_a_rule(said, [said]):
+        return False
+    instruction = _rule_instruction(said)
+    # The text says the instruction the user made a rule, all of it and nothing more: not another sentence of the
+    # same message, and not the rule without its limits ("push to main" from "push to main only after review").
+    # And the same words that turn it around ("never", "not", "instead") and the same numbers (C-M2).
+    return (bool(instruction) and _in_the_users_words(text, instruction)
+            and _says_what_was_quoted(instruction, text, share=USER_STATEMENT_SHARE)
+            and _turns(text) == _turns(instruction))
+
+
+_RULE_MARKS = re.compile(r"\b(?:from\s+now\s+on|going\s+forward)\b[\s,;:-]*|"
+                         r"\b(?:make|add|save|keep)\s+(?:it|that|this|these|those|them)\s+(?:as\s+)?"
+                         r"(?:a|one\s+of\s+my|my)\s+(?:standing\s+|permanent\s+)?rules?\b", re.IGNORECASE)
+
+
+def _rule_instruction(said: str) -> str:
+    """The instruction the user's words make a rule: the sentence beginning "from now on" without those words, or
+    the sentence before "make that a rule" (or the rest of its own sentence)."""
+
+    sentences = [said[start:end].strip() for start, end in _sentence_spans(said)]
+    for index, sentence in enumerate(sentences):
+        if _FROM_NOW_ON.match(sentence):
+            return _RULE_MARKS.sub("", sentence, count=1).strip()
+        if _STANDING_RULE.search(sentence):
+            rest = _RULE_MARKS.sub("", sentence).strip(" .,;:-")
+            if len(letters(rest)) >= _INSTRUCTION_LETTERS:
+                return rest
+            return sentences[index - 1] if index else ""
+    return ""
 
 
 def _says_make_it_a_rule(text: str, span: tuple[int, int], excluded: list[tuple[int, int]]) -> bool:
@@ -262,16 +305,26 @@ def learn(
     now: datetime | None = None,
     run: str | None = None,
     right_away: bool = False,
+    quick: bool = False,
 ) -> LearnReport:
-    """Learn from each finished log; ``run`` labels the journal entries of this run.
+    """Learn from each log; ``run`` labels the journal entries of this run.
+
+    Learning happens twice (the user's choice, 2026-10-13). ``quick`` is the
+    quick pass, at a commit or when an agent or the user asks: it reads what
+    is new since the last pass, an excerpt at a time, and what it saves is
+    provisional. Otherwise it is the final pass (``settle``): once a chat has
+    been quiet for ``settle_minutes``, or right away at a session's end, it
+    reads the stretch since the last final pass with how it ended, decides
+    what the quick pass saved, and adds what it missed.
 
     ``right_away`` learns the given logs even while their sessions are still
-    active, for learning at the moment something happens (a commit, the end
-    of a session, the user asking). What it reads is not read again later.
+    active, for learning at the moment something happens.
     """
 
+    from .settle import PART_CHARACTERS, confirm_session, needed_calls, settle
+
     moment = now or datetime.now(timezone.utc)
-    idle_since = moment - timedelta(minutes=settings.idle_minutes)
+    settled_since = moment - timedelta(minutes=settings.settle_minutes)
     calls_today = state.limited_calls_since(day_ago(moment))
     origin = "work" if right_away else "learning"
     report = LearnReport(logs=len(logs))
@@ -294,10 +347,14 @@ def learn(
         set_aside_before = moment - timedelta(days=SET_ASIDE_DAYS)
         for log, status in found:
             entry = state.entry(log)
-            if status.st_size <= int(entry.get("offset", 0)):
+            if SETTLED not in entry:
+                # Learned before 0.11: what was read then was learned for good.
+                entry[SETTLED] = int(entry.get("offset", 0))
+            start = int(entry.get("offset", 0)) if quick else int(entry[SETTLED])
+            if status.st_size <= start:
                 continue
             active_at = datetime.fromtimestamp(status.st_mtime, tz=timezone.utc)
-            if not right_away and active_at > idle_since:
+            if not right_away and active_at > settled_since:
                 report.active += 1
                 continue
             if (not right_away and active_at < set_aside_before and not entry.get("caught_up_at")
@@ -308,26 +365,96 @@ def learn(
                 # Counted, not read: reading every waiting log took minutes at each run once the calls ran out.
                 report.deferred += 1
                 continue
-            start = int(entry.get("offset", 0))
             # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
             session, end = read_session(log, start=start, stop=int(entry.get(LEARN_TO) or 0) or None)
-            dossiers = build_dossiers(session, require_user=start == 0)
+            dossiers = build_dossiers(session, require_user=start == 0,
+                                      **({} if quick else {"budget": PART_CHARACTERS}))
             if memory is not None:
                 # What was learned belongs to the project the work was in, not always the chat's folder.
                 file_by_work(dossiers, known=memory.store.all_project_paths(), resolve=memory.stored_project,
                              started=session.started_at, ended=session.ended_at)
-            duplicates = [item for item in dossiers if state.seen(item.fingerprint) or item.fingerprint in run_seen]
-            run_seen.update(item.fingerprint for item in dossiers)
+            left = settings.max_calls_per_day - calls_today - report.calls
+            partial = not quick and needed_calls(dossiers) > left >= 2
+            if partial:
+                # More than the calls left today: settled a slice at a time, sized to what is left, each told how
+                # the stretch ended, rather than waiting for a day with no background call at all, which an active
+                # user never has (candidate reviews, C-L2, D-M2, D-M6).
+                dossiers = dossiers[:left - 1]
+                end = dossiers[-1].end_offset
+            # What the final pass settled is told apart from what the quick pass read: the same text, read again.
+            prints = [item.fingerprint if quick else SETTLED_PRINT + item.fingerprint for item in dossiers]
+            duplicates = [item for item, mark in zip(dossiers, prints) if state.seen(mark) or mark in run_seen]
+            if not quick and len(duplicates) < len(dossiers):
+                duplicates = []   # a stretch is settled whole: only an identical copy of all of it is skipped
+            run_seen.update(prints)
             report.ready.append(ReadySession(
                 session.session_id, log, len(dossiers), sum(len(item.text) for item in dossiers), len(duplicates),
             ))
             if dry_run:
                 continue
             if not dossiers:
-                _finish(entry, session.session_id, end, moment)
+                if not quick and memory is not None:
+                    confirm_session(memory, session.session_id)
+                _finish(entry, session.session_id, end, moment, settled=not quick)
                 continue
             if extractor is None:
                 raise ExtractionError("no extractor is configured")
+            assert memory is not None
+            if not quick and duplicates:
+                # The same stretch was settled already, from another copy of the log.
+                report.outcomes["duplicate dossier"] += len(dossiers)
+                confirm_session(memory, session.session_id)
+                _finish(entry, session.session_id, end, moment, settled=True)
+                continue
+            if not quick:
+                if settings.max_calls_per_day - calls_today - report.calls < needed_calls(dossiers):
+                    # A stretch is settled whole or not at all; it waits for the calls it needs.
+                    report.deferred += 1
+                    continue
+                made: list[int] = []
+
+                def counted() -> None:
+                    made.append(1)
+                    state.record_call(at=moment, session=session.session_id, outcome="ok", origin=origin)
+
+                try:
+                    settled = settle(memory, extractor, dossiers, session=session, run=run, on_call=counted,
+                                     partial=partial)
+                except ExtractionError as exc:
+                    report.calls += len(made)
+                    if exc.blocking:
+                        # The backend itself is unusable: blame no session, stop the run.
+                        report.blocked = str(exc)
+                        break
+                    journal.problem("learning", f"a final pass failed for session {session.session_id}: {exc}")
+                    report.calls += 1
+                    state.record_call(at=moment, session=session.session_id, outcome="failed", origin=origin)
+                    entry["failures"] = int(entry.get("failures", 0)) + 1
+                    entry["last_error"] = str(exc)[:300]
+                    entry["updated_at"] = moment.isoformat()
+                    if entry["failures"] >= MAX_FAILURES:
+                        # Give up on this stretch: what the quick pass saved stands.
+                        confirm_session(memory, session.session_id)
+                        _finish(entry, session.session_id, end, moment, settled=True)
+                        entry["status"] = "skipped"
+                        report.skipped.append(session.session_id)
+                    else:
+                        entry["status"] = "failed"
+                        report.failed.append(session.session_id)
+                    continue
+                except (sqlite3.Error, StoreError, OSError) as exc:
+                    report.calls += len(made)
+                    report.blocked = f"the memory store failed: {exc}"
+                    journal.problem("learning", f"learning stopped because the memory store failed: {exc}")
+                    break
+                report.calls += settled.calls
+                report.usage.update(settled.usage)
+                report.outcomes.update(settled.outcomes)
+                report.results.extend(settled.results)
+                for mark in prints:
+                    state.mark_seen(mark)
+                _finish(entry, session.session_id, end, moment, settled=True)
+                continue
             budget = remaining()
             progress: int | None = None
             completed = True
@@ -341,7 +468,6 @@ def learn(
                     if budget <= 0:
                         completed = False
                         break
-                    assert memory is not None
                     current = dossier
                     dossier.known = known_context(memory, dossier)
                     try:
@@ -352,7 +478,7 @@ def learn(
                     report.calls += 1
                     state.record_call(at=moment, session=session.session_id, outcome="ok", origin=origin)
                     for candidate in candidates:
-                        outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
+                        outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run, provisional=True)
                         report.outcomes[outcome] += 1
                         report.results.append({"outcome": outcome, "ids": record_ids,
                                                "text": result_text(outcome, candidate)})
@@ -416,18 +542,30 @@ def result_text(outcome: str, candidate: dict[str, Any]) -> str | None:
     return None if outcome == "rejected (secret)" else redact(str(candidate.get("text") or ""))
 
 
-def known_context(memory: Memory, dossier: Dossier) -> list[RecordRow]:
-    """The existing memories the model sees: this project's, plus global ones about the same things."""
+# What the chat itself already taught, shown first: most repeats were a chat learning again, at a later commit or
+# at its end, what an earlier pass of the same chat had saved (55 to 81% of them, 2026-10-13).
+KNOWN_OWN = 20
+
+
+def known_context(memory: Memory, dossier: Dossier, *, exclude: set[str] | frozenset[str] = frozenset()
+                  ) -> list[RecordRow]:
+    """The existing memories the model sees: what this chat already taught, this project's, plus global ones about
+    the same things. ``exclude`` leaves out memories shown another way (the final pass's provisional ones)."""
 
     known: list[RecordRow] = []
+    if dossier.session_id:
+        known.extend(row for row in memory.store.from_session(dossier.session_id, limit=KNOWN_OWN)
+                     if row.id not in exclude)
+    seen = {record.id for record in known} | set(exclude)
     if dossier.project is not None:
-        known.extend(memory.store.list_active(
-            project_id=dossier.project.id, scope="project", limit=KNOWN_PROJECT_RECENT,
-        ))
+        for row in memory.store.list_active(project_id=dossier.project.id, scope="project",
+                                            limit=KNOWN_PROJECT_RECENT):
+            if row.id not in seen:
+                known.append(row)
+                seen.add(row.id)
     terms = keywords(dossier.text[dossier.body_start:], limit=KNOWN_KEYWORDS)
     if not terms:
         return known
-    seen = {record.id for record in known}
     match = " OR ".join(f'"{term}"' for term in terms)
     # The project's older memories too, when they are about the same things, so they are not learned again.
     project_id = dossier.project.id if dossier.project is not None else None
@@ -461,13 +599,52 @@ def publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, run:
     return publish_with_ids(memory, candidate, dossier, run=run)[0]
 
 
-def publish_with_ids(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *,
-                     run: str | None = None) -> tuple[str, list[str]]:
-    """``publish``, also returning the ids of the memories it saved or touched."""
+def publish_with_ids(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, run: str | None = None,
+                     provisional: bool = False, merge: bool = False) -> tuple[str, list[str]]:
+    """``publish``, also returning the ids of the memories it saved or touched.
 
-    outcome, record_ids = _publish(memory, candidate, dossier)
+    ``provisional`` is the quick pass. What it saves is labelled provisional, and it never replaces or questions a
+    known memory (the final pass decides that, knowing how the chat ended). ``merge`` is the final pass's merge of a
+    candidate into a known memory (``relation`` "updates"): when the merged text keeps everything the known memory
+    says, it takes its place and its better verification, instead of becoming a copy and a question.
+    """
+
+    dossier = filed_where_named(memory, candidate, dossier)
+    outcome, record_ids = _publish(memory, candidate, dossier, provisional=provisional, merge=merge)
     _record_candidate(memory, candidate, dossier, outcome, record_ids, run)
     return outcome, record_ids
+
+
+def filed_where_named(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> Dossier:
+    """The dossier to file ``candidate`` with: under the project the model named, when it is a known project other
+    than the chat's that this part of the chat worked in. Knowledge belongs to the project whose work it is, and a
+    chat in one folder often works on another project (a third of misfiled memories, 2026-10-13).
+
+    Only a project the chat worked in (its tool calls used that project's folder) or whose folder the chat names:
+    never on the model's word alone, which text in the chat can steer, and never for a project's own documents,
+    whose lessons stay with that project. A name two projects share files nothing elsewhere.
+    """
+
+    from ..chats import projects_worked_in
+
+    name = " ".join(str(candidate.get("project") or "").split()).casefold()
+    if not name or candidate.get("scope") != "project" or dossier.from_documents:
+        return dossier
+    if dossier.project is not None and name in (dossier.project.name.casefold(), dossier.project.id.casefold()):
+        return dossier
+    named = [item for item in memory.store.project_list()
+             if name in (str(item.get("name") or "").casefold(), str(item.get("id") or "").casefold())]
+    if len(named) != 1:
+        return dossier
+    known = list(memory.store.all_project_paths())
+    worked = projects_worked_in(dossier.tool_inputs, known)
+    folders = [folder for project_id, _name, folder in known if project_id == named[0]["id"]]
+    body = dossier.text[dossier.body_start:].casefold().replace("\\", "/")
+    if not worked.get(named[0]["id"]) and not any(
+            folder and folder.casefold().replace("\\", "/") in body for folder in folders):
+        return dossier
+    project = memory.stored_project(named[0]["id"])
+    return dataclasses.replace(dossier, project=project, worked_elsewhere=True) if project is not None else dossier
 
 
 def _record_candidate(
@@ -498,10 +675,13 @@ def _record_candidate(
     )
 
 
-def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tuple[str, list[str]]:
+def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, provisional: bool = False,
+             merge: bool = False) -> tuple[str, list[str]]:
     checked, reason = validate(candidate, dossier)
     if checked is None:
         return f"rejected ({reason})", []
+    if provisional:
+        return _save_provisional(memory, checked, dossier)
     older = None
     if PREFERENCE_TAG in checked["tags"] and checked["relation"] not in ("updates", "contradicts"):
         # What the model says the user changed is never counted as said again.
@@ -515,7 +695,26 @@ def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tup
         return "already known", []   # it repeats something that is not one of the user's preferences
     if older is None:
         older = _changed_memory(memory, checked, dossier)
+    if (merge and checked["source"] == "observed" and not _observed(checked["text"], "", dossier)
+            and _added_words(checked["text"], [str(candidate.get("own_text") or ""), older.text if older else ""])
+            > MERGE_ADDED_WORDS):
+        # A merged text is the model's: the candidate's quote vouches for the candidate, not for claims the merge
+        # added (second candidate review, C-H5).
+        checked["source"] = "inferred"
     verification = VERIFICATION_FOR_SOURCE[checked["source"]]
+    if merge and older is not None and not may_replace_unasked(
+            older, kind=checked["kind"], text=checked["text"], verification=verification):
+        merged = _merge(memory, checked, dossier, older, verification)
+        if merged is not None:
+            return merged
+        from .maintenance import keeps_everything
+
+        if not in_users_words(older) and keeps_everything([older.text], checked["text"]):
+            # It only adds to the known memory, without the evidence to take its place: both stand, and what stands
+            # beside it is the candidate's own text, not the merge written to replace the known one (D-L8).
+            older = None
+            checked["text"] = " ".join(str(candidate.get("own_text") or checked["text"]).split())
+        # Otherwise it changes what a better-supported memory, or the user's own words, say: kept, and asked.
     earlier = older is not None and _said_before(memory, checked, older)
     if earlier and VERIFICATION_STRENGTH[older.verification] >= VERIFICATION_STRENGTH[verification]:
         return "already known", [older.id]   # older words: what is known now was said since, and newer words win
@@ -549,11 +748,95 @@ def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier) -> tup
     return ("updated" if replaces else "saved"), ids
 
 
-def _preference_repeated(memory: Memory, checked: dict[str, Any], dossier: Dossier) -> tuple[RecordRow | None, bool]:
+# A merge may word things its own way, a word or so beyond what the two memories said; more is a claim of its own.
+MERGE_ADDED_WORDS = 1
+
+
+def _added_words(text: str, sources: list[str]) -> int:
+    """How many significant words of ``text``, endings aside, none of ``sources`` has."""
+
+    known = {_stem(word) for source in sources for word in significant_words(source)}
+    return sum(1 for word in {_stem(word) for word in significant_words(text)}
+               if not any(_same_word(word, other) for other in known))
+
+
+def _save_provisional(memory: Memory, checked: dict[str, Any], dossier: Dossier) -> tuple[str, list[str]]:
+    """The quick pass's save: a new memory labelled provisional, beside whatever is known. It never replaces,
+    questions, or counts against a known memory, nor marks one provisional: the final pass decides all that,
+    knowing how the chat ended (candidate review, C-H1 and C-H2)."""
+
+    if checked["relation"] == "repeats" and PREFERENCE_TAG not in checked["tags"]:
+        return "already known", []
+    if PREFERENCE_TAG in checked["tags"] and checked["source"] == "user":
+        # The user's own words, said again in another chat, word for word or nearly: counted on the user's own
+        # preference that holds them, as before 0.11 (second candidate review, D-M4). Counting changes nothing the
+        # chat could take back; anything that would replace or ask is left to the final pass.
+        known, same = _preference_repeated(memory, checked, dossier)
+        if known is not None and same and known.verification == "user_stated" and known.kind != "rule":
+            return _said_again(memory, checked, dossier, known)
+    try:
+        with memory.store.transaction():
+            result = memory.remember(
+                checked["text"], kind=checked["kind"], subjects=checked["subjects"], tags=checked["tags"],
+                scope=checked["scope"], source=checked["source"], project_path=dossier.cwd,
+                project=dossier.project if dossier.worked_elsewhere else None, session=dossier.session_id,
+                touch_existing=False,   # never raises or tags what is known (D-L2)
+            )
+            if result.status != "saved":
+                return "already known", [result.record.id]
+            memory.store.set_tags(result.record.id, [*result.record.tags, PROVISIONAL_TAG], now=memory.now())
+    except MemoryInputError:
+        return "rejected (not accepted by memory)", []
+    return "saved", [result.record.id]
+
+
+def _merge(memory: Memory, checked: dict[str, Any], dossier: Dossier, older: RecordRow,
+           verification: str) -> tuple[str, list[str]] | None:
+    """A merge into ``older`` that weaker evidence would not be let replace: it takes its place when it keeps
+    everything ``older`` says and a command's output shows the merged text's details, and then is observed like
+    ``older``. Never over what the user stated (the model's added words would pass for theirs), nor a rule or a
+    note. None when it may not."""
+
+    from .maintenance import keeps_everything
+
+    if (older.verification == "user_stated" or in_users_words(older) or {older.kind, checked["kind"]} & {"rule", "note"}
+            or not keeps_everything([older.text], checked["text"])
+            or not _observed(checked["text"], "", dossier)):
+        return None
+    try:
+        result = memory.remember(
+            checked["text"], kind=checked["kind"], subjects=checked["subjects"], tags=checked["tags"],
+            scope=checked["scope"], source=checked["source"], project_path=dossier.cwd,
+            project=dossier.project if dossier.worked_elsewhere else None, session=dossier.session_id,
+        )
+    except MemoryInputError:
+        return "rejected (not accepted by memory)", []
+    if result.record.id == older.id:
+        return "already known", [older.id]
+    now = memory.now()
+    with memory.store.transaction():
+        if VERIFICATION_STRENGTH[older.verification] > VERIFICATION_STRENGTH[result.record.verification]:
+            memory.store.set_verification(result.record.id, older.verification, now=now)
+        memory.store.supersede(older.id, result.record.id, now=now, reason=f"merged into [{result.record.id}]")
+    return "updated", [result.record.id, older.id]
+
+
+def preference_match(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, exclude: str) -> bool:
+    """Whether a preference ``candidate`` says again, or changes, one of the user's preferences or rules other
+    than ``exclude``: only then does the final pass have anything to count or replace."""
+
+    checked, _reason = validate(candidate, dossier)
+    if checked is None or PREFERENCE_TAG not in checked["tags"]:
+        return False
+    return _preference_repeated(memory, checked, dossier, exclude=exclude)[0] is not None
+
+
+def _preference_repeated(memory: Memory, checked: dict[str, Any], dossier: Dossier, *,
+                         exclude: str | None = None) -> tuple[RecordRow | None, bool]:
     """The user's preference or rule a candidate says again (with True), or changes in nearly the same words, with
     another number or a "not" (with False): the one the model named, or one the model was not shown."""
 
-    if checked["known_id"] in dossier.known_ids:
+    if checked["known_id"] in dossier.known_ids and checked["known_id"] != exclude:
         record = memory.store.get(checked["known_id"])
         if record is not None and record.status == "active" and _a_preference(record):
             compared = _compare(record.text, checked["text"])
@@ -566,7 +849,7 @@ def _preference_repeated(memory: Memory, checked: dict[str, Any], dossier: Dossi
     match = " OR ".join(f'"{term}"' for term in terms)
     changed = None
     for row, _rank in memory.store.search(match, project_id=project_id, scope="all", limit=20):
-        if not _a_preference(row):
+        if not _a_preference(row) or row.id == exclude:
             continue
         compared = _compare(row.text, checked["text"])
         if compared == "same":
@@ -745,13 +1028,14 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
         # A project's documents may be wrong or planted: what they teach reaches only that project's agents.
         scope = "project"
     body = dossier.text[dossier.body_start:]  # not the header KnowItAll2 wrote (the session's id and folder)
-    if not _quoted_in(evidence, [body]) and not _nearly_quoted_in(evidence, [body]):
+    if (not _quoted_in(evidence, [body]) and not _nearly_quoted_in(evidence, [body])
+            and not short_quote_in(evidence, [body])):
         # Every memory must rest on the session itself: not on the known-memory
         # list, and not on context an engine adds, such as the user's AGENTS.md.
         # A near quote (a few words re-typed) counts, but only an exact one below
         # makes a memory observed or the user's own words, or makes a rule; the
         # user's words must also say what the memory says.
-        return None, "evidence not in the session"
+        return None, "quote too short" if too_short(evidence) else "evidence not in the session"
     source = "inferred"
     tags: list[str] = []
     if kind in ("rule", "preference"):
@@ -769,19 +1053,94 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
             kind = "note"   # an instruction an agent wrote, not the user's
         if work_state and source != "user":
             return None, "work state"
-    elif _quoted_in(evidence, dossier.trusted_outputs):
-        # What a command printed is often raw data that the memory explains in its own words, so no shared words
-        # are needed. Documents, searches, MCP tools, and helper agents only say what someone wrote: unverified.
-        source = "observed"
     elif _quoted_in(evidence, dossier.user_texts) and _in_the_users_words(text, evidence):
-        source = "user"
+        source = "user"   # the user's own words stay theirs, whatever a command printed (candidate review, C-H3)
+    elif _observed(text, evidence, dossier):
+        source = "observed"
     relation = candidate.get("relation")
     relation = relation if relation in ("updates", "contradicts", "repeats") else "new"
     known_id = str(candidate.get("known_id") or "").strip().strip("[]")
     return {
         "text": text, "kind": kind, "scope": scope, "subjects": subjects, "source": source, "tags": tags,
-        "relation": relation, "known_id": known_id, "said_at": _when_said(evidence, dossier),
+        "relation": relation, "known_id": known_id, "said_at": _when_said(evidence, dossier), "evidence": evidence,
     }, None
+
+
+# A detail of a memory's (a host, address, path, port, version) shorter than this tells nothing apart.
+_DETAIL_CHARACTERS = 4
+# An output line that says a thing is not there, or failed, does not show it.
+_DENIES = re.compile(r"\b(?:no|not|none|failed|failure|refused|unreachable|denied|cannot|unable|timed out|"
+                     r"error|missing|unknown)\b|n't\b", re.IGNORECASE)
+
+
+def _observed(text: str, evidence: str, dossier: Dossier) -> bool:
+    """Whether what a command printed shows ``text``.
+
+    The quote is what a command printed; or, when the quote is from elsewhere (the agent's words about the
+    output), every checkable detail of the memory (an address, a host name, an absolute path, a version) is in
+    one command and what it printed, at least one in the output itself, on a line that does not say it is missing
+    or failed. Half the memories marked unverified in the 2026-10-13 replay were confirmed by an output the quote
+    was not taken from. Documents, searches, MCP tools, and helper agents only say what someone wrote, so they
+    never count.
+    """
+
+    if _quoted_in(evidence, dossier.trusted_outputs):
+        # What a command printed is often raw data that the memory explains in its own words, so no shared words
+        # are needed.
+        return True
+    details, anchored = _checkable_details(text)
+    if not anchored:
+        # File names and versions alone are printed by any listing or status: they show where a thing is named,
+        # not that the claim holds (the second replay of the built code, 2026-10-13: all five wrong labels).
+        return False
+    patterns = {detail: re.compile(r"(?<![\w.])" + re.escape(detail) + r"(?![\w]|\.\w)", re.IGNORECASE)
+                for detail in details}
+    for command, output in dossier.trusted_calls:
+        printed = [line for line in output.splitlines() if not _DENIES.search(line)]
+        shown = {detail for detail, pattern in patterns.items() if any(pattern.search(line) for line in printed)}
+        if shown and all(detail in shown or patterns[detail].search(command) for detail in details):
+            return True
+    return False
+
+
+# What a command's output can show word for word: an address (with a port or a network), a host name with a
+# dot, an absolute path, a version. Not words joined by slashes, possessives, placeholders, or approximations,
+# which no output prints as written (the 2026-10-13 replay of the built code).
+_CHECKABLE = (
+    re.compile(r"\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5}|/\d{1,2})?"),
+    re.compile(r"(?=[a-z0-9-]*[a-z])[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\.[a-z][a-z0-9-]+", re.IGNORECASE),
+    re.compile(r"(?:/|~/|[a-z]:[\\/])[\w.@%+-]+(?:[\\/][\w.@%+-]+)*", re.IGNORECASE),
+    re.compile(r"v?\d+\.\d+(?:\.\d+)+"),
+)
+
+
+# What ends a file name rather than a host name: "ssh.py" and "layout.tsx" are files, "nas01.lan" is a host.
+_FILE_ENDINGS = frozenset({
+    "py", "pyc", "ts", "tsx", "js", "jsx", "mjs", "cjs", "md", "txt", "rst", "ps1", "psm1", "psd1", "sh", "bash",
+    "bat", "cmd", "exe", "dll", "so", "json", "jsonl", "yml", "yaml", "toml", "ini", "cfg", "conf", "env", "lock",
+    "log", "html", "htm", "css", "scss", "go", "rs", "java", "kt", "cs", "c", "h", "cpp", "hpp", "rb", "php", "sql",
+    "db", "sqlite", "xml", "csv", "tsv", "zip", "gz", "tar", "tgz", "msi", "pem", "crt", "key", "pdf", "png", "jpg",
+    "svg", "ico", "vue", "svelte", "tf", "hcl", "service", "timer", "conf", "properties", "gradle", "csproj", "sln",
+})
+
+
+def _checkable_details(text: str) -> tuple[set[str], bool]:
+    """The details of ``text`` a command could print, and whether one of them names a place (an address, an
+    absolute path, a host): only those make the details worth checking."""
+
+    details, anchored = set(), False
+    for token in text.split():
+        bare = token.strip(".,;:!?()[]{}\"'`").casefold()
+        bare = re.sub(r"['’]s$", "", bare)
+        if len(bare) < _DETAIL_CHARACTERS:
+            continue
+        address, host, path, version = (pattern.fullmatch(bare) for pattern in _CHECKABLE)
+        # A host name of real labels: not "e.g" or "i.e".
+        host = host and all(len(label) >= 2 for label in bare.split("."))
+        if address or path or version or host:
+            details.add(bare)
+            anchored = anchored or bool(address or path or (host and bare.rsplit(".", 1)[-1] not in _FILE_ENDINGS))
+    return details, anchored
 
 
 def _says_what_was_quoted(text: str, quote: str, *, share: float = USER_WORDS_SHARE) -> bool:
@@ -892,16 +1251,23 @@ def _set_aside(entry: dict[str, Any], log: Path, moment: datetime) -> bool:
         return False
     if end <= int(entry.get("offset", 0)):
         return False
-    entry.update({"offset": end, "status": SKIPPED, SET_ASIDE_TO: end, "failures": 0, "updated_at": moment.isoformat()})
+    entry.update({"offset": end, SETTLED: end, "status": SKIPPED, SET_ASIDE_TO: end, "failures": 0,
+                  "updated_at": moment.isoformat()})
     return True
 
 
-def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime) -> None:
+def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime, *, settled: bool = False) -> None:
+    """Note that ``entry``'s log was read up to ``end``: by the quick pass, or (``settled``) by the final pass,
+    which also leaves the quick pass nothing before it to read."""
+
     bound = int(entry.get(LEARN_TO) or 0)
     if bound and end >= bound:
         # The set-aside part is caught up: carry on from where learning had already got to.
         end = max(end, int(entry.pop(RESUME_AT, 0) or 0))
         entry.pop(LEARN_TO, None)
+    if settled:
+        entry[SETTLED] = end
+        end = max(end, int(entry.get("offset", 0)))
     entry.update(
         {"session_id": session_id, "offset": end, "status": "done", "failures": 0, "last_error": None,
          "updated_at": moment.isoformat()}

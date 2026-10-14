@@ -110,7 +110,7 @@ class RenderTests(KnownTestCase):
         # 2026-10-05: the iDRAC addresses were filed under the homelab and missing from the iDRAC's file.
         helper = self.remember("The read-only iDRAC helper runs on the jump host as hermes.", scope="global")
         self.file(helper.id, "Dell iDRAC", aliases=["iDRAC", "Redfish"])
-        addresses = self.remember("Homelab iDRAC endpoints: vhost1-mgmt 10.9.15.19 (helper profile vhost1-mgmt).",
+        addresses = self.remember("Homelab iDRAC endpoints: vhost1-mgmt 10.20.30.19 (helper profile vhost1-mgmt).",
                                   scope="global")
         self.file(addresses.id, "Homelab", facet="where")
         path_only = self.remember("Homelab runbooks are in docs/idrac/ of the repository.", scope="global")
@@ -123,7 +123,7 @@ class RenderTests(KnownTestCase):
         own, listed = idrac.split(f"## {known.ELSEWHERE}\n")
         self.assertIn(helper.id, own)
         self.assertIn(f"[{addresses.id}] fact, saved", listed)
-        self.assertIn("filed in homelab.md: Homelab iDRAC endpoints: vhost1-mgmt 10.9.15.19", listed)
+        self.assertIn("filed in homelab.md: Homelab iDRAC endpoints: vhost1-mgmt 10.20.30.19", listed)
         self.assertNotIn(path_only.id, idrac)   # a folder in a path is not a mention
         # Filed in one file only; a name with no file of its own (Grafana) makes none.
         self.assertIn(addresses.id, files["homelab.md"])
@@ -769,6 +769,84 @@ class WorkedInTests(KnownTestCase):
         record = json.loads((self.root / "home" / known.WORKED_FILE).read_text(encoding="utf-8"))
         self.assertEqual(2, len(record["folders"]))
         self.assertTrue(record["seeded"])
+
+
+class HeldBackTests(KnownTestCase):
+    """Folders where knowledge files could travel further than this computer (the user, 2026-10-12): a folder a
+    cloud service keeps in sync, and a project that publishes an npm package or builds a Docker image."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.remember("Alpha deploys with make deploy.", scope="project")
+
+    def written(self) -> bool:
+        known.worked_in(self.project)
+        known.refresh(self.connection, force=True)
+        return (self.project / known.FOLDER / "alpha.md").is_file()
+
+    def test_a_folder_a_cloud_service_syncs_is_skipped_unless_the_user_allows_it(self) -> None:
+        with mock.patch.dict(os.environ, {"OneDrive": str(self.root)}):
+            self.assertFalse(self.written())
+            self.assertIn("cloud", json.dumps(known.read_status().get("held")))
+            (self.root / "home" / "config.json").write_text(json.dumps({known.SYNCED_SETTING: True}),
+                                                           encoding="utf-8")
+            self.assertTrue(self.written())
+
+    def test_an_npm_package_or_docker_image_that_would_carry_the_folder_is_skipped(self) -> None:
+        package = self.project / "package.json"
+        package.write_text(json.dumps({"name": "alpha", "version": "1.0.0"}), encoding="utf-8")
+        self.assertFalse(self.written())
+        self.assertIn(".npmignore", json.dumps(known.read_status().get("held")))
+        (self.project / ".npmignore").write_text(f"{known.FOLDER}/\n", encoding="utf-8")
+        self.assertTrue(self.written())
+        for shape in ({"name": "alpha", "private": True}, {"name": "alpha", "files": ["dist"]}):
+            with self.subTest(shape=shape):
+                (self.project / ".npmignore").unlink(missing_ok=True)
+                package.write_text(json.dumps(shape), encoding="utf-8")
+                self.assertTrue(self.written())
+        (self.project / "Dockerfile").write_text("FROM alpine\nCOPY . /app\n", encoding="utf-8")
+        self.assertFalse(self.written())
+        self.assertFalse((self.project / known.FOLDER).exists())   # what was written before is taken out
+        self.assertIn(".dockerignore", json.dumps(known.read_status().get("held")))
+        (self.project / ".dockerignore").write_text(f".git\n{known.FOLDER}\n", encoding="utf-8")
+        self.assertTrue(self.written())
+
+
+class HeldBackDetailTests(KnownTestCase):
+    def test_a_hold_follows_the_files_that_decide_it_without_a_memory_changing(self) -> None:
+        # Candidate review, C-L4: the line doctor suggests took effect only when some memory changed.
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        known.worked_in(self.project)
+        (self.project / "Dockerfile").write_text("FROM alpine\nCOPY . /app\n", encoding="utf-8")
+        known.refresh(self.connection)
+        self.assertFalse((self.project / known.FOLDER).exists())
+        (self.project / ".dockerignore").write_text(f"{known.FOLDER}/**\n", encoding="utf-8")
+        known.refresh(self.connection)
+        self.assertTrue((self.project / known.FOLDER / "alpha.md").is_file())
+
+    def test_a_build_stage_copy_does_not_hold_the_folder_back(self) -> None:
+        folder = self.root / "staged"
+        folder.mkdir()
+        (folder / "Dockerfile").write_text("FROM node AS build\nCOPY package.json /src/\nFROM alpine\n"
+                                           "COPY --from=build . /app\n", encoding="utf-8")
+        self.assertIsNone(known.held_back(folder, places=[], allow_synced=False))
+
+    def test_only_what_would_really_carry_the_folder_holds_it_back(self) -> None:
+        # Candidate review, C-L5.
+        cases = [
+            ({"package.json": json.dumps({"scripts": {"lint": "eslint ."}})}, False),   # tooling only
+            ({"package.json": json.dumps({"name": "a", "version": "1.0.0", "files": ["."]})}, True),
+            ({"Dockerfile": "FROM alpine\nCOPY app.py /app/\n"}, False),
+            ({"Dockerfile.prod": "FROM alpine\nCOPY --chown=app . /app\n"}, True),
+            ({"Dockerfile": "FROM alpine\nADD ./ /app\n", ".dockerignore": f"/{known.FOLDER}/*\n"}, False),
+        ]
+        for files, held in cases:
+            with self.subTest(files=sorted(files)):
+                folder = self.root / f"case{cases.index((files, held))}"
+                folder.mkdir()
+                for name, text in files.items():
+                    (folder / name).write_text(text, encoding="utf-8")
+                self.assertEqual(held, known.held_back(folder, places=[], allow_synced=False) is not None)
 
 
 class CleanupTests(KnownTestCase):

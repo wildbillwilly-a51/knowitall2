@@ -56,7 +56,7 @@ class ReplacingTests(FilesTestCase):
             while not stop.is_set():
                 minutes += 1
                 try:
-                    save_settings(LearnerSettings(enabled=True, idle_minutes=minutes))
+                    save_settings(LearnerSettings(enabled=True, settle_minutes=minutes))
                 except OSError as exc:
                     failures.append(exc)
 
@@ -152,10 +152,10 @@ class ByteOrderMarkTests(FilesTestCase):
         config.parent.mkdir(parents=True)
         config.write_bytes((BOM + json.dumps({"theme": "dark", "learning": {"enabled": True}})).encode("utf-8"))
         self.assertTrue(load_settings().enabled)
-        save_settings(LearnerSettings(enabled=True, idle_minutes=5))
+        save_settings(LearnerSettings(enabled=True, settle_minutes=5))
         saved = json.loads(config.read_text(encoding="utf-8"))
         self.assertEqual("dark", saved["theme"])  # the rest of the file is kept
-        self.assertEqual(5, saved["learning"]["idle_minutes"])
+        self.assertEqual(5, saved["learning"]["settle_minutes"])
 
     def test_a_connection_saved_with_a_bom_still_counts_and_its_key_is_clean(self) -> None:
         server = self.root / "data" / "server"

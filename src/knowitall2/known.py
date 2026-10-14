@@ -100,6 +100,7 @@ def render_files(connection: sqlite3.Connection) -> Rendered:
     """Every file there is, with the files each project's folder gets."""
 
     from . import secrets
+    from .memory import PROVISIONAL_LABEL, PROVISIONAL_TAG
 
     systems = {row[0]: (row[1], _aliases(row[2]))
                for row in connection.execute("SELECT id, name, aliases FROM systems")}
@@ -112,10 +113,10 @@ def render_files(connection: sqlite3.Connection) -> Rendered:
     groups: dict[str, dict[str, Any]] = {}
     elsewhere: list[tuple[list[str], str]] = []   # the files a memory names besides its own, and its entry there
     rows = connection.execute(
-        "SELECT id, kind, text, scope, project_id, verification, created_at FROM records "
+        "SELECT id, kind, text, scope, project_id, verification, created_at, tags FROM records "
         "WHERE status = 'active' ORDER BY created_at DESC, seq DESC"
     )
-    for record_id, kind, text, scope, project_id, verification, created_at in rows:
+    for record_id, kind, text, scope, project_id, verification, created_at, tags in rows:
         system = systems.get(notes.get(record_id))
         if system is not None:
             name, aliases = system
@@ -130,6 +131,8 @@ def render_files(connection: sqlite3.Connection) -> Rendered:
         group["aliases"].extend(alias for alias in aliases if alias not in group["aliases"] and alias != name)
         where = f", project {projects[project_id]}" if scope == "project" and projects.get(project_id) else ""
         unverified = " (unverified: check before relying on it)" if verification == "unverified" else ""
+        if f'"{PROVISIONAL_TAG}"' in str(tags or ""):
+            unverified += f" ({PROVISIONAL_LABEL})"
         body = secrets.redact(" ".join(str(text).split()))
         saved = f"[{record_id}] {kind}, saved {str(created_at)[:10]}{where}{unverified}"
         group["entries"].append(_wrap(f"- {saved}: {body}"))
@@ -552,6 +555,105 @@ def enabled() -> bool:
     return not (isinstance(data, dict) and data.get("known_files") is False)
 
 
+# --- Where knowledge files could travel further than this computer (the user, 2026-10-12) ----------------
+
+# In config.json: true lets knowledge files be written in folders a cloud service keeps in sync.
+SYNCED_SETTING = "known_files_in_synced_folders"
+
+
+def synced_places(home: Path | None = None) -> list[str]:
+    """The folders OneDrive, Dropbox, Google Drive, or iCloud keep in sync on this computer, as keys."""
+
+    places = [os.environ.get(name) for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")]
+    places += [str((home or Path.home()) / name) for name in ("Dropbox", "Google Drive", "iCloudDrive")]
+    return [_key(Path(place).resolve()) for place in places if place]
+
+
+def held_back(root: Path, *, places: Sequence[str] | None = None, allow_synced: bool | None = None) -> str | None:
+    """Why no knowledge files go into ``root`` although an agent works there, or None when they may.
+
+    - A folder a cloud service keeps in sync copies them to other devices and to the service, unless the user
+      allows it (``SYNCED_SETTING``).
+    - A project that publishes an npm package, or builds a Docker image from its folder, would carry them in
+      the package or image, unless they are excluded there: Git's exclude file, where KnowItAll2 keeps them out
+      of Git, means nothing to npm or Docker.
+    """
+
+    key = _key(root.resolve())
+    if not (_synced_allowed() if allow_synced is None else allow_synced):
+        for place in synced_places() if places is None else places:
+            if key == place or key.startswith(place.rstrip("\\/") + os.sep):
+                return (f"a cloud service keeps this folder in sync, so knowledge files would be copied off this "
+                        f"computer; to allow it, set \"{SYNCED_SETTING}\": true in KnowItAll2's config.json")
+    npm = _npm_publishes(root)
+    if npm:
+        return npm
+    if _copies_the_folder(root) and not _names_folder(root / ".dockerignore"):
+        return f"a Docker build copies this folder into its image; add {FOLDER}/ to .dockerignore to allow it"
+    return None
+
+
+_COPIES_ALL = re.compile(r"^\s*(?:COPY|ADD)\b(?:\s+--(?!from)\S+)*\s+\.(?:/)?\s", re.IGNORECASE | re.MULTILINE)
+
+
+def _copies_the_folder(root: Path) -> bool:
+    """Whether a Dockerfile or Containerfile in ``root`` copies the whole folder into its image (``COPY . ...``)."""
+
+    try:
+        with os.scandir(root) as scan:
+            files = [entry.path for entry in scan if entry.is_file() and _a_container_file(entry.name)]
+    except OSError:
+        return False
+    for path in files:
+        try:
+            if _COPIES_ALL.search(read_text(Path(path))):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _npm_publishes(root: Path) -> str | None:
+    package = root / "package.json"
+    if not package.is_file():
+        return None
+    try:
+        data = json.loads(read_text(package))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or data.get("private") is True or not (data.get("name") and data.get("version")):
+        return None   # not published (npm publishes only a package with a name and a version)
+    files = data.get("files")
+    if isinstance(files, list) and not any(str(item).strip("./*") == "" for item in files):
+        return None   # only the files it lists are published
+    ignore = root / ".npmignore"
+    if _names_folder(ignore if ignore.is_file() else root / ".gitignore"):
+        return None
+    return f"npm would publish this folder with the package; add {FOLDER}/ to .npmignore to allow it"
+
+
+def _names_folder(path: Path) -> bool:
+    try:
+        lines = read_text(path).splitlines()
+    except OSError:
+        return False
+    def bare(line: str) -> str:
+        line = line.strip().removeprefix("**/").strip("/")
+        for ending in ("/**", "/*"):
+            line = line.removesuffix(ending)
+        return line.strip("/")
+
+    return any(bare(line) == FOLDER for line in lines)
+
+
+def _synced_allowed() -> bool:
+    try:
+        data = json.loads(read_text(data_home() / "config.json"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get(SYNCED_SETTING) is True
+
+
 def project_roots(connection: sqlite3.Connection) -> list[tuple[Path, list[str]]]:
     """The folders to write, each with the projects whose files it gets.
 
@@ -778,7 +880,36 @@ def _key(path: str | os.PathLike[str]) -> str:
 
 
 def _marker(connection: sqlite3.Connection) -> str:
-    return f"{change_marker(connection)}|{_worked_marker()}"
+    return f"{change_marker(connection)}|{_worked_marker()}|{_held_marker()}"
+
+
+# The files that decide whether a folder is held back (``held_back``): a change to one is a change to refresh for.
+_HOLD_FILES = ("package.json", ".npmignore", ".gitignore", ".dockerignore")
+
+
+def _held_marker() -> str:
+    """What the holds depend on: the setting, and the files that decide in each folder worked in (about 10 ms for
+    60 folders, measured 2026-10-13)."""
+
+    parts = [str(_synced_allowed())]
+    for key in sorted(_recent(_read_worked()["folders"], _now())):
+        if key.startswith(("\\\\", "//")):
+            continue   # a network share that is away would hold up every hook (second candidate review, D-L6)
+        try:
+            with os.scandir(key) as scan:
+                for entry in scan:
+                    name = entry.name.casefold()
+                    if name in _HOLD_FILES or _a_container_file(name):
+                        stat = entry.stat()
+                        parts.append(f"{key}/{name}:{stat.st_mtime_ns}:{stat.st_size}")
+        except OSError:
+            continue
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _a_container_file(name: str) -> bool:
+    name = name.casefold()
+    return name.startswith(("dockerfile", "containerfile")) or name.endswith((".dockerfile", ".containerfile"))
 
 
 def refresh(connection: sqlite3.Connection, *, force: bool = False) -> RefreshReport:
@@ -788,7 +919,14 @@ def refresh(connection: sqlite3.Connection, *, force: bool = False) -> RefreshRe
     status = read_status()
     if not force and status.get("marker") == marker:
         return RefreshReport(marker, unchanged=True)
-    roots = project_roots(connection)
+    roots, held = [], []
+    places, allow_synced = synced_places(), _synced_allowed()
+    for root, projects in project_roots(connection):
+        why = held_back(root, places=places, allow_synced=allow_synced)
+        if why:
+            held.append({"folder": str(root), "reason": why})
+        else:
+            roots.append((root, projects))
     marker = _marker(connection)   # the record of where agents work is seeded by now
     rendered = render_files(connection)
     try:
@@ -816,6 +954,7 @@ def refresh(connection: sqlite3.Connection, *, force: bool = False) -> RefreshRe
                    "retiring": retiring,
                    "owned": list(_owned({"owned": [*written, *kept, *retiring]}).values()),
                    "refused": [{"folder": item.root, "reason": item.refused} for item in report.folders if item.refused],
+                   "held": held,
                    "notes": [f"{item.root}: {note}" for item in report.folders for note in item.notes],
                    "problems": [f"{item.root}: {item.skipped}" for item in problems]})
     for item in problems:

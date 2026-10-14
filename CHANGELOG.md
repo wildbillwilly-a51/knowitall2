@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.11.0 (2026-10-14)
+
+From a review of how KnowItAll2 works in real use, research into why it learns
+poor memories, and your decisions on 2026-10-13. Replayed on ten real chats,
+65% of what the new learning keeps passes every check, against 37% before.
+
+- **Learning happens twice.** During a chat, KnowItAll2 still learns at each
+  commit, and other chats see it right away, marked "from a chat still in
+  progress; may change". Once the chat has been quiet for 90 minutes, or
+  ends, KnowItAll2 reads the whole stretch with how it ended. It confirms
+  what held, corrects or retires what the chat later overturned, adds what
+  it missed, and checks each memory against the ones most like it, so it
+  adds to an existing memory instead of saving a repeat. The wait is
+  changeable in the app; a longer wait you had set for learning before is
+  kept.
+- **Your rules, your preferences, and how your projects work are told
+  apart.** A rule needs your own words that make one ("make that a rule",
+  "from now on"), also when an agent saves it. How you like to work is a
+  preference. What you decided or required for a project is filed with that
+  project as trusted project information, not as a rule for everything.
+- **Memories are filed where the work happened.** Learning names the project
+  a memory belongs to, and an agent's `remember` files it under the current
+  project unless several projects use it. An agent's save that is close to
+  something already known is answered with that memory, to add to it.
+- **Less that goes out of date.** Learning leaves out status and records of
+  the chat's own work; what the catalog still files as a status goes after
+  a week unless confirmed.
+- **Honest labels.** A memory is marked observed when a command's output
+  shows its details (addresses, paths, versions), wherever the quote came
+  from. A short quote counts when it is distinctive, such as "port 8443".
+- **Tidying catches up and stays caught up.** Only memories that are new or
+  changed are reviewed, plus a slow pass over everything once a month, so
+  tidying no longer falls behind. Near-repeats that each hold a detail are
+  combined into one memory that keeps every name, number, and "not", and
+  can be undone. When two memories disagree, the one the evidence does not
+  favour is marked and ranked lower while it is checked, and a check no
+  agent takes within a week is settled by the evidence; only your own
+  choices still come to you.
+- **Each kind of work has its own daily calls.** Background learning,
+  tidying, and filing each have their own allowance; learning from your
+  work and what you start yourself never use them up.
+- **Knowledge files stay on your computer.** By default no knowledge files
+  are written in folders OneDrive, Dropbox, Google Drive, or iCloud keep in
+  sync, nor in projects whose npm package or Docker image would carry them,
+  unless they are excluded there; `doctor` says what line to add.
+
 ## 0.10.6 (2026-10-12)
 
 From a full review of 0.10.5 on 2026-10-11, with your decisions about where

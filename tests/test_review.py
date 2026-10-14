@@ -49,6 +49,77 @@ class ReviewTestCase(unittest.TestCase):
         return note, question["id"]
 
 
+class EvidenceTests(ReviewTestCase):
+    """Disagreements settled by evidence (2026-10-13: 20 checks were handed to agents and none was done)."""
+
+    def disagree(self, older_source: str = "observed", newer_source: str = "inferred"):
+        older = self.save("The CI runner is ci01.", source=older_source)
+        newer = self.save("The CI runner is ci02.", source=newer_source)
+        self.assertTrue(review.ask_conflict(self.memory, older, newer))
+        [question] = self.store.open_questions(limit=5)
+        task = review.start_check(self.memory, question, [older, newer], plain=None, labels=None, reason=None)
+        return older, newer, question, task
+
+    def test_the_side_the_evidence_does_not_favour_is_marked_and_ranked_lower_while_it_is_checked(self) -> None:
+        older, newer, _question, _task = self.disagree()
+        self.assertEqual((False, True), ("disputed" in self.store.get(older.id).tags,
+                                         "disputed" in self.store.get(newer.id).tags))
+        found = self.memory.recall("CI runner", project_path=self.project)
+        self.assertIn("another memory disagrees; being checked", found)
+        self.assertLess(found.index(older.id), found.index(newer.id))
+
+    def test_a_check_no_agent_took_in_a_week_is_settled_by_the_evidence(self) -> None:
+        older, newer, question, task = self.disagree()
+        self.clock.value = "2026-10-05T12:00:00Z"
+        self.assertEqual(1, review.expire_tasks(self.memory)["settled by evidence"])
+        self.assertEqual(("active", "retired"), (self.store.get(older.id).status, self.store.get(newer.id).status))
+        self.assertNotIn("disputed", self.store.get(older.id).tags)
+        self.assertEqual("answered", self.store.question(question["id"])["status"])
+        self.assertEqual(0, self.store.count_open_questions())
+        # Verified alike, the newer one stands.
+        self.store.connection.execute("DELETE FROM questions")
+        first = self.save("The deploy window is Tuesday.", source="observed")
+        second = self.save("The deploy window is Thursday.", source="observed")
+        review.ask_conflict(self.memory, first, second)
+        [again] = self.store.open_questions(limit=5)
+        review.start_check(self.memory, again, [first, second], plain=None, labels=None, reason=None)
+        self.clock.value = "2026-10-14T12:00:00Z"
+        review.expire_tasks(self.memory)
+        self.assertEqual((second.id, "active"), (self.store.get(first.id).superseded_by,
+                                                 self.store.get(second.id).status))
+
+    def test_a_dispute_ends_with_its_question_however_it_closes(self) -> None:
+        # Candidate review, C-M3: a question closed unanswered after 30 days left its memory "disputed" for good.
+        older, newer, question, _task = self.disagree()
+        self.clock.value = "2026-11-05T12:00:00Z"
+        self.store.connection.execute("UPDATE agent_tasks SET status = 'given_up'")
+        review.expire_unanswered(self.memory)
+        self.assertNotEqual("open", self.store.question(question["id"])["status"])
+        self.assertNotIn("disputed", self.store.get(newer.id).tags)
+
+    def test_a_memory_two_questions_check_stays_disputed_until_both_close(self) -> None:
+        # Second candidate review, D-L7.
+        older, newer, question, _task = self.disagree()
+        third = self.save("The CI runner is ci03.", source="observed")
+        review.ask_conflict(self.memory, newer, third)
+        other = [item for item in self.store.open_questions(limit=5) if item["id"] != question["id"]][0]
+        review.answer(self.memory, other["id"], "keep_both")
+        self.assertIn("disputed", self.store.get(newer.id).tags)
+        review.answer(self.memory, question["id"], "keep_both")
+        self.assertNotIn("disputed", self.store.get(newer.id).tags)
+
+    def test_the_users_own_choice_still_goes_to_the_user(self) -> None:
+        older = self.save("The user prefers releases on Fridays.", kind="note", source="user")
+        newer = self.save("Releases happen on Mondays.", source="observed")
+        review.ask_conflict(self.memory, older, newer)
+        [question] = self.store.open_questions(limit=5)
+        review.start_check(self.memory, question, [older, newer], plain=None, labels=None, reason=None)
+        self.assertNotIn("disputed", self.store.get(older.id).tags + self.store.get(newer.id).tags)
+        self.clock.value = "2026-10-05T12:00:00Z"
+        self.assertEqual(1, review.expire_tasks(self.memory)["escalated"])
+        self.assertEqual("ask_user", review.stage(self.store, question["id"]))
+
+
 class AnswerTests(ReviewTestCase):
     def test_keep_mine_retires_the_newer_memory(self) -> None:
         stated, newer, question_id = self.conflict()

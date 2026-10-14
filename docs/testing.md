@@ -32,8 +32,9 @@ long-term memory:
 - Claude Code, Codex, or both. On Codex, KnowItAll2's tools are called
   through Codex's code mode, so install Codex's full package: its npm package,
   or the `codex-package` release archive on Linux.
-- Access to the release repository, and a way for Git to sign in to it (a
-  credential manager or a personal access token).
+- The repository's address. The public repository needs no sign-in; a
+  private copy needs a way for Git to sign in to it (a credential manager
+  or a personal access token).
 
 ## Installing
 

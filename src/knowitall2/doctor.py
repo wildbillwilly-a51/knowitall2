@@ -175,6 +175,13 @@ def _refused_folder_checks() -> list[Check]:
             f"{folder} was not written by KnowItAll2, or its {known.INDEX} is empty or damaged",
             f"If it holds only KnowItAll2's old files, delete that folder, then run: {cli_command('known')}"))
         checks.append(Check("knowledge files", True, f"not written in {root}: {why}", fix))
+    held = known.read_status().get("held")
+    for item in held if isinstance(held, list) else []:
+        # A synced folder has its own note (``_cloud_folder_checks``); a package or image says what to add.
+        if isinstance(item, dict) and isinstance(item.get("folder"), str) and "cloud" not in str(item.get("reason")):
+            why, _, fix = str(item.get("reason")).partition("; ")
+            checks.append(Check("knowledge files", True, f"not written in {item['folder']}: {why}",
+                                (fix[:1].upper() + fix[1:] + ".") if fix else None))
     return checks
 
 
@@ -184,21 +191,21 @@ def _cloud_folder_checks(*, home: Path | None = None) -> list[Check]:
 
     from . import known
 
-    places = [os.environ.get(name) for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")]
-    places += [str((home or Path.home()) / name) for name in ("Dropbox", "Google Drive", "iCloudDrive")]
-    synced = [os.path.normcase(str(Path(place).resolve())).rstrip("\\/") for place in places if place]
+    synced = [place.rstrip("\\/") for place in known.synced_places(home)]
     found = []
     for folder in sorted(known.worked_folders()):
         if any(folder == place or folder.startswith(place + os.sep) for place in synced):
             try:
                 found.append(str(Path(folder).resolve(strict=True)))
             except OSError:
-                found.append(folder)
+                continue   # a folder since deleted or moved is no longer anywhere (seen 2026-10-12)
     if not found:
         return []
+    written = "KnowItAll2 writes no knowledge files there" if not known._synced_allowed() else (
+        "knowledge files are written there, as config.json allows")
     return [Check("project folders", True,
                   f"{len(found)} project folder{'s are' if len(found) > 1 else ' is'} in a folder that a cloud "
-                  f"service keeps in sync: {'; '.join(found)}",
+                  f"service keeps in sync ({written}): {'; '.join(found)}",
                   f"Move {'these projects' if len(found) > 1 else 'this project'} to a folder on this computer that "
                   "is not synced, and open it from there.")]
 

@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from .dossier import build_dossiers
-from .learner import LEARN_TO, RESUME_AT
+from .learner import LEARN_TO, RESUME_AT, SETTLED
+from .settle import PART_CHARACTERS, needed_calls
 from .state import LearnerState, learner_lock
 from .transcripts import read_session, session_folder, session_logs
 
@@ -95,8 +96,15 @@ def estimate(folder: str, *, since: str | None = None) -> dict[str, int]:
     for log in _matching(folder, since=since, state=state):
         session, _ = read_session(log, stop=_set_aside_end(state.entry(log)))
         sessions += 1
-        calls += len(build_dossiers(session))
+        calls += _calls_for(session)
     return {"sessions": sessions, "calls": calls}
+
+
+def _calls_for(session) -> int:
+    """The calls the final pass of a caught-up session takes; none when there is nothing to learn."""
+
+    parts = build_dossiers(session, budget=PART_CHARACTERS)
+    return needed_calls(parts) if parts else 0
 
 
 def _set_aside_end(entry: dict[str, Any]) -> int | None:
@@ -119,13 +127,14 @@ def catch_up(folder: str, *, since: str | None = None, max_calls: int | None = N
         for log in _matching(folder, since=since, state=state):
             if max_calls is not None:
                 session, _ = read_session(log, stop=_set_aside_end(state.entry(log)))
-                needed = len(build_dossiers(session))
+                needed = _calls_for(session)
                 if calls and calls + needed > max_calls:
                     continue
                 calls += needed
             entry = state.entry(log)
             resume, bound = int(entry.get("offset") or 0), int(entry.get(SET_ASIDE_TO) or 0)
-            entry.update({"offset": 0, "status": "new", "failures": 0, "updated_at": moment, "caught_up_at": moment})
+            entry.update({"offset": 0, SETTLED: 0, "status": "new", "failures": 0, "updated_at": moment,
+                          "caught_up_at": moment})
             if bound and resume > bound:
                 # Learning went on past the set-aside part: read only that part, then carry on from there.
                 entry.update({LEARN_TO: bound, RESUME_AT: resume})

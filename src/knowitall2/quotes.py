@@ -43,6 +43,30 @@ def quoted_in(quote: str, sources: list[str]) -> bool:
     return False
 
 
+# A short quote still counts when it is distinctive: this many letters and digits, at least one a digit (a port, a
+# version, an address), and found word for word, with nothing joined to either end. "port 8443" is evidence; "the
+# router" is not. Six of seven quotes turned down in the 2026-10-12 review were in the chat word for word.
+MIN_SHORT_QUOTE_LETTERS = 6
+
+
+def short_quote_in(quote: str, sources: list[str]) -> bool:
+    """Whether ``quote``, too short for ``quoted_in``, is a distinctive passage of one of ``sources``, word for word."""
+
+    quote = " ".join(quote.split())
+    count = len(letters(quote))
+    if not MIN_SHORT_QUOTE_LETTERS <= count < MIN_QUOTE_LETTERS or not any(c.isdigit() for c in quote):
+        return False
+    pattern = re.compile(r"(?<!\w)" + r"\s+".join(re.escape(part) for part in quote.split()) + r"(?!\w)",
+                         re.IGNORECASE)
+    return any(pattern.search(source) for source in sources)
+
+
+def too_short(quote: str) -> bool:
+    """Whether ``quote`` holds too few letters and digits to be evidence at all."""
+
+    return len(letters("".join(_ELISION.split(quote)))) < MIN_QUOTE_LETTERS
+
+
 _ELISION = re.compile(r"\.{3,}|…|\[\.\.\.\]")
 # A quote shortened with "..." keeps a few real pieces: each one this many letters
 # (or two words with a few letters fewer), so it cannot be spelled out of single

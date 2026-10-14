@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
 from . import __version__, journal, review
-from .memory import KINDS, MAX_RECALL_LIMIT, RECALL_SCOPES, SCOPES, SOURCES, Memory, MemoryInputError
+from .memory import (
+    KINDS, MAX_RECALL_LIMIT, PREFERENCE_TAG, RECALL_SCOPES, SCOPES, SOURCES, Memory, MemoryInputError,
+)
 from .paths import data_home, database_path
 from .store import Store, StoreError
 
@@ -43,10 +45,12 @@ INSTRUCTIONS = (
     "file, read a file KnowItAll2 points you to, and do not edit it. "
     "When you establish a durable fact that would help a future session, or the user tells you "
     "one (a system, a method, how they want something done), call `remember` right away and tell the user in one "
-    "short line what was saved; set source to 'user' only for the user's own words. Save how the user wants "
-    "something done as a note tagged 'preference', in the user's own words with the work it was about in its "
-    "subjects; save a rule only when the "
-    "user explicitly asks for a standing one ('make that a rule', 'from now on'). Never save secrets; save where a "
+    "short line what was saved; set source to 'user' only for the user's own words. A memory belongs to the "
+    "current project unless several projects use it. What the user decided or required for a project is a "
+    "decision of that project; how the user personally likes to work is a note tagged 'preference', in the "
+    "user's own words with the work it was about in its subjects; save a rule only when the user explicitly asks "
+    "for a standing one ('make that a rule', 'from now on'), with their words in rule_words. Never save secrets; "
+    "save where a "
     "credential is kept instead. When the user asks KnowItAll2 to learn from the session, or once when a task "
     "the user gave you is complete, call `learn`. Treat unverified memories as leads to check. When the briefing says KnowItAll2 has "
     "a question about this project's memories, show it with `questions` once, at a natural point in the chat: look "
@@ -118,10 +122,11 @@ TOOLS: list[dict[str, Any]] = [
         "title": "Remember",
         "description": (
             "Save one durable memory that would help a future session: a fact about a system or project, a "
-            "procedure that worked, a decision, a lesson from a failure, or a rule the user stated. Keep it to "
-            "one self-contained statement. Never include secrets; record where a credential is kept instead. "
-            "Set source to 'user' only for the user's own words, 'observed' for something confirmed by tool "
-            "output in this session, and otherwise 'inferred'."
+            "procedure that worked, a decision, a lesson from a failure, how the user likes to work, or a rule the "
+            "user made. Keep it to one self-contained statement. Never include secrets; record where a credential "
+            "is kept instead. Set source to 'user' only for the user's own words, 'observed' for something "
+            "confirmed by tool output in this session, and otherwise 'inferred'. When it is close to a memory "
+            "already known, nothing is saved and the reply names that memory: add to it with replaces."
         ),
         "inputSchema": {
             "type": "object",
@@ -130,8 +135,17 @@ TOOLS: list[dict[str, Any]] = [
                 "kind": {
                     "type": "string", "enum": list(KINDS),
                     "description": (
-                        "Default 'fact'. 'rule' only when the user explicitly asks for a standing rule ('make that a "
-                        "rule', 'from now on'); how the user wants something done is a 'note' tagged 'preference'."
+                        "Default 'fact'. What the user required or decided for a project is a 'decision' of that "
+                        "project. How the user personally likes to work is a 'note' tagged 'preference'. 'rule' "
+                        "only when the user made a standing rule: pass their words in rule_words."
+                    ),
+                },
+                "rule_words": {
+                    "type": "string",
+                    "description": (
+                        "For kind 'rule': the user's sentence that made it a rule, exactly as typed, with the words "
+                        "that make it one and the instruction itself ('From now on, always run the tests first.', or "
+                        "'Run the tests first. Make that a rule.'). Without them it is saved as a preference."
                     ),
                 },
                 "subjects": {
@@ -142,8 +156,10 @@ TOOLS: list[dict[str, Any]] = [
                 "scope": {
                     "type": "string", "enum": list(SCOPES),
                     "description": (
-                        "'global' (default) for systems, infrastructure, tools, and user-wide rules; 'project' "
-                        "for things that matter only inside this project. Decisions default to 'project'."
+                        "'project' (default) for what belongs to this project's work, including the hosts, "
+                        "services, and deployments it runs. 'global' only for what several projects use: shared "
+                        "infrastructure and how to reach it, general tool quirks. Rules and preferences default "
+                        "to 'global'."
                     ),
                 },
                 "source": {"type": "string", "enum": list(SOURCES), "description": "Default 'inferred'."},
@@ -154,6 +170,11 @@ TOOLS: list[dict[str, Any]] = [
                         "memory, and only the user's own words replace the user's statements: otherwise both are "
                         "kept and the user is asked which is right."
                     ),
+                },
+                "distinct": {
+                    "type": "boolean",
+                    "description": "True to save it although it is close to a memory already known, when it says "
+                                   "something different.",
                 },
                 "project_path": _PROJECT_PATH,
             },
@@ -426,17 +447,51 @@ def _recall(memory: Memory, arguments: dict[str, Any], cwd: Path) -> str:
 
 
 def _remember(memory: Memory, arguments: dict[str, Any], cwd: Path) -> str:
+    text = _required_string(arguments, "text")
+    kind = _optional_string(arguments, "kind") or "fact"
+    tags = _string_list(arguments, "tags")
+    source = _optional_string(arguments, "source") or "inferred"
+    replaces = _optional_string(arguments, "replaces")
+    distinct = arguments.get("distinct", False)
+    if not isinstance(distinct, bool):
+        raise MemoryInputError("'distinct' must be true or false.")
+    project_path = _optional_string(arguments, "project_path") or cwd
+    told = ""
+    if kind == "rule":
+        from .learning.learner import makes_a_rule
+
+        if source != "user" or not makes_a_rule(_optional_string(arguments, "rule_words"), text):
+            # What the user said once about how to work is a preference, not a rule (the user, 2026-10-13).
+            kind, tags = "note", [*tags, *([] if PREFERENCE_TAG in tags else [PREFERENCE_TAG])]
+            told = (" It was saved as a preference, not a rule: a rule needs the user's own words that made it one "
+                    "(rule_words), such as 'make that a rule' or 'from now on, ...'.")
+    scope = _optional_string(arguments, "scope")
+    project = memory.project_for(project_path)
+    if scope is None and kind != "rule" and PREFERENCE_TAG not in tags and project is not None:
+        # Knowledge belongs to the project whose work it is; global only for what several projects use.
+        scope = "project"
+    if not replaces and not distinct and source != "user":
+        close = memory.nearest(text, project_id=project.id if project else None, scope="all", limit=1)
+        if close and close[0][0] >= NEAR_SHARE:
+            known = close[0][1]
+            where = f"project {known.project_name}" if known.scope == "project" and known.project_name else "global"
+            return (f"Not saved: this is close to [{known.id}] ({known.kind}, {where}): \"{_short(known.text)}\" "
+                    f"If it adds to that memory, call remember again with replaces={known.id} and the whole combined "
+                    "text; if it says something different, call again with distinct: true.")
     result = memory.remember(
-        _required_string(arguments, "text"),
-        kind=_optional_string(arguments, "kind") or "fact",
-        subjects=_string_list(arguments, "subjects"),
-        tags=_string_list(arguments, "tags"),
-        scope=_optional_string(arguments, "scope"),
-        source=_optional_string(arguments, "source") or "inferred",
-        replaces=_optional_string(arguments, "replaces"),
-        project_path=_optional_string(arguments, "project_path") or cwd,
+        text, kind=kind, subjects=_string_list(arguments, "subjects"), tags=tags, scope=scope, source=source,
+        replaces=replaces, project_path=project_path,
     )
-    return result.describe()
+    return result.describe() + told
+
+
+# A save holding this share of a known memory's keywords (rarer ones counting more) was the same knowledge in each
+# of 15 such pairs read by hand (2026-10-13), so the agent is asked to add to it instead.
+NEAR_SHARE = 0.5
+
+
+def _short(text: str, limit: int = 300) -> str:
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
 
 def _forget(memory: Memory, arguments: dict[str, Any], cwd: Path) -> str:

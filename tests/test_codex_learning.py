@@ -56,7 +56,7 @@ class RolloutBuilder:
         text = "".join(json.dumps(record) + "\n" for record in self.records)
         path.write_text(text + (partial_tail or ""), encoding="utf-8")
         if idle:
-            old = time.time() - 3600
+            old = time.time() - 3 * 3600   # past the final pass's wait (settle_minutes)
             os.utime(path, (old, old))
         return path
 

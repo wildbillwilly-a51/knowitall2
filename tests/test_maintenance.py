@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -65,6 +66,57 @@ class MaintenanceTestCase(unittest.TestCase):
         return self.store.get(record_id).status
 
 
+class StatusTests(MaintenanceTestCase):
+    def test_a_status_lasts_a_week_unless_it_is_confirmed(self) -> None:
+        # What the catalog files as a status (a current state that will change) goes out of date: the 2026-10-12
+        # review found one in six new memories was status. It is kept out of briefings, and goes after a week.
+        from knowitall2.learning.maintenance import retire_old_status
+
+        def status(text: str, **options):
+            record = self.memory.remember(text, project_path=self.project, scope="project", **options).record
+            self.store.set_note(record.id, headline=text, system_id=None, facet="status", written_by="catalog",
+                                now=self.clock())
+            return record
+
+        old = status("The alpha nightly build is failing on the lint step.")
+        said = status("The alpha release is frozen until the audit finishes.", kind="decision", source="user")
+        self.clock.value = "2026-10-01T12:00:00Z"
+        fresh = status("The alpha staging server is down for upgrades.")
+        renewed = status("The alpha queue holds 40 jobs.")
+        self.clock.value = "2026-10-03T12:00:00Z"
+        self.memory.confirm(renewed.id)
+        self.clock.value = "2026-10-05T12:00:00Z"
+        self.assertEqual(1, retire_old_status(self.memory))
+        self.assertEqual(["retired", "active", "active", "active"],
+                         [self.store.get(record.id).status for record in (old, said, fresh, renewed)])
+        self.assertIn("status", self.store.get(old.id).retired_reason)
+
+
+class StatusKindTests(MaintenanceTestCase):
+    def test_only_a_fact_or_note_filed_as_status_goes_after_a_week(self) -> None:
+        # Candidate review, C-L9: decisions, procedures, and lessons are never statuses.
+        from knowitall2.learning.maintenance import retire_old_status
+
+        kept = self.memory.remember("To restart alpha, run make restart.", project_path=self.project, scope="project",
+                                    kind="procedure").record
+        gone = self.memory.remember("The alpha build is red today.", project_path=self.project, scope="project").record
+        for record in (kept, gone):
+            self.store.set_note(record.id, headline=record.text, system_id=None, facet="status", written_by="catalog",
+                                now=self.clock())
+        self.clock.value = "2026-10-10T12:00:00Z"
+        self.assertEqual(1, retire_old_status(self.memory))
+        self.assertEqual(("active", "retired"), (self.status(kept.id), self.status(gone.id)))
+        self.assertEqual(1, len(self.store.events(kinds=["change"])))
+
+    def test_memory_reviews_never_count_as_group_reviews(self) -> None:
+        # Candidate review, C-L1: they set the groups' 6-hour throttle and hid a stalled maintenance.
+        from knowitall2.learning.maintenance import mark_reviewed
+
+        record = self.memory.remember("The NAS is nas01.").record
+        mark_reviewed(self.memory, [record])
+        self.assertIsNone(self.store.last_review("global"))
+
+
 class PlanTests(MaintenanceTestCase):
     def test_a_small_scope_is_one_group_and_a_lone_memory_is_not_reviewed(self) -> None:
         for text in ("The NAS is nas01.", "The router is rtr01.", "The printer is prn01."):
@@ -116,6 +168,65 @@ class GateTests(MaintenanceTestCase):
         self.assertIn("is also still active", self.memory.restore(short.id))
         restored = self.store.get(short.id)
         self.assertEqual(("active", "user_stated"), (restored.status, restored.verification))
+
+    def test_near_repeats_that_each_add_a_detail_are_combined_without_losing_one(self) -> None:
+        # 2026-10-12: the gate turned down about 400 duplicate findings, each copy holding a detail the kept one
+        # lacked; they stayed as repeats. Combining keeps every detail in one memory.
+        first = self.save("The NAS nas01 shares media over SMB.", subjects=["NAS"])
+        second = self.save("nas01 exports /volume1/media read-only.", subjects=["nas01"])
+        other = self.save("The router is rtr01.")
+        whole = "The NAS nas01 shares media over SMB, exporting /volume1/media read-only."
+        combine = {"kind": "combine", "keep_id": "", "ids": [first.id, second.id], "text": whole, "reason": "Same share."}
+        report = self.run_maintenance(FakeReviewer([[combine]]))
+        self.assertEqual({"combined": 2}, dict(report.changes))
+        holder = self.store.get(self.store.get(first.id).superseded_by)
+        self.assertEqual((whole, "unverified", ["NAS", "nas01"]), (holder.text, holder.verification,
+                                                                   list(holder.subjects)))
+        self.assertEqual(holder.id, self.store.get(second.id).superseded_by)
+        self.assertEqual("active", self.status(other.id))
+        self.assertIn("combined into", self.store.get(second.id).retired_reason)
+
+    def test_a_combination_that_loses_a_detail_or_mixes_evidence_is_refused(self) -> None:
+        first = self.save("The NAS nas01 shares media over SMB.")
+        second = self.save("nas01 exports /volume1/media read-only.")
+        observed = self.save("nas01 answers on port 445.", source="observed")
+        said = self.save("Never expose nas01 to the internet.", kind="decision", source="user", scope="global")
+        cases = [
+            ([first.id, second.id], "The NAS nas01 shares media over SMB, read-only.", "drops a name"),
+            ([first.id, observed.id], "The NAS nas01 shares media over SMB on port 445.", "verified differently"),
+            ([first.id, said.id], "The NAS nas01 shares media over SMB and is never exposed to the internet.",
+             "the user's own words"),
+            ([first.id, second.id], "", "missing or too long"),
+        ]
+        for ids, text, why in cases:
+            with self.subTest(why=why):
+                finding = {"kind": "combine", "keep_id": "", "ids": ids, "text": text, "reason": ""}
+                report = self.run_maintenance(FakeReviewer([[finding]]))
+                self.assertTrue(any(why in item for item in report.left_alone), report.left_alone)
+                self.assertTrue(all(self.status(item) == "active" for item in ids))
+                self.store.connection.execute("DELETE FROM reviews")
+
+    def test_a_combination_keeps_the_words_that_carry_meaning(self) -> None:
+        # Candidate review, C-M8: "nightly", "encrypted", "restic", "offsite" could vanish.
+        from knowitall2.learning.maintenance import keeps_everything
+
+        sources = ["NAS backups run nightly at 02:00 to /volume1/backups and are encrypted with restic.",
+                   "NAS backups are kept for 30 days on the offsite bucket."]
+        self.assertFalse(keeps_everything(sources, "NAS backups run at 02:00 to /volume1/backups, kept 30 days."))
+        self.assertTrue(keeps_everything(sources, "NAS backups run nightly at 02:00 to /volume1/backups, encrypted "
+                                                  "with restic, and are kept for 30 days on the offsite bucket."))
+
+    def test_a_combined_memory_is_dated_like_its_newest_input_and_drops_a_dispute(self) -> None:
+        first = self.save("The NAS nas01 shares media over SMB.", subjects=["NAS"])
+        self.clock.value = "2026-09-28T12:00:00Z"
+        second = self.save("nas01 exports /volume1/media read-only.", subjects=["nas01"])
+        self.store.set_tags(second.id, ["disputed"], now=self.clock())
+        self.clock.value = "2026-10-01T12:00:00Z"
+        whole = "The NAS nas01 shares media over SMB, exporting /volume1/media read-only."
+        self.run_maintenance(FakeReviewer([[{"kind": "combine", "keep_id": "", "ids": [first.id, second.id],
+                                             "text": whole, "reason": ""}]]))
+        holder = self.store.get(self.store.get(first.id).superseded_by)
+        self.assertEqual(("2026-09-28T12:00:00Z", ()), (holder.created_at, tuple(holder.tags)))
 
     def test_a_better_verified_copy_is_never_retired_by_a_fuller_one(self) -> None:
         full = self.save("The NAS is nas01 at 10.0.0.5, reached over SSH as admin.")
@@ -358,6 +469,40 @@ class ScheduleTests(MaintenanceTestCase):
         self.assertEqual(1, self.run_maintenance(reviewer).calls)
         self.assertIn("The printer is prn01.", reviewer.texts[0])
         self.assertNotIn("nas01 is the NAS.", reviewer.texts[0])
+
+    def test_only_groups_with_a_new_or_changed_memory_are_reviewed_again(self) -> None:
+        # 2026-10-13: groups were rebuilt from scratch, so one change reshuffled many and nearly everything looked
+        # due every day (148 groups waiting against 8 calls). Each memory's review is remembered instead.
+        saved = [self.save(f"The homelab host {name} runs service number {number} for the lab.")
+                 for number, name in enumerate(f"h{index:02d}" for index in range(45))]
+        first = self.run_maintenance(FakeReviewer([[]] * 5))
+        self.assertEqual(2, first.calls)
+        self.memory.forget(saved[3].id, reason="gone")
+        self.assertEqual({"unchanged"}, {status for _, status in plan(self.memory)})
+        self.clock.value = "2026-09-28T12:00:00Z"
+        self.save("The homelab host n99 runs the new metrics service for the lab.")
+        statuses = [status for _, status in plan(self.memory)]
+        self.assertEqual((1, len(statuses) - 1), (statuses.count("review"), statuses.count("unchanged")))
+        self.run_maintenance(FakeReviewer([[]]))
+        self.assertEqual({"unchanged"}, {status for _, status in plan(self.memory)})
+        changed = self.memory.correct(saved[10].id, "The homelab host h10 runs service number 10 and 11 for the lab.")
+        self.clock.value = "2026-09-29T12:00:00Z"
+        due = [group for group, status in plan(self.memory) if status == "review"]
+        self.assertEqual([[changed.record.id]], [[record.id for record in group.members if record.id == changed.record.id]
+                                                 for group in due])
+
+    def test_a_slow_sweep_looks_at_each_group_again_after_a_month(self) -> None:
+        from knowitall2.learning.maintenance import SWEEP_DAYS
+
+        for text in ("The NAS is nas01.", "The router is rtr01."):
+            self.save(text)
+        self.run_maintenance(FakeReviewer([[]]))
+        self.clock.value = (datetime(2026, 9, 27, 12, tzinfo=timezone.utc) + timedelta(days=SWEEP_DAYS - 1)
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(["unchanged"], [status for _, status in plan(self.memory)])
+        self.clock.value = (datetime(2026, 9, 27, 12, tzinfo=timezone.utc) + timedelta(days=SWEEP_DAYS + 1)
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(["review"], [status for _, status in plan(self.memory)])
 
     def test_failures_retry_then_give_up_and_backend_problems_stop_the_run(self) -> None:
         for text in ("The NAS is nas01.", "The router is rtr01."):

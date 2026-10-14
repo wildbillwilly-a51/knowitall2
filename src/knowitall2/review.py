@@ -28,7 +28,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from . import journal
-from .memory import QUESTION_CHECK_DAYS, QUESTION_REVIEW_DAYS, Memory, MemoryInputError, is_users_choice
+from .memory import (
+    DISPUTED_TAG, QUESTION_CHECK_DAYS, QUESTION_REVIEW_DAYS, VERIFICATION_STRENGTH, Memory, MemoryInputError,
+    is_users_choice,
+)
 from .store import RecordRow, Store
 
 UNCONFIRMED_RULE_PREFIX = "Possible rule, not confirmed by the user: "
@@ -78,14 +81,32 @@ _VERIFICATION_WORDS = {"user_stated": "stated by the user", "observed": "seen in
 
 
 def ask_conflict(memory: Memory, older: RecordRow, newer: RecordRow) -> bool:
-    """Newer, weaker evidence disagrees with a memory; find out which is right."""
+    """Newer, weaker evidence disagrees with a memory; find out which is right.
+
+    Until it is settled, the side the evidence does not favour is marked disputed: shown with a warning and
+    ranked lower, so an agent relying on it is warned when it matters (2026-10-13: 20 such checks waited for an
+    agent, and none came). The user's own choices are not marked: only the user settles those.
+    """
 
     said = "You said" if older.verification == "user_stated" else f"KnowItAll2 has ({older.verification})"
     prompt = (
         f'{said}: "{_short(older.text)}" [{older.id}]. A later session suggests: '
         f'"{_short(newer.text)}" [{newer.id}]. Which is right now?'
     )
-    return _ask(memory, "conflict", prompt, [older.id, newer.id])
+    asked = _ask(memory, "conflict", prompt, [older.id, newer.id])
+    if asked and not (is_users_choice(older) or is_users_choice(newer)):
+        weaker = newer if _evidence_choice(older, newer) == "keep_mine" else older
+        if DISPUTED_TAG not in weaker.tags:
+            memory.store.set_tags(weaker.id, [*weaker.tags, DISPUTED_TAG], now=memory.now())
+    return asked
+
+
+def _evidence_choice(older: RecordRow, newer: RecordRow) -> str:
+    """How the evidence settles a disagreement: the better-verified memory, or, verified alike, the newer one."""
+
+    if VERIFICATION_STRENGTH[older.verification] > VERIFICATION_STRENGTH[newer.verification]:
+        return "keep_mine"
+    return "use_new"
 
 
 def ask_rule(memory: Memory, note: RecordRow) -> bool:
@@ -589,6 +610,9 @@ def expire_tasks(memory: Memory, *, now: datetime | None = None) -> dict[str, in
     for task in memory.store.tasks(status="open"):
         age = moment - _parse(task["created_at"])
         if task["kind"] == "check" and (task["offered"] >= CHECK_OFFERS or age > timedelta(days=CHECK_DAYS)):
+            if _settled_by_evidence(memory, task["question_id"]):
+                counts["settled by evidence"] = counts.get("settled by evidence", 0) + 1
+                continue
             finding = (f"Agents were asked {task['offered']} times, but none could tell." if task["offered"]
                        else "No agent worked on it within a week.")
             escalate(memory, task["question_id"], finding=finding)
@@ -597,6 +621,29 @@ def expire_tasks(memory: Memory, *, now: datetime | None = None) -> dict[str, in
             memory.store.update_task(task["id"], status="given_up", now=memory.now())
             counts["given up"] += 1
     return counts
+
+
+def _settled_by_evidence(memory: Memory, question_id: str) -> bool:
+    """Settle a disagreement no agent checked by the evidence, quietly, unless it involves the user's own choice,
+    which goes to the user. Whether it was settled."""
+
+    question = memory.store.question(question_id)
+    if question is None or question["status"] != "open" or question["kind"] != "conflict":
+        return False
+    records = [memory.store.get(record_id) for record_id in question["record_ids"]]
+    if len(records) != 2 or any(record is None or record.status != "active" for record in records):
+        return False
+    older, newer = records
+    if is_users_choice(older) or is_users_choice(newer):
+        return False
+    choice = _evidence_choice(older, newer)
+    why = ("no agent checked within a week; the better-verified memory stands" if choice == "keep_mine" else
+           "no agent checked within a week; the newer memory, verified at least as well, stands")
+    done = settle(memory, question, choice, by="KnowItAll2", evidence=why)
+    if done is None:
+        return False
+    _close_tasks(memory, question_id, "done")
+    return True
 
 
 def _found_out(memory: Memory, task: dict[str, Any], found: str, certain: bool) -> str:

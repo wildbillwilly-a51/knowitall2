@@ -76,6 +76,13 @@ FACT_KINDS = frozenset({"fact", "procedure", "lesson"})
 # How the user wants things done, said in a chat: a note with this tag, weighed like any memory. Said in this many
 # chats, it is a lasting preference that briefings show (the user, 2026-10-11).
 PREFERENCE_TAG = "preference"
+# What the quick pass learned while its chat was still going on: shown at once, labelled, until the final pass
+# confirms, corrects, or retires it (the user, 2026-10-13).
+PROVISIONAL_TAG = "provisional"
+# The weaker side of a disagreement still being checked: shown with a warning and ranked lower, until it is
+# settled (by an agent's check, the user, or after a week by the evidence).
+DISPUTED_TAG = "disputed"
+RESERVED_TAGS = frozenset({PROVISIONAL_TAG, DISPUTED_TAG})
 LASTING_PREFERENCE_CHATS = 3
 BRIEFING_PREFERENCES = 10
 # The reason on the user's words said again, replaced by the memory that holds the preference (``Store.times_said``).
@@ -130,6 +137,9 @@ class RememberResult:
         if self.kept is not None and is_users_choice(self.kept):
             text += (f" [{self.kept.id}] is what the user wants, in their own words, so it was not replaced: both "
                      "are kept, and the user will be asked which is right.")
+        elif self.kept is not None and in_users_words(self.kept):
+            text += (f" [{self.kept.id}] is what the user decided or required, in their own words, so it was not "
+                     "replaced: both are kept until KnowItAll2 finds out which is right.")
         elif self.kept is not None and self.kept.verification == "user_stated":
             text += (f" [{self.kept.id}] is the user's own statement, and only something observed corrects it: "
                      "both are kept until KnowItAll2 finds out which is right.")
@@ -166,11 +176,21 @@ def utc_now() -> str:
 
 
 def is_users_choice(record: RecordRow) -> bool:
-    """Whether ``record`` is what the user wants, in their own words: a rule, a preference, or a decision.
+    """Whether ``record`` is the user's own choice, in their own words: one of their rules, or a note of how they
+    like to work (a preference).
 
-    Only the user's own words change those. What the user said is true about a system (a fact, a procedure,
-    a lesson) is evidence like any other: a newer observation may correct it (the user, 2026-10-11).
+    Only the user's own words change those, and only the user settles a conflict with them. What the user said
+    about how a project or system works (a decision, a requirement, a fact) is project information: trusted, but
+    not the user's personal choice, so an observation may question it (the user, 2026-10-13: "most of these are
+    simply project information").
     """
+
+    return record.verification == "user_stated" and record.kind in ("rule", "note")
+
+
+def in_users_words(record: RecordRow) -> bool:
+    """Whether ``record`` is something the user stated that is not a plain fact about a system: their rules and
+    preferences, and what they decided or required for a project. An agent does not retire it unasked."""
 
     return record.verification == "user_stated" and record.kind not in FACT_KINDS
 
@@ -300,6 +320,7 @@ class Memory:
         project: ProjectIdentity | None = None,
         recorded_at: str | None = None,
         detect_project: bool = True,
+        touch_existing: bool = True,
     ) -> RememberResult:
         """Save one memory. ``project`` and ``recorded_at`` let an import keep a
         memory's original project and date; ``detect_project`` off leaves the
@@ -308,6 +329,8 @@ class Memory:
         ``replaces`` supersedes that memory only when the new evidence is at
         least as strong, and the user's own statement only for the user's own
         words; otherwise both are kept and a question asks which is right.
+        ``touch_existing`` off leaves a memory already holding the same words as
+        it is, for a save that may still be taken back (the quick pass).
         """
 
         _require_choice(kind, KINDS, "kind")
@@ -329,7 +352,8 @@ class Memory:
                 "as separate arguments."
             )
         subject_list = _clean_labels(subjects, "subjects")
-        tag_list = _clean_labels(tags, "tags")
+        # "provisional" and "disputed" are set by the learner and the questions alone, never through remember.
+        tag_list = [tag for tag in _clean_labels(tags, "tags") if tag.casefold() not in RESERVED_TAGS]
         findings = find_secrets("\n".join([body, *subject_list, *tag_list]))
         if findings:
             kinds = ", ".join(sorted({finding.kind for finding in findings}))
@@ -360,6 +384,8 @@ class Memory:
         now = self._clock()
         with self.store.transaction():
             existing = self.store.find_active_duplicate(content_hash)
+            if existing is not None and not touch_existing:
+                return RememberResult("already_known", existing, None, None)
             if existing is not None:
                 stronger = max(existing.verification, verification, key=VERIFICATION_STRENGTH.__getitem__)
                 self.store.confirm(existing.id, verification=stronger, now=now)
@@ -491,6 +517,35 @@ class Memory:
         offers = self._task_lines(project_id=None, record_ids=found)
         return text + ("\n" + "\n".join(offers) if offers else "")
 
+    def nearest(
+        self, text: str, *, project_id: str | None, scope: str = "all", limit: int = 8,
+        exclude: Iterable[str] = (),
+    ) -> list[tuple[float, RecordRow]]:
+        """The active memories most like ``text``, best first, each with the share of ``text``'s keywords it holds
+        (rarer keywords count more, as in recall).
+
+        This is how a new memory meets the ones it may repeat: nine in ten repeats had the earlier copy among the
+        top five, where the newest memories of a project or the excerpt's own words found almost none
+        (2026-10-13).
+        """
+
+        terms = _query_terms(" ".join(_tokens(text)))
+        match = _fts_match(terms)
+        if match is None:
+            return []
+        weights, _unknown = self._term_weights(terms, project_id=project_id, scope=scope)
+        total = sum(weights.values()) or 1.0
+        skip = set(exclude)
+        found = []
+        for row, _rank in self.store.search(match, project_id=project_id, scope=scope, limit=max(20, limit * 3)):
+            if row.id in skip:
+                continue
+            tokens = _row_tokens(row)
+            share = sum(weight for term, weight in weights.items() if _covers(tokens, term)) / total
+            found.append((share, row))
+        found.sort(key=lambda item: item[0], reverse=True)
+        return found[:limit]
+
     def _term_weights(
         self, terms: list[_Term], *, project_id: str | None, scope: str,
     ) -> tuple[dict[_Term, float], list[str]]:
@@ -564,7 +619,7 @@ class Memory:
             raise MemoryInputError("forget needs the id of a memory, such as k-1a2b3c4d5e.")
         note = _clean_text(reason or "")[:200] or None
         stated = self.store.get(identifier)
-        if not by_user and stated is not None and stated.status == "active" and is_users_choice(stated):
+        if not by_user and stated is not None and stated.status == "active" and in_users_words(stated):
             return self._ask_before_forgetting(stated, note)
         if self.store.retire(identifier, reason=note, now=self._clock()):
             record = self.store.get(identifier)
@@ -882,7 +937,8 @@ class Memory:
                 if entry.record.id in known or entry.record.id in found:
                     continue
                 label = "rule" if entry.record.kind == "rule" else entry.group
-                found[entry.record.id] = (entry.record.created_at, f"{label}: {entry.headline}")
+                note = f" ({PROVISIONAL_LABEL})" if PROVISIONAL_TAG in entry.record.tags else ""
+                found[entry.record.id] = (entry.record.created_at, f"{label}: {entry.headline}{note}")
         ordered = sorted(found.items(), key=lambda item: item[1][0], reverse=True)
         return [(record_id, line) for record_id, (_, line) in ordered]
 
@@ -1342,7 +1398,22 @@ def _instruction_sections(project: ProjectIdentity | None) -> list[tuple[str, st
 
 def _briefing_provenance(row: RecordRow) -> str:
     date = (row.confirmed_at or row.created_at)[:10]
-    return f"stated by the user, {date}" if row.verification == "user_stated" else f"{row.verification}, {date}"
+    said = f"stated by the user, {date}" if row.verification == "user_stated" else f"{row.verification}, {date}"
+    return said + _provisional(row)
+
+
+# How a provisional memory is labelled wherever it is shown: about one in five was wrong or out of date by the end
+# of its chat in the replay (2026-10-13), so agents treat it as a lead until the final pass has reviewed it.
+PROVISIONAL_LABEL = "from a chat still in progress; may change"
+
+
+DISPUTED_LABEL = "another memory disagrees; being checked"
+
+
+def _provisional(row: RecordRow) -> str:
+    labels = [label for tag, label in ((PROVISIONAL_TAG, PROVISIONAL_LABEL), (DISPUTED_TAG, DISPUTED_LABEL))
+              if tag in row.tags]
+    return "".join(f"; {label}" for label in labels)
 
 
 def _require_choice(value: object, choices: tuple[str, ...], name: str) -> None:
@@ -1391,7 +1462,13 @@ def _score(row: RecordRow, rank: float, project_id: str | None, now: datetime | 
     if row.kind == "rule":
         score *= 1.2
     score *= _VERIFICATION_BOOST[VERIFICATION_STRENGTH[row.verification]]
+    if DISPUTED_TAG in row.tags:
+        score *= DISPUTED_WEIGHT
     return score * (_freshness(row, now) if now is not None else 1.0)
+
+
+# How much less a disputed memory counts in recall's order.
+DISPUTED_WEIGHT = 0.8
 
 
 def _freshness(row: RecordRow, now: datetime) -> float:
@@ -1429,8 +1506,8 @@ def _provenance(row: RecordRow) -> str:
     if row.source_session:
         via += f" from session {row.source_session[:8]}"
     if row.verification == "user_stated":
-        return f"stated by the user{via}, {date}"
-    return f"{row.verification}{via}, {date}"
+        return f"stated by the user{via}, {date}{_provisional(row)}"
+    return f"{row.verification}{via}, {date}{_provisional(row)}"
 
 
 def _format_recall(

@@ -346,7 +346,7 @@ def learning_settings(query, body, match) -> dict[str, Any]:
 
     settings = load_settings()
     before = asdict(settings)
-    for name, low, high in (("max_calls_per_run", 1, 50), ("max_calls_per_day", 1, 500), ("idle_minutes", 5, 240)):
+    for name, low, high in (("max_calls_per_run", 1, 50), ("max_calls_per_day", 1, 500), ("settle_minutes", 15, 480)):
         if name in body:
             value = body[name]
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
@@ -377,7 +377,7 @@ def learning_settings(query, body, match) -> dict[str, Any]:
         if model:
             settings.model = model
         save_settings(settings)
-    changed = [name.replace("_", " ") for name in ("max_calls_per_run", "max_calls_per_day", "idle_minutes")
+    changed = [name.replace("_", " ") for name in ("max_calls_per_run", "max_calls_per_day", "settle_minutes")
                if before[name] != getattr(settings, name)]
     if changed:
         journal.record_standalone(

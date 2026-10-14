@@ -40,7 +40,9 @@ class LearnerSettings:
     model: str = CLAUDE_MODEL
     max_calls_per_run: int = 10
     max_calls_per_day: int = 60
-    idle_minutes: int = 20
+    # How long a chat stays quiet before its final pass, when a stretch has settled (90 minutes lost none of the
+    # moments another chat needed what the quick pass had learned, 2026-10-13).
+    settle_minutes: int = 90
     # Background upkeep's own calls a day, apart from the daily limit, which learning from the user's work can use
     # up: maintenance made no call for 13 days while it did (2026-10-11).
     maintenance_calls_per_day: int = 8
@@ -48,9 +50,11 @@ class LearnerSettings:
     command_calls_per_day: int = 2
 
 
-# Where a model call came from. Background upkeep counts against its own daily allowance, everything else toward
-# the daily limit: learning from the user's work and its filing ("work"), background learning ("learning"), and
-# what the user started ("user").
+# Where a model call came from: learning from the user's work and its filing ("work"), background learning, the
+# final pass of settled chats ("learning"), what the user started ("user"), and background upkeep. Each kind of
+# background work has its own daily allowance, which no other can use up: the daily limit is background
+# learning's, and work and the user's own calls wait for none (the user, 2026-09-30; upkeep made no call for 13
+# days while work used the limit, and background learning none on busy days, 2026-10-13).
 UPKEEP_ORIGINS = ("maintenance", "catalog", "commands")
 
 
@@ -89,6 +93,10 @@ def load_settings() -> LearnerSettings:
                 isinstance(value, bool) or not isinstance(value, int) or value < 0):
             continue
         chosen[item.name] = value
+    old_wait = learning.get("idle_minutes")
+    if "settle_minutes" not in chosen and isinstance(old_wait, int) and not isinstance(old_wait, bool):
+        # Before 0.11 the wait was ``idle_minutes``: a longer wait the user chose is kept (candidate review, C-L6).
+        chosen["settle_minutes"] = max(old_wait, defaults.settle_minutes)
     return LearnerSettings(**chosen)
 
 
@@ -150,7 +158,9 @@ class LearnerState:
         """
 
         count = 0
-        for call in [*self.calls, *other_calls(self.path.parent)]:
+        # Calls the user started (kept apart, and written before 0.11 without an origin) are the user's.
+        started = [{**call, "origin": "user"} for call in other_calls(self.path.parent) if isinstance(call, dict)]
+        for call in [*self.calls, *started]:
             if origins is not None and call_origin(call) not in origins:
                 continue
             try:
@@ -161,9 +171,9 @@ class LearnerState:
         return count
 
     def limited_calls_since(self, moment: datetime) -> int:
-        """The calls since ``moment`` that count toward the daily limit: all but background upkeep's."""
+        """The calls since ``moment`` that count toward the daily limit: background learning's."""
 
-        return self.calls_since(moment) - self.calls_since(moment, origins=UPKEEP_ORIGINS)
+        return self.calls_since(moment, origins=("learning",))
 
     def save(self) -> None:
         # A log deleted long ago (an agent's old sessions cleaned up) needs no entry: the file stays small.
@@ -190,7 +200,7 @@ def record_other_call(what: str, *, at: datetime | None = None, folder: Path | N
     path.parent.mkdir(parents=True, exist_ok=True)
     # Appended, so two calls finishing together both count; trimmed now and then, which drops only old lines.
     with open(path, "a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps({"at": moment, "session": what, "outcome": "ok"}) + "\n")
+        handle.write(json.dumps({"at": moment, "session": what, "outcome": "ok", "origin": "user"}) + "\n")
     calls = other_calls(path.parent)
     if len(calls) > 2 * OTHER_CALLS_KEPT:
         write_text_atomic(path, "\n".join(json.dumps(call) for call in calls[-OTHER_CALLS_KEPT:]) + "\n")

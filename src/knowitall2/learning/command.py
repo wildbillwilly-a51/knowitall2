@@ -9,7 +9,7 @@ import sys
 import time
 import uuid
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +34,8 @@ from .command_tags import BATCH as COMMAND_BATCH, TagReport, tag_commands
 from .command_tags import waiting as command_waiting
 from .cataloguer import plan as catalog_plan
 from .learner import LEARNER_AGENT, SET_ASIDE_DAYS, LearnReport, learn
-from .maintenance import MAINTENANCE_AGENT, EngineReviewer, MaintenanceReport, maintain
+from .maintenance import MAINTENANCE_AGENT, EngineReviewer, MaintenanceReport, maintain, retire_old_status
+from .settle import confirm_stale
 from .state import (
     CLAUDE_MODEL, FORMER_CLAUDE_MODELS, LearnerSettings, LearnerState, LockBusy, RunLock, day_ago, learner_lock,
     load_settings, save_settings, upkeep_allowance,
@@ -70,6 +71,7 @@ def run_learn(arguments: argparse.Namespace) -> int:
         print(report.describe(dry_run=True))
         return 0
     if not settings.enabled:
+        let_provisional_stand()
         print(
             "Learning is off. Review what it would send with `knowitall2 learn --dry-run` and "
             "`knowitall2 learn --show <session>`, then turn it on with `knowitall2 learn --enable`."
@@ -150,6 +152,9 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         print(report.describe(dry_run=False))
         if report.calls or report.blocked:
             moments.add_news(news_entry(report, settings, reason="catch-up", run=run, requests=[]))
+        # What the quick pass saved from a chat that will not be settled (learning was off, the log is gone).
+        confirm_stale(Memory(store, agent=LEARNER_AGENT, record_events=False), now=datetime.now(timezone.utc))
+        retire_old_status(Memory(store, agent=MAINTENANCE_AGENT))
         upkeep = filing = None
         if not report.blocked:
             share_quietly(store)
@@ -183,6 +188,26 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         journal.prune(store)
         moments.prune_shown()
         share_quietly(store)
+    finally:
+        store.close()
+
+
+def let_provisional_stand() -> None:
+    """With learning off no final pass will come: what the quick pass saved stands as it is (candidate review,
+    C-M6). Never in the way of what called it."""
+
+    from .settle import PROVISIONAL_DAYS
+
+    try:
+        store = Store.open(database_path())
+    except (StoreError, sqlite3.Error, OSError):
+        return
+    try:
+        far_ahead = datetime.now(timezone.utc) + timedelta(days=PROVISIONAL_DAYS + 1)
+        # Only this computer's: another computer settles its own chats (second candidate review, D-L4).
+        confirm_stale(Memory(store, agent=LEARNER_AGENT, record_events=False), now=far_ahead, mine_only=True)
+    except (StoreError, sqlite3.Error, OSError) as exc:
+        journal.problem("learning", f"provisional memories were not let stand: {exc}")
     finally:
         store.close()
 
@@ -269,12 +294,15 @@ def learn_requests(store, state: LearnerState, settings: LearnerSettings, extrac
         limits = work_limits(settings)
         run = new_run_id()
         started = time.monotonic()
+        # At a session's end its last stretch has settled: the final pass, right away. Otherwise (a commit, an agent
+        # or the user asking) the chat goes on: the quick pass.
+        quick = not any(item.get("reason") == "session end" for item in group)
         moments.set_now({"since": moments.now_iso(), "doing": "learning from a session", "reason": chosen["reason"],
                          "detail": detail, "folder": chosen.get("cwd") or "", "agent": chosen.get("agent") or ""})
         report = learn(
             logs=[Path(chosen["transcript"])], state=state, settings=limits,
             memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
-            extractor=extractor, dry_run=False, run=run, right_away=True,
+            extractor=extractor, dry_run=False, run=run, right_away=True, quick=quick,
         )
         print(report.describe(dry_run=False))
         entry = moments.add_news(news_entry(report, settings, reason=chosen["reason"], detail=detail, run=run,
@@ -598,6 +626,7 @@ def configure_learning(
         settings.enabled = False
         save_settings(settings)
         journal.record_standalone("settings", "Learning turned off", outcome="learning off", agent=agent)
+        let_provisional_stand()
         return None
     chosen = backend or settings.backend
     if not backend and _engine_path(chosen) is None:
