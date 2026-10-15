@@ -178,6 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="note which command each lesson is about, so an agent sees it when that command fails; "
              "at most CALLS model calls (default 40), each for 50 memories",
     )
+    cataloguing.add_argument(
+        "--rules", type=int, nargs="?", const=20, metavar="CALLS",
+        help="write a tool rule for each quirk lessons from several chats share, so an agent gets it after the "
+             "commands it is about; at most CALLS model calls (default 20), each for six groups of lessons",
+    )
 
     finding = commands.add_parser(
         "find-out", help="have an agent look up a system's missing parts in its project folder now (read-only)",

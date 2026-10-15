@@ -448,11 +448,12 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
             [hook] = data["hooks"][event][0]["hooks"]
             self.assertIn(f"p={str(hook_launcher_path())!r}; sys.argv=[p, {word!r}]", hook["args"][3])
         self.assertEqual(guard, data["hooks"]["PreToolUse"])
-        # After a shell command fails: what is known about that command.
-        failed = data["hooks"]["PostToolUseFailure"][0]
-        self.assertEqual("Bash|PowerShell", failed["matcher"])
-        self.assertIn("sys.argv=[p, 'command']", failed["hooks"][0]["args"][3])
-        self.assertEqual(5, failed["hooks"][0]["timeout"])
+        # After every shell command, succeeded (PostToolUse) or failed: the tool rules it calls for (0.11.1).
+        for event in ("PostToolUse", "PostToolUseFailure"):
+            [after] = data["hooks"][event]
+            self.assertEqual("Bash|PowerShell", after["matcher"])
+            self.assertIn("sys.argv=[p, 'command']", after["hooks"][0]["args"][3])
+            self.assertEqual(5, after["hooks"][0]["timeout"])
         self.assertTrue(data["switchModelsOnFlag"])
         self.assertIn(repr("C:\\src dir"), hook_launcher_path().read_text(encoding="utf-8"))
         self.adapter.uninstall()
@@ -480,6 +481,13 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
                 with self.subTest(event=event):
                     done = run(event)
                     self.assertEqual((0, b"", b""), (done.returncode, done.stdout, done.stderr))
+            # Damaged from outside (a disk fault, an antivirus): still exit 0, quietly (review b, F-L1).
+            for damaged in (b"import os\nif True\n", bytes(range(256))):
+                hook_launcher_path().write_bytes(damaged)
+                for event in claude_code.HOOK_EVENTS:
+                    with self.subTest(event=event, damaged=damaged[:10]):
+                        done = run(event)
+                        self.assertEqual((0, b""), (done.returncode, done.stdout))
 
     def test_hooks_registered_the_earlier_way_are_recognized_and_registered_again(self) -> None:
         # Up to 0.10.5 the launcher itself was Python's script, which a missing launcher made exit 2.
@@ -511,6 +519,42 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
         self.assertTrue(hook_check().ok, hook_check().detail)
         self.adapter.uninstall()
         self.assertEqual({"hooks": {"Stop": [{"hooks": [other]}]}}, json.loads(self.settings.read_text(encoding="utf-8")))
+
+    def test_hooks_run_through_runpy_as_in_0_11_0_are_replaced_and_the_hook_modules_compiled(self) -> None:
+        # Review 2026-10-14, E-L1: runpy loads pkgutil and typing, 24 ms of every shell command; and with -B no
+        # hook ever wrote the bytecode it could have read.
+        launcher = str(hook_launcher_path())
+        earlier = ("import os,runpy,sys; p={path!r}; sys.argv=[p{arguments}]; os.path.isfile(p) and "
+                   "runpy.run_path(p, run_name='__main__')")
+        hooks = {event: [{"matcher": claude_code._EVENT_MATCHERS.get(event, ""), "hooks": [
+            {"type": "command", "command": LAUNCH.command, "timeout": 5, "args": ["-B", "-P", "-c", earlier.format(
+                path=launcher, arguments="".join(f", {word!r}" for word in claude_code._EVENT_ARGUMENTS[event]))]}]}]
+                 for event in claude_code.HOOK_EVENTS}
+        self.settings.write_text(json.dumps({"hooks": hooks}, indent=2) + "\n", encoding="utf-8")
+        import knowitall2
+
+        with mock.patch("compileall.compile_dir") as compiled:
+            self.adapter.setup(LAUNCH)
+        # The whole package: the message and session hooks load most of it (review b, F-L2).
+        self.assertEqual(Path(knowitall2.__file__).parent, Path(compiled.call_args.args[0]))
+        registered = json.loads(self.settings.read_text(encoding="utf-8"))["hooks"]
+        for event in claude_code.HOOK_EVENTS:
+            [hook] = [hook for group in registered[event] for hook in group["hooks"]]
+            self.assertEqual(claude_code.hook_entry(LAUNCH, event), hook)
+            self.assertNotIn("runpy", hook["args"][3])
+
+    def test_an_installation_without_the_after_command_hook_is_told_to_run_setup(self) -> None:
+        # Installed before 0.11.1, the hook ran only after a failed command.
+        self.adapter.setup(LAUNCH)
+        data = json.loads(self.settings.read_text(encoding="utf-8"))
+        del data["hooks"]["PostToolUse"]
+        self.settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        hook = next(check for check in self.adapter.checks(LAUNCH) if check.name == "Claude Code session hook")
+        self.assertEqual((False, "the after-command hook is not installed"), (hook.ok, hook.detail))
+        self.assertIn("knowitall2 setup claude-code", hook.fix)
+        self.adapter.setup(LAUNCH)
+        hook = next(check for check in self.adapter.checks(LAUNCH) if check.name == "Claude Code session hook")
+        self.assertTrue(hook.ok, hook.detail)
 
     def test_a_removed_hook_is_detected(self) -> None:
         self.adapter.setup(LAUNCH)

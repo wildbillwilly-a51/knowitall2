@@ -186,6 +186,26 @@ class GateTests(MaintenanceTestCase):
         self.assertEqual("active", self.status(other.id))
         self.assertIn("combined into", self.store.get(second.id).retired_reason)
 
+    def test_the_review_steers_near_repeats_that_each_hold_a_detail_to_combine(self) -> None:
+        # The first live catch-up (2026-10-14): 303 duplicate findings were refused as "not the same statement",
+        # because each copy held a detail; only 45 were combined.
+        prompt = " ".join(REVIEW_PROMPT.split())
+        self.assertIn('Before you report a "duplicate", check each copy against the one you keep', prompt)
+        self.assertIn('report "combine" instead, never "duplicate"', prompt)
+        self.assertIn("A duplicate whose copy holds such a detail is refused and changes nothing", prompt)
+
+    def test_a_duplicate_refused_because_the_copies_differ_asks_nothing_and_is_counted(self) -> None:
+        first = self.save("The NAS nas01 shares media over SMB.")
+        second = self.save("nas01 exports /volume1/media read-only.")
+        self.save("The router is rtr01.")
+        reviewer = FakeReviewer([[{"kind": "duplicate", "keep_id": first.id, "ids": [second.id], "reason": "NAS."}]])
+        report = self.run_maintenance(reviewer)
+        self.assertEqual((1, 1), (report.calls, report.near_repeats))
+        self.assertEqual(("active", "active"), (self.status(first.id), self.status(second.id)))
+        self.assertEqual([], self.store.open_questions(limit=5))
+        self.assertIn("Near-repeats found as duplicates but each holding a detail, left for combining: 1.",
+                      report.describe(dry_run=False))
+
     def test_a_combination_that_loses_a_detail_or_mixes_evidence_is_refused(self) -> None:
         first = self.save("The NAS nas01 shares media over SMB.")
         second = self.save("nas01 exports /volume1/media read-only.")
@@ -490,6 +510,34 @@ class ScheduleTests(MaintenanceTestCase):
         due = [group for group, status in plan(self.memory) if status == "review"]
         self.assertEqual([[changed.record.id]], [[record.id for record in group.members if record.id == changed.record.id]
                                                  for group in due])
+
+    def test_a_combined_memory_counts_as_reviewed_so_its_group_is_not_due_again(self) -> None:
+        # After the first live catch-up (2026-10-14), 22 groups were due again at once: each held a combined
+        # memory, new and so never reviewed, although it was made from memories reviewed in that same call.
+        first = self.save("The NAS nas01 shares media over SMB.", subjects=["NAS"])
+        second = self.save("nas01 exports /volume1/media read-only.", subjects=["nas01"])
+        self.save("The router is rtr01.")
+        whole = "The NAS nas01 shares media over SMB, exporting /volume1/media read-only."
+        self.run_maintenance(FakeReviewer([[{"kind": "combine", "keep_id": "", "ids": [first.id, second.id],
+                                             "text": whole, "reason": "Same share."}]]))
+        self.assertEqual("superseded", self.status(first.id))
+        self.clock.value = "2026-09-28T12:00:00Z"
+        self.assertEqual(["unchanged"], [status for _, status in plan(self.memory)])
+
+    def test_the_keeper_of_a_merge_or_a_replacement_is_not_due_again(self) -> None:
+        # The keepers were in the group the call reviewed, unchanged, so they were reviewed with it.
+        full = self.save("The NAS is nas01 at 10.0.0.5, reached over SSH.", source="observed")
+        short = self.save("The NAS is nas01 at 10.0.0.5 and is reached over SSH.")
+        old = self.save("The wiki is at wiki-old.example.test.")
+        self.clock.value = "2026-09-27T13:00:00Z"
+        new = self.save("The wiki is at wiki.example.test.", source="observed")
+        self.run_maintenance(FakeReviewer([[
+            {"kind": "duplicate", "keep_id": full.id, "ids": [short.id], "reason": "Same NAS."},
+            {"kind": "outdated", "keep_id": new.id, "ids": [old.id], "reason": "Moved."},
+        ]]))
+        self.assertEqual(("superseded", "superseded"), (self.status(short.id), self.status(old.id)))
+        self.clock.value = "2026-09-28T12:00:00Z"
+        self.assertEqual(["unchanged"], [status for _, status in plan(self.memory)])
 
     def test_a_slow_sweep_looks_at_each_group_again_after_a_month(self) -> None:
         from knowitall2.learning.maintenance import SWEEP_DAYS

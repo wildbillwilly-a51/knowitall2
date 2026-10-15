@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.11.1 (2026-10-15)
+
+Getting what KnowItAll2 knows to agents at the moment it helps, from the
+research of 2026-10-13 and your decisions that day.
+
+- **Tool rules, before the mistake.** A tool quirk learned in two chats
+  becomes one rule: the shell and program, the command pattern (such as a
+  heredoc holding a backslash), the error text it explains, and what to do.
+  After any shell command a rule fits, Claude Code is given it once a chat,
+  even when the command did not fail; the briefing lists three. Replayed on
+  31 real chats, rules reach 16 of 33 quirks agents met, 14 before the
+  first try, against 3 after the failure before. Only KnowItAll2 writes
+  rules, from lessons learned and checked in two chats, and a rule goes
+  when those lessons do.
+- **Faster hooks.** The hook after a shell command takes about 0.10 s,
+  faster than 0.11.0's after a failed one. Restart Claude Code after
+  updating, so it runs the new hooks.
+- **Fewer, better pointers.** Branch names, addresses, KnowItAll2's own
+  news, and the agent's own tools no longer set off a pointer, nor do names
+  too general to mean one system. On 22 real chats: 120 pointers instead of
+  178, a third of the noise, and most of the useful ones kept.
+- **A project's knowledge folder holds what it uses.** Also the systems its
+  documents and scripts name, the hosts its chats reach, and a file a chat
+  named that the folder lacked.
+- **"New since" is short and relevant.** At most three items, about the
+  project or the systems the chat touched, and never what the chat itself
+  taught; what a chat taught is told to it once, marked as not yet checked.
+- **Tidying combines more.** Near-repeats that each hold a detail are
+  combined rather than refused as duplicates, and a combined memory is not
+  reviewed again at once.
+- **Agents' instructions fit.** They are shorter, so Claude Code no longer
+  cuts off their end.
+- **News once a chat.** In the Claude desktop app, agents pass on what
+  KnowItAll2 learned once a chat (your choice, 2026-10-14); later news stays
+  in the app's notice, and news that needs you is always passed on.
+
 ## 0.11.0 (2026-10-14)
 
 From a review of how KnowItAll2 works in real use, research into why it learns

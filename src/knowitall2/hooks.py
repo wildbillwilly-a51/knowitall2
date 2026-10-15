@@ -10,9 +10,11 @@
   from the rest of the session.
 - ``prompt-submit`` (both agents) runs when the user sends a message. It gives
   the agent what is new to the chat since its briefing (``chats``): memories
-  learned since, and a project's table of contents when the chat starts
-  working in another project. Where the app does not show hook messages, it
-  also passes news of learning to the agent.
+  learned since in other chats, about its projects or the systems it
+  touched; once, what was learned from the chat itself, not yet checked; and
+  a project's table of contents when the chat starts working in another
+  project. Where the app does not show hook messages, it also passes news of
+  learning to the agent, to tell the user once a chat.
 
 Learning itself always runs in a separate, detached process, so an agent
 never waits for it. News goes to the user as ``systemMessage``, which the
@@ -41,8 +43,8 @@ from .learning.state import LearnerState, RunLock, load_settings
 from .paths import HOME_ENVIRONMENT_VARIABLE, data_home, database_path
 
 HOOK_AGENTS = ("claude-code", "codex")
-# While ``main`` runs a hook: news to mark as shown once its output is really written.
-_deferred: list[tuple[list[dict[str, Any]], str | None, str | None]] | None = None
+# While ``main`` runs a hook: what to note (news shown, news passed on) once its output is really written.
+_deferred: list[Callable[[], None]] | None = None
 HOOK_EVENTS = ("session-start", "stop", "session-end", "prompt-submit")
 _ENTRYPOINT = re.compile(rb'"entrypoint"\s*:\s*"([^"]+)"')
 # Hosts that show hook messages only where the user easily misses them (collapsed).
@@ -54,6 +56,11 @@ RELAY = (
 )
 BACKGROUND = "KnowItAll2 background for you (no need to mention it to the user):"
 NEW_HEADER = "New in KnowItAll2 since this chat started (recall with a few of these words for the details):"
+OWN_HEADER = ("What KnowItAll2 learned from this chat so far, from your own work here (no need to recall it). It is "
+              "checked once the chat has been quiet for a while; if one is wrong, correct it with remember or "
+              "forget it:")
+OWN_LATER = ("KnowItAll2 also learned from this chat since, not yet checked (correct a wrong one with remember or "
+             "forget):")
 CATCH_UP_HEADER = ("KnowItAll2's table of contents for project {name}, which this chat's briefing did not have "
                    "(recall with a few of these words for the details):")
 SPAWN_INTERVAL_SECONDS = 30 * 60
@@ -87,11 +94,11 @@ def main(argv: Sequence[str] | None = None, *, stdin: str | None = None) -> int:
             except (OSError, ValueError, UnicodeError) as exc:
                 journal.problem(source, f"its output could not be written: {exc}")
                 return 0  # the news was not delivered, so it stays unshown
-        try:
-            for items, transcript, session_id in _deferred:
-                moments.mark_shown(items, transcript=transcript, session_id=session_id)
-        except Exception as exc:
-            journal.problem(source, f"the news it showed could not be marked as shown: {exc}")
+        for note in _deferred:
+            try:
+                note()
+            except Exception as exc:
+                journal.problem(source, f"the news it showed could not be marked as shown: {exc}")
     finally:
         _deferred = None
         try:
@@ -136,10 +143,14 @@ def session_start(
     message = ""
     try:
         if load_settings().enabled:
-            message = _news_message(payload, agent)
-            if message and not shows_hook_messages(payload, agent):
-                context = "\n\n".join(part for part in (context, f"{RELAY}\n\n{message}") if part)
-                message = ""
+            news = _news_items(payload, agent)
+            if news and not shows_hook_messages(payload, agent):
+                relay, notice = _passed_on(payload, agent, news)
+                if relay:
+                    context = "\n\n".join(part for part in (context, RELAY + "\n\n" + "\n\n".join(relay)) if part)
+                message = "\n\n".join(notice)
+            else:
+                message = "\n\n".join(text for _, text in news)
     except Exception as exc:
         journal.problem(f"session start ({agent})", f"learning news could not be shown: {exc}")
     try:
@@ -253,22 +264,25 @@ def prompt_submit(stdin_text: str, *, agent: str = "claude-code") -> str:
             blocks.append(f"{BACKGROUND}\n\n{background}")
     except Exception as exc:
         journal.problem(f"message hook ({agent})", f"what is new could not be added: {exc}")
+    notice: list[str] = []
     if load_settings().enabled and not shows_hook_messages(payload, agent, transcript=transcript):
-        parts = []
+        news: list[tuple[str, str]] = []
         now = moments.read_now()
         cwd = _text(payload, "cwd")
         if now and now.get("folder") and cwd and _same_place(str(now["folder"]), cwd) and moments.first_mention(
                 f"now-{now.get('since')}", transcript=transcript, session_id=_text(payload, "session_id")):
-            parts.append(moments.started_message(str(now.get("reason") or "asked"), str(now.get("detail") or "")))
-        news = _news_message(payload, agent, transcript=transcript)
-        if news:
-            parts.append(news)
-        if parts:
-            blocks.append(RELAY + "\n\n" + "\n\n".join(parts))
-    if not blocks:
-        return ""
-    context = "\n\n".join(blocks)
-    return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}})
+            news.append((STARTED, moments.started_message(str(now.get("reason") or "asked"),
+                                                          str(now.get("detail") or ""))))
+        news += _news_items(payload, agent, transcript=transcript)
+        relay, notice = _passed_on(payload, agent, news, transcript=transcript)
+        if relay:
+            blocks.append(RELAY + "\n\n" + "\n\n".join(relay))
+    output: dict[str, Any] = {}
+    if notice:
+        output["systemMessage"] = "\n\n".join(notice)
+    if blocks:
+        output["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": "\n\n".join(blocks)}
+    return json.dumps(output) if output else ""
 
 
 def _start_chat(payload: dict[str, Any], agent: str, *, since: str, project_id: str | None, briefing: str) -> None:
@@ -277,15 +291,19 @@ def _start_chat(payload: dict[str, Any], agent: str, *, since: str, project_id: 
     chat = chats.chat_key(_text(payload, "session_id"), _transcript(payload, agent))
     if chat is not None:
         chats.start(chat, since=since, project_id=project_id, told=chats.RECORD_ID.findall(briefing),
-                    transcript=_transcript(payload, agent))
+                    transcript=_transcript(payload, agent), session_id=_text(payload, "session_id"))
         chats.prune()
 
 
-def _pointers(payload: dict[str, Any], store: Any, said: Sequence[str], state: dict[str, Any]) -> list[tuple[str, str]]:
+def _pointers(payload: dict[str, Any], store: Any, said: Sequence[str], state: dict[str, Any],
+              commands: Sequence[str] = ()) -> list[tuple[str, str]]:
     """Which knowledge files the user's message or the agent's own words since the last message name.
 
     Not the agent's tool calls: their logins, paths, and long commands named many systems the work did
-    not need, and agents learned to skip the pointers (2026-10-05: 8 of 45 opened).
+    not need, and agents learned to skip the pointers (2026-10-05: 8 of 45 opened). The systems its shell
+    ``commands`` reach are noted for the folder's next refresh instead. What arrives as a message is read
+    by who wrote it (``known.message_parts``): a subagent's result counts as the agent's words, a monitor's
+    event as nobody's.
 
     Never raises: a pointer is a help, and a failure must not cost the chat what else this hook adds.
     """
@@ -300,8 +318,9 @@ def _pointers(payload: dict[str, Any], store: Any, said: Sequence[str], state: d
         root = find_git_root(Path(cwd))
         if root is None:
             return []
-        return known.find_pointers(store._connection, [_text(payload, "prompt") or ""], root / known.FOLDER,
-                                   state.get("pointed", []), own_words=said)
+        users, agents = known.message_parts(_text(payload, "prompt"))
+        return known.find_pointers(store._connection, users, root / known.FOLDER, state.get("pointed", []),
+                                   own_words=[*said, *agents], commands=commands)
     except Exception as exc:
         journal.problem("message hook", f"knowledge-file pointers could not be found: {type(exc).__name__}: {exc}")
         return []
@@ -330,8 +349,11 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
             project = identify(Path(cwd)) if cwd else None
             state = {"since": memory.now(), "projects": [], "told": [], "log": transcript,
                      "offset": max(0, chats.log_size(transcript) - chats.CATCH_UP_READ)}
+            if _text(payload, "session_id"):
+                state["session"] = _text(payload, "session_id")
             said: list[str] = []
-            inputs, mentioned = chats.read_new(state, transcript, said=said)
+            commands: list[str] = []
+            inputs, mentioned = chats.read_new(state, transcript, said=said, commands=commands)
             state["told"] = sorted(mentioned)
             if project is not None:
                 state["projects"].append(project.id)
@@ -340,10 +362,10 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
                     parts.append(contents)
                     state["told"] += chats.RECORD_ID.findall(contents)
         else:
-            said = []
-            inputs, mentioned = chats.read_new(state, transcript, said=said)
+            said, commands = [], []
+            inputs, mentioned = chats.read_new(state, transcript, said=said, commands=commands)
             state["told"] = [*state.get("told", []), *sorted(mentioned)]
-        pointers = _pointers(payload, store, said, state)
+        pointers = _pointers(payload, store, said, state, commands)
         if pointers:
             parts.append("\n".join(line for _, line in pointers))
             state["pointed"] = [*state.get("pointed", []), *(target for target, _ in pointers)]
@@ -360,17 +382,48 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
             if contents:
                 parts.append(contents)
                 state["told"] += chats.RECORD_ID.findall(contents)
-        new = memory.added_since(state["projects"], state["since"], known=state["told"])
+        from .known import message_parts
+
+        users, _ = message_parts(_text(payload, "prompt"))
+        state["touched"] = _touched(store, state, [*commands, *users])
+        sessions = chats.own_sessions(state, session_id=_text(payload, "session_id"), transcript=transcript)
+        # What was learned from the chat, each item once: the first batch in a block (again after a compaction,
+        # ``chats.start``, which may have taken the chat's early findings out of its context), later ones in a
+        # short line (candidate review 2026-10-14, E-L6: lessons from later commits were never told).
+        own = memory.learned_in(sessions, known=state["told"],
+                                limit=chats.OWN_LATER_SHOWN if state.get("own_told") else chats.OWN_SHOWN)
+        if own:
+            if state.get("own_told"):
+                parts.append(f"{OWN_LATER} " + "; ".join(line for _, line in own) + ".")
+            else:
+                parts.append("\n".join([OWN_HEADER, *(f"- {line}" for _, line in own)]))
+            state["told"] += [record_id for record_id, _ in own]
+            state["own_told"] = True
+        new = memory.added_since(state["projects"], state["since"], known=state["told"], sessions=sessions,
+                                 touched=state["touched"])
         if new:
-            lines = [NEW_HEADER, *(f"- {line}" for _, line in new[:chats.NEW_SHOWN])]
-            if len(new) > chats.NEW_SHOWN:
-                lines.append(f"(+{len(new) - chats.NEW_SHOWN} more; use recall to search.)")
-            parts.append("\n".join(lines))
-            state["told"] += [record_id for record_id, _ in new]
+            parts.append("\n".join([NEW_HEADER, *(f"- {line}" for _, line in new[:chats.NEW_SHOWN])]))
+            state["told"] += [record_id for record_id, _ in new]  # all of them: the rest is not advertised
     finally:
         store.close()
     chats.save(chat, state)
     return "\n\n".join(parts)
+
+
+def _touched(store: Any, state: dict[str, Any], texts: Sequence[str]) -> list[str]:
+    """The systems the chat has touched: those it had, and those these commands or the user's words name.
+
+    Commands and the user's words, as in the 2026-10-13 replay; not the agent's own prose, which names systems
+    in passing (35% of the pointers it set off named a system the work never touched).
+    """
+
+    from . import chats
+    from .known import system_table
+
+    earlier = [item for item in state.get("touched") or [] if isinstance(item, str)]
+    if not any(texts):
+        return earlier
+    return list(dict.fromkeys([*earlier, *chats.touched(texts, system_table(store._connection))]))
 
 
 def tool_news(memory: Any, *, cwd: str | os.PathLike[str], agent: str | None, shown: Sequence[str] = (),
@@ -403,12 +456,13 @@ def tool_news(memory: Any, *, cwd: str | os.PathLike[str], agent: str | None, sh
         return ""
     transcript = state.get("log") if isinstance(state.get("log"), str) else None
     told = [*(state.get("told") or []), *shown]  # what this answer shows, such as the chat's own save, is seen
-    new = memory.added_since(projects, since, known={*told, *chats.mentioned_since(state, transcript)})
+    commands, mentioned = chats.seen_since(state, transcript)
+    # What the agent's commands touched since the user's message counts now; the message hook keeps it later.
+    new = memory.added_since(projects, since, known={*told, *mentioned}, touched=_touched(memory.store, state, commands),
+                             sessions=chats.own_sessions(state, session_id=session_id, transcript=transcript))
     lines = []
     if new:
         lines = [NEW_HEADER, *(f"- {line}" for _, line in new[:chats.NEW_SHOWN])]
-        if len(new) > chats.NEW_SHOWN:
-            lines.append(f"(+{len(new) - chats.NEW_SHOWN} more; use recall to search.)")
         told += [record_id for record_id, _ in new]
     if len(told) != len(state.get("told") or []):
         state["told"] = told
@@ -521,18 +575,61 @@ def maybe_start_learner(
 
 
 def _news_message(payload: dict[str, Any], agent: str, *, transcript: str | None = None) -> str:
+    return "\n\n".join(text for _, text in _news_items(payload, agent, transcript=transcript))
+
+
+def _news_items(payload: dict[str, Any], agent: str, *, transcript: str | None = None) -> list[tuple[str, str]]:
+    """News of learning this session has not shown, as (status, what the user reads); marked as shown once the
+    hook's output is written."""
+
     transcript = transcript or _transcript(payload, agent)
     session_id, cwd = _text(payload, "session_id"), _text(payload, "cwd")
     items = moments.news_to_show(transcript=transcript, session_id=session_id, cwd=cwd)
     if not items:
-        return ""
+        return []
     mine = set(moments.session_keys(transcript, session_id))
-    text = "\n\n".join(moments.describe(item, here=bool(mine & set(item.get("sessions") or []))) for item in items)
+    texts = [(str(item.get("status") or "done"),
+              moments.describe(item, here=bool(mine & set(item.get("sessions") or [])))) for item in items]
+    _after_output(lambda: moments.mark_shown(items, transcript=transcript, session_id=session_id))
+    return texts
+
+
+# News that waits for the user is passed on every time: the daily limit used up, or the model not available.
+_NEEDS_THE_USER = ("limit", "stopped")
+STARTED = "started"
+
+
+def _passed_on(payload: dict[str, Any], agent: str, news: list[tuple[str, str]], *,
+               transcript: str | None = None) -> tuple[list[str], list[str]]:
+    """For an app that does not show hook messages: which news the agent passes on to the user, and which is
+    shown only in the app's own notice.
+
+    The agent passed on "KnowItAll2 learned N things" after every commit, opening most of its replies with it
+    (2026-10-12 review: 42 of 58 times), and each relay could set off a pointer. So a chat passes on news of
+    learning once (and that learning has started, until then); later news goes to the app's notice and to the
+    KnowItAll2 app. A chat with no state of its own passes on everything, as before.
+    """
+
+    from . import chats
+
+    chat = chats.chat_key(_text(payload, "session_id"), transcript or _transcript(payload, agent))
+    state = chats.load(chat) if chat else None
+    relayed = bool(state and state.get("relayed"))
+    relay = [text for status, text in news if not relayed or status in _NEEDS_THE_USER]
+    notice = [text for status, text in news if relayed and status not in _NEEDS_THE_USER]
+    if chat and state is not None and not relayed and any(
+            status not in (*_NEEDS_THE_USER, STARTED) for status, _ in news):
+        _after_output(lambda: chats.mark_relayed(chat))
+    return relay, notice
+
+
+def _after_output(note: Callable[[], None]) -> None:
+    """Note something once the hook's output is really written (in ``main``); right away when called directly."""
+
     if _deferred is not None:
-        _deferred.append((items, transcript, session_id))
+        _deferred.append(note)
     else:
-        moments.mark_shown(items, transcript=transcript, session_id=session_id)
-    return text
+        note()
 
 
 def _unlearned(transcript: str) -> bool:

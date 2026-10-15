@@ -34,33 +34,26 @@ LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
 # Tools whose answer also gives what is new to the chat since its briefing (``hooks.tool_news``).
 NEWS_TOOLS = ("recall", "remember")
 
+# Claude Code shows an MCP server's instructions only up to a length: the 0.11.0 text (about 2,450 characters) lost
+# its end, the update sentence, in a live session (2026-10-14). Kept under 2,000; the Skill holds the details.
 INSTRUCTIONS = (
-    "KnowItAll2 is the user's long-term memory for coding work: projects, systems, infrastructure, "
-    "procedures, decisions, lessons, and the user's own rules. At the start of a session, call `briefing` "
-    "with project_path set to the workspace root, unless a KnowItAll2 briefing is already in your context. "
-    "Before rediscovering anything that may have been learned "
-    "before (a host, service, route, credential location, procedure, or past decision), call `recall` with a "
-    "few keywords. What KnowItAll2 knows about the project and the systems it uses is also in the "
-    "`knowitall2-known/` folder at the project's root (its README.md lists the files): search it like any project "
-    "file, read a file KnowItAll2 points you to, and do not edit it. "
-    "When you establish a durable fact that would help a future session, or the user tells you "
-    "one (a system, a method, how they want something done), call `remember` right away and tell the user in one "
-    "short line what was saved; set source to 'user' only for the user's own words. A memory belongs to the "
-    "current project unless several projects use it. What the user decided or required for a project is a "
-    "decision of that project; how the user personally likes to work is a note tagged 'preference', in the "
-    "user's own words with the work it was about in its subjects; save a rule only when the user explicitly asks "
-    "for a standing one ('make that a rule', 'from now on'), with their words in rule_words. Never save secrets; "
-    "save where a "
-    "credential is kept instead. When the user asks KnowItAll2 to learn from the session, or once when a task "
-    "the user gave you is complete, call `learn`. Treat unverified memories as leads to check. When the briefing says KnowItAll2 has "
-    "a question about this project's memories, show it with `questions` once, at a natural point in the chat: look "
-    "into it first and tell the user what you found and the answer you recommend; record only the user's own "
-    "choices with `answer`, and if the user does not answer, let it be. "
-    "A briefing or recall result may include an optional KnowItAll2 request with a task id such as t-1a2b3c4d; "
-    "help only if it is quick, look-only, and not in the way of the user's task, and report with `settle`. "
-    "When the user asks to update KnowItAll2, run the update script `update.py` in the `.knowitall2` folder of "
-    "the user's home with Python 3.12 or later, and show the user its output. "
-    "If KnowItAll2 is unavailable, continue normally."
+    "KnowItAll2 is the user's long-term memory for coding work: projects, systems, procedures, decisions, "
+    "lessons, and the user's rules. At the start of a session call `briefing` with project_path set to the "
+    "workspace root, unless a KnowItAll2 briefing is already in your context. Before working out anything that "
+    "may be known (a host, service, route, credential location, procedure, past decision, or a tool's behavior "
+    "or an error message seen before), call `recall` with a few keywords. The `knowitall2-known/` folder at the "
+    "project root holds the same knowledge (README.md lists the files): search it like project files, read a "
+    "file KnowItAll2 points you to, and do not edit it. Save a durable fact, or what the user tells you, with "
+    "`remember` right away and tell the user in one short line; source 'user' only for the user's own words. A "
+    "memory belongs to the current project unless several projects use it. What the user decided for a project "
+    "is a decision of that project; how the user likes to work is a note tagged 'preference'; a rule only when "
+    "the user asks for a standing one, with their words in rule_words. Never save secrets; save where a "
+    "credential is kept. Call `learn` when the user asks, or once when their task is complete. Treat unverified "
+    "and provisional memories as leads to check. Show a briefing's question with `questions` once, at a natural "
+    "point, with what you found and your recommendation; record only the user's own choice with `answer`. Help "
+    "with an optional request (task id t-...) only if it is quick and look-only; report with `settle`. To update "
+    "KnowItAll2, run `update.py` in the `.knowitall2` folder of the user's home with Python 3.12 or later and show "
+    "its output. If KnowItAll2 is unavailable, continue normally."
 )
 
 _PROJECT_PATH = {

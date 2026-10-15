@@ -133,7 +133,7 @@ class MainTests(HookTestCase):
 
     def deferring_hook(self, text: str, *, agent: str) -> str:
         # What a hook does when it shows news: mark it as shown once the output is written.
-        hooks._deferred.append(([{"id": "n-1"}], None, "s1"))
+        hooks._after_output(lambda: moments.mark_shown([{"id": "n-1"}], transcript=None, session_id="s1"))
         return self.NEWS
 
     def run_main(self, event: str = "stop", **options) -> tuple[int, str]:

@@ -1,8 +1,10 @@
-"""Which command a lesson is about, so KnowItAll2 can show it to an agent when that command fails.
+"""Which command a lesson is about, so lessons about one command from several chats become one tool rule.
 
 The model reads lessons (and procedures and facts that say how a command fails or must be run) in batches and
 names, for each, the command it is about or nothing. The answer is a tag (``commands.COMMAND_TAG``), which
-syncs like any tag. Each memory is looked at once, recorded in ``reviews`` by its id and text. A batch the
+syncs like any tag; ``tool_rules`` groups lessons by it. Only a rule for running a command is tagged, never an
+incident or a description of a system: the study of 2026-10-13 found a vCenter password incident tagged ``govc``
+and a lesson about store probe scripts tagged ``python heredoc``, each reaching agents where it did not apply. Each memory is looked at once, recorded in ``reviews`` by its id and text. A batch the
 model refuses (on 2026-10-11 its safeguards refused one about Cisco access points' certificates) is tried
 again in small groups, and a memory refused twice is left out, so it never holds up the ones behind it.
 """
@@ -48,7 +50,7 @@ SCHEMA: dict[str, Any] = {
 
 SYSTEM_PROMPT = """You decide when a coding agent should be reminded of something from its memory: right before it runs a particular shell command. You receive memories, each with an id. For each one, return the command it is about, or an empty string.
 
-Give a command only when the memory tells an agent who is about to run that command something that changes what it does: the command fails, hangs, is blocked, or misbehaves here in a way the memory explains, or it must be run a particular way here (options, quoting, environment, order). A memory that only mentions a command, or that describes a system, an address, a project's code, a decision, or a result, gets an empty string. When in doubt, return an empty string: a reminder that would not change what the agent does is noise.
+Give a command only when the memory tells an agent who is about to run that command something that changes what it does: the command fails, hangs, is blocked, or misbehaves here in a way the memory explains, or it must be run a particular way here (options, quoting, environment, order). Give one only for a memory that states a rule for running the command, true each time it runs here. A memory about an incident (what happened once: a wrong password, an expired token, a host that was down, a bug since fixed) gets an empty string even when it names the command, and so does a memory that only mentions a command, or that describes a system, an address, a project's code, a decision, or a result. When in doubt, return an empty string: a reminder that would not change what the agent does is noise.
 
 Write the command as the program's own name in lower case, without a path, followed by its subcommand when the memory is about one subcommand: "git archive", "glab mr", "rmm.py command", "tailscale up", "docker compose", "gofmt", "sleep", "ssh-keygen". For a memory about running Python code through a shell heredoc (python - <<'EOF'), write "python heredoc". Never write git, ssh, python, docker, bash, powershell, or another general program alone: write the subcommand the memory is about, or an empty string.
 
@@ -80,8 +82,8 @@ class TagReport:
 
 
 def candidate(record: RecordRow) -> bool:
-    if record.status != "active" or commands.tagged_keys(record.tags):
-        return False
+    if record.status != "active" or commands.tagged_keys(record.tags) or commands.RULE_TAG in record.tags:
+        return False   # a tool rule carries its programs already (``tool_rules``)
     return record.kind == "lesson" or (record.kind in ("procedure", "fact") and bool(_FAILURE.search(record.text))
                                        and bool(_COMMANDISH.search(record.text)))
 

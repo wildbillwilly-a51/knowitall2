@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -219,7 +220,7 @@ class FinishTests(unittest.TestCase):
         settings = self.root / "claude" / "settings.json"
         data = json.loads(settings.read_text(encoding="utf-8"))
         words = {"SessionStart": [], "Stop": ["stop"], "SessionEnd": ["session-end"], "UserPromptSubmit": ["prompt-submit"],
-                 "PostToolUseFailure": ["command"]}
+                 "PostToolUse": ["command"], "PostToolUseFailure": ["command"]}
         for event, groups in data["hooks"].items():
             for group in groups:
                 for hook in group["hooks"]:
@@ -311,6 +312,28 @@ class FinishTests(unittest.TestCase):
         notes = update.changelog_since("0.2.0")
         self.assertTrue(notes and notes[0].startswith(f"{__version__}: "), notes)
         self.assertEqual([], update.changelog_since(__version__))
+
+    def test_whats_new_reads_a_heading_wrapped_across_lines(self) -> None:
+        # 0.11.0: "Your rules, your preferences, and how your projects work are told apart." wraps onto a second
+        # line in CHANGELOG.md, so the update's "What's new" left it out.
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## 9.1.0 (2026-10-14)\n\nIntro.\n\n"
+                "- **Learning happens twice.** During a chat, it learns\n  at each commit.\n"
+                "- **Your rules, your preferences, and how your projects work are told\n  apart.** A rule needs your "
+                "own words.\n- **Less that goes out of date.** Status goes after a week.\n\n"
+                "## 9.0.0 (2026-10-12)\n\n- **Older.** Text.\n", encoding="utf-8")
+            with mock.patch.object(update, "checkout_root", return_value=Path(folder)):
+                self.assertEqual(["9.1.0: Learning happens twice",
+                                  "9.1.0: Your rules, your preferences, and how your projects work are told apart",
+                                  "9.1.0: Less that goes out of date"], update.changelog_since("9.0.0"))
+
+    def test_every_heading_of_the_real_changelog_is_read_whole(self) -> None:
+        text = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
+        headings = re.findall(r"^- \*\*", text, re.MULTILINE)
+        notes = update.changelog_since("0.0.0", limit=10_000)
+        self.assertEqual(len(headings), len(notes))
+        self.assertIn("0.11.0: Your rules, your preferences, and how your projects work are told apart", notes)
 
 
 if __name__ == "__main__":

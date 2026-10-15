@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Sequence
 
 from . import commands, journal
 from .files import read_text, write_text_atomic
@@ -83,15 +83,22 @@ class Rendered:
     files: dict[str, str]        # each system's or project's file, by name, in the index's order
     lines: dict[str, str]        # each file's line in the index
     uses: dict[str, set[str]]    # each project's files: its own, and those of the systems its memories use
+    generic: set[tuple[str, ...]] = field(default_factory=set)   # names most memories use in passing (``GENERIC_SHARE``)
+    tools: set[str] = field(default_factory=set)                 # the files of the agent's own tools
+    systems: set[str] = field(default_factory=set)               # the files of catalogued systems
+    counts: dict[str, int] = field(default_factory=dict)         # each file's own memories
 
     def everything(self) -> dict[str, str]:
         return {**self.files, INDEX: _index(list(self.lines.values()))}
 
-    def folder(self, projects: Sequence[str]) -> dict[str, str]:
+    def folder(self, projects: Sequence[str], extra: Sequence[str] = ()) -> dict[str, str]:
         """The files of a folder of ``projects``: their own, those of the systems their memories are filed
-        under or name, and the general file; the index lists only those (review 2026-10-11, the user's choice)."""
+        under or name, and the general file; the index lists only those (review 2026-10-11, the user's choice).
 
-        chosen = {file_name(GENERAL)}.union(*(self.uses.get(project_id, set()) for project_id in projects))
+        ``extra``: the files of what else the projects depend on (``dependencies``).
+        """
+
+        chosen = {file_name(GENERAL)}.union(*(self.uses.get(project_id, set()) for project_id in projects), extra)
         files = {name: text for name, text in self.files.items() if name in chosen}
         return {**files, INDEX: _index([self.lines[name] for name in files])}
 
@@ -102,8 +109,11 @@ def render_files(connection: sqlite3.Connection) -> Rendered:
     from . import secrets
     from .memory import PROVISIONAL_LABEL, PROVISIONAL_TAG
 
-    systems = {row[0]: (row[1], _aliases(row[2]))
-               for row in connection.execute("SELECT id, name, aliases FROM systems")}
+    from .catalog import workstation_tool
+
+    catalogued = list(connection.execute("SELECT id, name, aliases, kind FROM systems"))
+    systems = {row[0]: (row[1], _aliases(row[2])) for row in catalogued}
+    tools = {file_name(row[1]) for row in catalogued if workstation_tool(row[1], row[3], _aliases(row[2]))}
     projects = dict(connection.execute("SELECT id, name FROM projects"))
     notes = dict(connection.execute("SELECT record_id, system_id FROM record_notes WHERE system_id IS NOT NULL"))
     facets = dict(connection.execute("SELECT record_id, facet FROM record_notes"))
@@ -111,7 +121,16 @@ def render_files(connection: sqlite3.Connection) -> Rendered:
     system_files = {file_name(name) for name, _ in systems.values()}
     uses: dict[str, set[str]] = {project_id: {file_name(str(name))} for project_id, name in projects.items()}
     groups: dict[str, dict[str, Any]] = {}
-    elsewhere: list[tuple[list[str], str]] = []   # the files a memory names besides its own, and its entry there
+    # A project that is itself a system (saltbox) uses what that system's shared memories name, too.
+    as_system: dict[str, list[str]] = {}
+    for project_id, name in projects.items():
+        as_system.setdefault(file_name(str(name)), []).append(project_id)
+    shared_names: list[tuple[list[str], dict[str, set[tuple[str, ...]]]]] = []
+    # How specific each name is (``GENERIC_SHARE``): the memories that use it, and those of them filed in its file.
+    using: dict[tuple[str, ...], int] = {}
+    filed_there: dict[tuple[str, ...], int] = {}
+    # The files a memory names besides its own, each with the names it used, and its entry there.
+    elsewhere: list[tuple[dict[str, set[tuple[str, ...]]], str]] = []
     rows = connection.execute(
         "SELECT id, kind, text, scope, project_id, verification, created_at, tags FROM records "
         "WHERE status = 'active' ORDER BY created_at DESC, seq DESC"
@@ -138,15 +157,31 @@ def render_files(connection: sqlite3.Connection) -> Rendered:
         group["entries"].append(_wrap(f"- {saved}: {body}"))
         group["sections"][_section(facets.get(record_id), kind)].append(group["entries"][-1])
         home = file_name(name)
-        others = [target for target in named(str(text), table) if target != home]
+        by_names: dict[str, set[tuple[str, ...]]] = {}
+        for key, target in _named_keys(str(text), table):
+            by_names.setdefault(target, set()).add(key)
+        for key in {key for keys in by_names.values() for key in keys}:
+            using[key] = using.get(key, 0) + 1
+            if table[key] == home:
+                filed_there[key] = filed_there.get(key, 0) + 1
+        others = {target: keys for target, keys in by_names.items() if target != home}
         if others:
             elsewhere.append((others, _wrap(f"- {saved}, filed in {home}: {body}")))
         if scope == "project" and project_id:
             uses.setdefault(project_id, set()).update([home, *(target for target in others if target in system_files)])
+        elif system is not None and home in as_system and others:
+            shared_names.append((as_system[home], others))
+    generic = {key for key, count in using.items()
+               if count >= GENERIC_MINIMUM_USES and filed_there.get(key, 0) < GENERIC_SHARE * count}
     for others, entry in elsewhere:   # only into files that exist: a name alone makes no file
-        for target in others:
-            if target in groups:
+        for target, keys in others.items():
+            if target in groups and not keys <= generic:   # not when only a name used in passing names it
                 groups[target]["elsewhere"].append(entry)
+    for project_ids, others in shared_names:
+        for target, keys in others.items():
+            if target in system_files and target not in tools:
+                for project_id in project_ids:
+                    uses.setdefault(project_id, set()).add(target)
     files: dict[str, str] = {}
     index_lines: dict[str, str] = {}
     for name in sorted(groups, key=lambda item: (" / ".join(groups[item]["names"]).casefold(), item)):
@@ -169,7 +204,8 @@ def render_files(connection: sqlite3.Connection) -> Rendered:
         called = f" (also {', '.join(group['aliases'][:4])})" if group["aliases"] else ""
         more = f", and {len(group['elsewhere'])} filed elsewhere that name it" if group["elsewhere"] else ""
         index_lines[name] = f"- {name}: {title}{called}, {len(group['entries'])} memories{more}"
-    return Rendered(files, index_lines, uses)
+    counts = {name: len(group["entries"]) for name, group in groups.items()}
+    return Rendered(files, index_lines, uses, generic, tools, system_files, counts)
 
 
 def _index(lines: Sequence[str]) -> str:
@@ -880,7 +916,7 @@ def _key(path: str | os.PathLike[str]) -> str:
 
 
 def _marker(connection: sqlite3.Connection) -> str:
-    return f"{change_marker(connection)}|{_worked_marker()}|{_held_marker()}"
+    return f"{change_marker(connection)}|{_worked_marker()}|{_held_marker()}|{_needed_marker()}"
 
 
 # The files that decide whether a folder is held back (``held_back``): a change to one is a change to refresh for.
@@ -929,6 +965,8 @@ def refresh(connection: sqlite3.Connection, *, force: bool = False) -> RefreshRe
             roots.append((root, projects))
     marker = _marker(connection)   # the record of where agents work is seeded by now
     rendered = render_files(connection)
+    _write_names(rendered.generic)
+    table, documents = name_table(connection), _read_documents()
     try:
         commands.write_index(connection, data_home())
     except OSError as exc:
@@ -937,10 +975,12 @@ def refresh(connection: sqlite3.Connection, *, force: bool = False) -> RefreshRe
     owned = _owned(status)
     for root, projects in roots:
         try:
-            report.folders.append(write_folder(root, rendered.folder(projects), recorded=_key(root) in owned,
+            extra = dependencies(root, projects, rendered, table, cache=documents)
+            report.folders.append(write_folder(root, rendered.folder(projects, extra), recorded=_key(root) in owned,
                                                claim=lambda root=root: _claim(root)))
         except OSError as exc:
             report.folders.append(FolderResult(str(root), skipped=f"could not be written: {exc}"))
+    _write_documents(documents, [root for root, _ in roots])
     targets = {_key(root) for root, _ in roots}
     retiring = _retire(owned, targets, report)
     written = [item.root for item in report.folders if item.skipped is None]
@@ -1082,6 +1122,21 @@ POINTER_LOG = "pointers.jsonl"
 POINTER_LOG_KEPT = 2000
 OWN_NAME = "knowitall2"   # the word that names the file about KnowItAll2 itself
 _WORD = re.compile(r"[^\W_]+")
+# A name fewer than a tenth of the memories using it are filed under is used in passing: of the memories that
+# say "UniFi", 1% are in the network plane's file it points to, "Tailscale" 3%, "Codex" 7%, against 82% to 93%
+# for "TacticalRMM", "taskboard", and "KnowItAll2" (docs/research/2026-10-13-root-causes/pointers.md). Such a
+# name neither points from the agent's words nor lists a memory again in that file. Too few uses say nothing.
+GENERIC_SHARE = 0.10
+GENERIC_MINIMUM_USES = 5
+NAMES_FILE = "names.json"   # in the data home: the generic names, as the last refresh measured them
+
+
+class _Table(dict):
+    """A name table (``name_table``): each name as words, and its target; ``starts`` holds the lengths of the
+    names beginning with each word, so a text is matched in one pass instead of trying every length at each word
+    (matching all 4,400 live memories took 2 seconds that way, measured 2026-10-14)."""
+
+    starts: dict[str, tuple[int, ...]]
 
 
 def name_table(connection: sqlite3.Connection) -> dict[tuple[str, ...], str]:
@@ -1105,26 +1160,59 @@ def system_table(connection: sqlite3.Connection) -> dict[tuple[str, ...], str]:
         "SELECT id, name, aliases FROM systems")])
 
 
+def tool_files(connection: sqlite3.Connection) -> set[str]:
+    """The files of the agent's own tools on the workstation (``catalog.workstation_tool``)."""
+
+    from .catalog import workstation_tool
+
+    return {file_name(name) for name, raw, kind in connection.execute("SELECT name, aliases, kind FROM systems")
+            if workstation_tool(name, kind, _aliases(raw))}
+
+
 def named(text: str, table: dict[tuple[str, ...], str]) -> list[str]:
     """The targets of ``table`` that ``text`` names, in the order first named; the longest name wins."""
 
+    return list(dict.fromkeys(target for _, target in _named_keys(text, table)))
+
+
+def _named_keys(text: str, table: dict[tuple[str, ...], str]) -> list[tuple[tuple[str, ...], str]]:
+    """Each name of ``table`` that ``text`` uses, with its target, in order; not a part of a path or a login."""
+
+    folded, found = _matches(text, table)
+    return [(key, target) for key, target, start, end in found if not _not_a_mention(folded, start, end)]
+
+
+def _matches(text: str, table: dict[tuple[str, ...], str]) -> tuple[str, list[tuple[tuple[str, ...], str, int, int]]]:
+    """``text`` folded, and each name of ``table`` in it, longest first: its words, target, start, and end."""
+
     folded = str(text).casefold()
+    starts = table.starts if isinstance(table, _Table) else _indexed(table).starts
     words = [(match.group(0), match.start(), match.end()) for match in _WORD.finditer(folded)]
-    longest = max((len(key) for key in table), default=0)
-    found: list[str] = []
+    found: list[tuple[tuple[str, ...], str, int, int]] = []
     index = 0
     while index < len(words):
-        for size in range(min(longest, len(words) - index), 0, -1):
-            target = table.get(tuple(word for word, _, _ in words[index:index + size]))
-            if target is not None:
-                break
+        for size in starts.get(words[index][0], ()):
+            if index + size <= len(words):
+                key = tuple(word for word, _, _ in words[index:index + size])
+                target = table.get(key)
+                if target is not None:
+                    break
         else:
             index += 1
             continue
-        if not _not_a_mention(folded, words[index][1], words[index + size - 1][2]) and target not in found:
-            found.append(target)
+        found.append((key, target, words[index][1], words[index + size - 1][2]))
         index += size
-    return found
+    return folded, found
+
+
+def _indexed(table: dict[tuple[str, ...], str]) -> _Table:
+    indexed = _Table(table)
+    lengths: dict[str, set[int]] = {}
+    for words in table:
+        if words:
+            lengths.setdefault(words[0], set()).add(len(words))
+    indexed.starts = {word: tuple(sorted(sizes, reverse=True)) for word, sizes in lengths.items()}
+    return indexed
 
 
 def _word_table(entries: Sequence[tuple[str, str, Sequence[str]]]) -> dict[tuple[str, ...], str]:
@@ -1141,16 +1229,126 @@ def _word_table(entries: Sequence[tuple[str, str, Sequence[str]]]) -> dict[tuple
     for words, targets in aliases.items():
         if words not in names and len(targets) == 1 and len("".join(words)) >= POINTER_MINIMUM_CHARACTERS:
             table[words] = next(iter(targets))
-    return table
+    return _indexed(table)
+
+
+# --- Who wrote the words, and what part a name plays in them (docs/research/2026-10-13-root-causes/pointers.md)
+
+# What a message hook's prompt can hold besides the user's own message. Claude Code delivers a background task's
+# end as a message: a subagent's final result is another agent's words, but a monitor's event lines and a
+# background command's notice are a tool's (5 pointers in one minute from a store-tagging monitor). A message
+# another session sends begins with a header naming that session ("Codex audit findings review" pointed to
+# codex.md). The apps add blocks of their own: the in-app browser's state, a list of plugins.
+_NOTICE = re.compile(r"<task-notification>.*?(?:</task-notification>|\Z)", re.DOTALL)
+_NOTICE_RESULT = re.compile(r"<result>(.*?)(?:</result>|\Z)", re.DOTALL)
+_NOTICE_SUMMARY = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
+_TOOL_NOTICES = ("Monitor event", "Background command")
+_HANDOFF = re.compile(r"<cross-session-message\b[^>]*>(.*?)(?:</cross-session-message>|\Z)", re.DOTALL)
+_AMBIENT = re.compile(r"<(in-app-browser-context|recommended_plugins|external_codex_apps_open_page|system-reminder|"
+                      r"environment_context)\b[^>]*>.*?(?:</\1>|\Z)", re.DOTALL)
+_URL = re.compile(r"[a-z][a-z0-9+.-]*://\S+")
+
+
+def message_parts(prompt: str | None) -> tuple[list[str], list[str]]:
+    """The words of a message hook's prompt, by who wrote them: the user's (their message, or an automation
+    prompt they set up, such as a scheduled task or a heartbeat), and other agents' (a subagent's final result,
+    the body of a message another session sent), which count as the agent's own words.
+
+    Left out: monitor events and background-command notices, the header of a message from another session,
+    and the blocks the apps add.
+    """
+
+    agents: list[str] = []
+
+    def notice(match: re.Match[str]) -> str:
+        summary = _NOTICE_SUMMARY.search(match.group(0))
+        if not (summary and summary.group(1).startswith(_TOOL_NOTICES)):
+            agents.extend(result.group(1) for result in _NOTICE_RESULT.finditer(match.group(0)))
+        return ""
+
+    def handoff(match: re.Match[str]) -> str:
+        agents.append(match.group(1))
+        return ""
+
+    text = _AMBIENT.sub("", _HANDOFF.sub(handoff, _NOTICE.sub(notice, str(prompt or ""))))
+    return ([text] if text.strip() else []), [item for item in agents if item.strip()]
+
+
+def pointer_targets(table: dict[tuple[str, ...], str], texts: Sequence[str], own_words: Sequence[str] = (), *,
+                    itself: str | None = None, tools: Collection[str] = (),
+                    generic: Collection[tuple[str, ...]] = ()) -> list[str]:
+    """The files ``texts`` (the user's words) and ``own_words`` (the agent's, and other agents') name as what the
+    work is about, the user's first, each in the order first named.
+
+    Never a name that starts a branch, ref, or path (``codex/visual-suite-repair``), one inside a URL, a login
+    (``name@``), or a folder deeper in a path; never ``itself``, KnowItAll2's own file, which is given as None in
+    the KnowItAll2 project. From the agent's words, never a sentence that passes on KnowItAll2's own output
+    ("KnowItAll2 learned 12 things ... through the gateway host"), a file of the agent's own tools (``tools``), or a
+    name used in passing (``generic``).
+    """
+
+    found: list[str] = []
+    for agents, items in ((False, texts), (True, own_words)):
+        folded, matches = _matches(_joined(items), table)
+        urls = [match.span() for match in _URL.finditer(folded)] if matches else []
+        for key, target, start, end in matches:
+            if target in found or target == itself or any(low <= start < high for low, high in urls):
+                continue
+            pair = not agents and _two_names(folded, start, end, table)
+            if folded[end:end + 1] == "/" and not pair:
+                continue
+            if _not_a_mention(folded, start, end) and not (pair and folded[start - 1:start] == "/"):
+                continue
+            if agents and (target in tools or key in generic or _relays_own_output(folded, start, end)):
+                continue
+            found.append(target)
+    return found
+
+
+def _two_names(folded: str, start: int, end: int, table: dict[tuple[str, ...], str]) -> bool:
+    """Whether the name sits in a word of two parts joined by one slash that are two names, not a branch or a
+    path: both parts letters only ("Sonarr/Docker"), or both known names ("Sonarr/Radarr", "nas01/nas02").
+    ``sonarr/fix-imports``, ``sonarr/v4`` and ``sonarr/config/x.xml`` stay a branch or a path (candidate review
+    of 0.11.1, E-L3)."""
+
+    if folded[end:end + 1] != "/" and folded[start - 1:start] != "/":
+        return False
+    first, last = start, end
+    while first > 0 and not folded[first - 1].isspace():
+        first -= 1
+    while last < len(folded) and not folded[last].isspace():
+        last += 1
+    word = folded[first:last].strip("\"'`()[]<>,;:.!?*")
+    parts = word.split("/")
+    if len(parts) != 2 or not all(parts):
+        return False
+    if all(part.isalpha() for part in parts):
+        return True
+    return all(tuple(_WORD.findall(part)) in table and "".join(_WORD.findall(part)) == part.replace("-", "")
+               .replace(".", "").replace("_", "") for part in parts)
+
+
+def _relays_own_output(folded: str, start: int, end: int) -> bool:
+    """Whether the name sits in a sentence (to the end of its line) that names KnowItAll2: such a sentence passes
+    on its news, a question it asks, or what it saved, not the work."""
+
+    begin = max(folded.rfind(". ", 0, start), folded.rfind("\n", 0, start), 0)
+    stop = folded.find("\n", end)
+    return OWN_NAME in folded[begin:len(folded) if stop < 0 else stop]
 
 
 def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: Path,
-                  shown: Sequence[str], *, own_words: Sequence[str] = ()) -> list[tuple[str, str]]:
+                  shown: Sequence[str], *, own_words: Sequence[str] = (),
+                  commands: Sequence[str] = ()) -> list[tuple[str, str]]:
     """Files in ``folder`` that ``texts`` (the user's) or ``own_words`` (the agent's) name and this chat has not
-    been pointed to, with the line to show.
+    been pointed to, with the line to show (``pointer_targets``).
 
-    KnowItAll2's own name in the agent's words points nowhere: agents pass on its news ("KnowItAll2 learned
-    ..."), which pointed them to its file in every project (2026-10-10: 24 of 165 pointers, one opened).
+    KnowItAll2's own name points nowhere outside the KnowItAll2 project: agents pass on its news ("KnowItAll2
+    learned ..."), which pointed them to its file in every project (2026-10-10: 24 of 165 pointers, one opened).
+
+    What the folder's project depends on is noted for its next refresh (``dependencies``): the systems
+    ``commands`` (the chat's shell commands since the last message) reach, and a file named here that the folder
+    lacks, so the next mention finds it instead of pointing nowhere.
     """
 
     if not ours(folder):
@@ -1158,11 +1356,20 @@ def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: 
     table = name_table(connection)
     if not table:
         return []
+    from .identity import identify
+
+    project = identify(folder.parent)
+    tools = tool_files(connection)
+    generic = generic_names()
     itself = table.get((OWN_NAME,))
-    targets = named(_joined(texts), table)
-    targets += [target for target in named(_joined(own_words), table) if target != itself and target not in targets]
+    if project is not None and file_name(project.name) == itself:
+        itself = None
+    if project is not None and commands:
+        note_reached(project.id, commands, table, tools=tools)
+    targets = pointer_targets(table, texts, own_words, itself=itself, tools=tools, generic=generic)
     found: list[tuple[str, str, int]] = []
     rejected: set[str] = set()
+    lacking: list[str] = []
     for target in targets:
         if target in shown or target in rejected:
             continue
@@ -1170,6 +1377,7 @@ def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: 
             head = read_text(folder / target).splitlines()[:3]
         except OSError:
             rejected.add(target)
+            lacking.append(target)
             continue
         count = next((line.split(" ", 1)[0] for line in head if line.endswith("memories, newest first.")), "0")
         if not count.isdigit() or int(count) < POINTER_MINIMUM_MEMORIES:
@@ -1179,8 +1387,29 @@ def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: 
         found.append((target, title, int(count)))
         if len(found) == POINTERS_PER_MESSAGE:
             break
+    if project is not None and lacking:
+        note_needed(project.id, "named", {target: 1 for target in lacking})
     return [(target, f"KnowItAll2: what is known about {title} is in {FOLDER}/{target} ({count} memories); "
                      "read or search it before working this out again.") for target, title, count in found]
+
+
+def generic_names() -> set[tuple[str, ...]]:
+    """The names used in passing (``GENERIC_SHARE``), as the last refresh measured them from the store."""
+
+    try:
+        data = json.loads(read_text(data_home() / NAMES_FILE))
+    except (OSError, ValueError):
+        return set()
+    names = data.get("generic") if isinstance(data, dict) else None
+    return {tuple(str(name).split(" ")) for name in names} if isinstance(names, list) else set()
+
+
+def _write_names(generic: set[tuple[str, ...]]) -> None:
+    try:
+        write_text_atomic(data_home() / NAMES_FILE,
+                          json.dumps({"generic": sorted(" ".join(key) for key in generic)}, indent=0) + "\n")
+    except OSError as exc:
+        journal.problem("knowledge files", f"the names used in passing could not be written: {exc}")
 
 
 def _joined(texts: Sequence[str]) -> str:
@@ -1223,6 +1452,281 @@ def folder_line(project_path: str | os.PathLike[str] | None) -> str | None:
         return None
     return (f"What KnowItAll2 knows about this project and the systems it uses is also in {FOLDER}/ in this project "
             f"({INDEX} lists the files): search it like any project file.")
+
+
+# --- What a project depends on ---------------------------------------------------------------------------
+
+# A folder chosen only from where memories were filed missed half of what projects use: 119 of the 238
+# systems their own documents name, 62% of those their chats reached by command, and every system of a new
+# project (docs/research/2026-10-13-root-causes/pointers.md, H4). So a folder also gets, besides its projects'
+# own files (``Rendered.uses``):
+# - the systems its documents and scripts name, each in at least ``DOCUMENTED_FILES`` files;
+# - the systems its chats' shell commands reached, in at least ``REACHED_COMMANDS`` commands, in the last
+#   ``NEEDED_DAYS`` days;
+# - a system's file a chat there named, as a pointer would have, while the folder lacked it.
+# Never the files of the agent's own tools, and never by a name used in passing.
+NEEDED_FILE = "needed.json"     # in the data home: what the hooks noted, by project
+NEEDED_DAYS = 30
+REACHED_COMMANDS = 2
+COMMAND_TEXT_LIMIT = 20_000
+DOCUMENTS_FILE = "documents.json"   # in the data home: what each folder's documents name, until they change
+DOCUMENTED_FILES = 2
+DOCUMENT_BYTES = 400_000
+DOCUMENTS_PER_FOLDER = 600
+# Where a repository says what it depends on: its top-level notes and scripts, its docs, its scripts folder.
+DOCUMENT_PLACES = (("", (".md", ".ps1", ".sh")), ("scripts", None), ("docs", (".md",)))
+# Folders of other people's packages and of what a build makes, whose READMEs name anything (E-L4).
+DOCUMENT_SKIPPED = frozenset({"node_modules", "vendor", "build", "dist", "site", "__pycache__", "venv"})
+DOCUMENTS_VERSION = 2   # what a document is read as changed: what the cache holds is read again
+
+
+def note_reached(project_id: str, commands: Sequence[str], table: dict[tuple[str, ...], str], *,
+                 tools: Collection[str] = ()) -> None:
+    """Note the systems ``commands`` name for ``project_id``'s next refresh, each once a command
+    (``command_names``).
+
+    Not KnowItAll2's own commands, or a search of its folder, which name what they look up; never raises. A name
+    used in passing counts here: a command reaching a host is no passing use, and a host many services run on is
+    named in passing by each of their memories (candidate review of 0.11.1, E-M4).
+    """
+
+    counts: dict[str, int] = {}
+    for command in commands:
+        text = str(command)[:COMMAND_TEXT_LIMIT]
+        if OWN_NAME in text.casefold():
+            continue
+        for target in set(command_names(text, table)):
+            if target not in tools:
+                counts[target] = counts.get(target, 0) + 1
+    if counts:
+        note_needed(project_id, "reached", counts)
+
+
+def command_names(text: str, table: dict[tuple[str, ...], str]) -> list[str]:
+    """The targets a command names, in order: as ``named``, and also a host a command reaches by URL or network
+    path (``curl http://sonarr:8989/...``, ``\\\\nas01\\share``, ``//nas01/share``), which ``named`` takes for a
+    folder deeper in a path (candidate review of 0.11.1, E-M3)."""
+
+    folded, found = _matches(text, table)
+    return list(dict.fromkeys(target for _, target, start, end in found
+                              if not _not_a_mention(folded, start, end) or _host_start(folded, start)))
+
+
+def _host_start(text: str, start: int) -> bool:
+    """Whether the name at ``start`` begins the host of a URL (``scheme://name``) or of a network path
+    (``\\\\name``, ``//name``): two slashes or more, all of one kind, at the start of a word, not inside a path such
+    as ``C:\\\\work\\\\name`` (a Windows path with its backslashes escaped)."""
+
+    first = start
+    while first > 0 and text[first - 1] in "\\/":
+        first -= 1
+    slashes = text[first:start]
+    if len(slashes) < 2 or len(set(slashes)) != 1:
+        return False
+    before = text[first - 1] if first else " "
+    return before.isspace() or before in "\"'`(=,[<" or (before == ":" and slashes[0] == "/")
+
+
+def note_needed(project_id: str, how: str, counts: dict[str, int]) -> None:
+    """Add to what ``project_id``'s folder is to get (``how``: "reached" by commands, or "named" while missing)."""
+
+    try:
+        record, now = _read_needed(), _now()
+        entries = record["projects"].setdefault(project_id, {}).setdefault(how, {})
+        for target, count in counts.items():
+            entry = entries.get(target) if isinstance(entries.get(target), dict) else {}
+            entries[target] = {"at": now, "count": int(entry.get("count") or 0) + count}
+        _write_needed(record, now)
+    except Exception as exc:   # a help: never at the cost of the hook
+        journal.problem("knowledge files", f"what a project uses was not noted: {type(exc).__name__}: {exc}")
+
+
+def needed_files(project_ids: Sequence[str], record: dict[str, Any] | None = None) -> dict[str, str]:
+    """The files the hooks noted for ``project_ids`` in the last ``NEEDED_DAYS`` days, and how: "reached" (by
+    ``REACHED_COMMANDS`` commands or more) or "named". ``record``: what ``_read_needed`` returned, if read already."""
+
+    record, found, now = record or _read_needed(), {}, _now()
+    for project_id in project_ids:
+        noted = _recent_needed(record["projects"].get(project_id) or {}, now)
+        for target, entry in noted.get("reached", {}).items():
+            if int(entry.get("count") or 0) >= REACHED_COMMANDS:
+                found[target] = "reached"
+        for target in noted.get("named", {}):
+            found.setdefault(target, "named")
+    return found
+
+
+def _needed_marker() -> str:
+    """Changes when the files the hooks noted would change a folder, not at every count; cheap for every hook:
+    the record is read once (reading it again for each project took 13 to 179 ms, candidate review E-L2)."""
+
+    record = _read_needed()
+    chosen = {project_id: sorted(needed_files([project_id], record)) for project_id in sorted(record["projects"])}
+    return hashlib.sha256(json.dumps(chosen, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _read_needed() -> dict[str, Any]:
+    try:
+        data = json.loads(read_text(data_home() / NEEDED_FILE))
+    except (OSError, ValueError):
+        data = {}
+    projects = data.get("projects") if isinstance(data, dict) else None
+    return {"projects": {str(key): value for key, value in projects.items() if isinstance(value, dict)}
+            if isinstance(projects, dict) else {}}
+
+
+def _recent_needed(noted: dict[str, Any], now: str) -> dict[str, dict[str, dict[str, Any]]]:
+    moment = _when(now)
+    if moment is None:
+        return {}
+    cutoff = moment - timedelta(days=NEEDED_DAYS)
+    return {how: {target: entry for target, entry in entries.items()
+                  if isinstance(entry, dict) and (_when(entry.get("at")) or cutoff) > cutoff}
+            for how, entries in noted.items() if isinstance(entries, dict)}
+
+
+def _write_needed(record: dict[str, Any], now: str) -> None:
+    kept = {}
+    for project_id, noted in record["projects"].items():
+        recent = {how: entries for how, entries in _recent_needed(noted, now).items() if entries}
+        if recent:
+            kept[project_id] = recent
+    write_text_atomic(data_home() / NEEDED_FILE, json.dumps({"projects": kept}, indent=1, sort_keys=True) + "\n")
+
+
+def documented(root: Path, table: dict[tuple[str, ...], str], *, cache: dict[str, Any] | None = None) -> set[str]:
+    """The targets of ``table`` that ``root``'s documents and scripts (``DOCUMENT_PLACES``) name, each in at
+    least ``DOCUMENTED_FILES`` of them; a name used in passing counts too, since a host many services run on is
+    named in passing by each of their memories (candidate review of 0.11.1, E-M4). A binary is not read; a script
+    Windows PowerShell saved as UTF-16 is (E-L4).
+
+    ``cache`` (kept in the data home between refreshes, ``_read_documents``) spares the reading: a folder whose
+    documents and the names are as they were is not read again, and a document whose text was read before, in
+    this folder or in another worktree of its repository, is not searched again. Searching every document of
+    the 54 project folders on the live computer took about 10 seconds (2026-10-14), most of it the same
+    documents in several worktrees; checking that nothing changed takes about 0.2 seconds.
+    """
+
+    cache = {} if cache is None else cache
+    names = hashlib.sha256(json.dumps([sorted(f"{' '.join(key)}={target}" for key, target in table.items()),
+                                       DOCUMENTS_VERSION]).encode("utf-8")).hexdigest()
+    if cache.get("names") != names or not isinstance(cache.get("folders"), dict) or not isinstance(
+            cache.get("texts"), dict):
+        cache.clear()
+        cache.update({"names": names, "folders": {}, "texts": {}})
+    listed = _documents(root)
+    signature = hashlib.sha256(json.dumps([(str(path), stamp) for path, stamp in listed]).encode("utf-8")).hexdigest()
+    held = cache["folders"].get(_key(root))
+    if isinstance(held, dict) and held.get("signature") == signature and isinstance(held.get("named"), list):
+        return {str(target) for target in held["named"]}
+    files: dict[str, int] = {}
+    texts = []
+    for path, _ in listed:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        digest = hashlib.sha1(raw).hexdigest()
+        texts.append(digest)
+        named_here = cache["texts"].get(digest)
+        if not isinstance(named_here, list):
+            text = _document_text(raw)
+            named_here = sorted({target for _, target in _named_keys(text, table)}) if text is not None else []
+            cache["texts"][digest] = named_here
+        for target in named_here:
+            files[target] = files.get(target, 0) + 1
+    found = {target for target, count in files.items() if count >= DOCUMENTED_FILES}
+    cache["folders"][_key(root)] = {"signature": signature, "named": sorted(found), "texts": texts}
+    return found
+
+def _document_text(raw: bytes) -> str | None:
+    """A document's text by its byte-order mark (UTF-16, UTF-8, else UTF-8 with replacements); None for a binary."""
+
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", "replace")
+    if b"\x00" in raw[:8192]:
+        return None
+    return raw.decode("utf-8-sig", "replace")
+
+
+def _documents(root: Path) -> list[tuple[Path, list[int]]]:
+    """The documents and scripts of ``root`` to read, with their sizes and times; none in a link, a hidden
+    folder, or KnowItAll2's own folder, none too large, and at most ``DOCUMENTS_PER_FOLDER``."""
+
+    found: list[tuple[Path, list[int]]] = []
+    for place, suffixes in DOCUMENT_PLACES:
+        base = root / place if place else root
+        if _linked(base) or not base.is_dir():
+            continue
+        folders = [base]
+        while folders and len(found) < DOCUMENTS_PER_FOLDER:
+            folder = folders.pop(0)
+            try:
+                with os.scandir(folder) as scan:
+                    entries = sorted(scan, key=lambda entry: entry.name)
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name.startswith(".") or entry.name == FOLDER or entry.is_symlink() or entry.is_junction():
+                    continue   # a junction is no symbolic link to is_symlink (candidate review E-L4)
+                if entry.name.casefold() in DOCUMENT_SKIPPED:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if place == "docs":   # the docs folder whole; elsewhere only the top level
+                        folders.append(Path(entry.path))
+                    continue
+                if suffixes is not None and not entry.name.casefold().endswith(suffixes):
+                    continue
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.st_size <= DOCUMENT_BYTES and len(found) < DOCUMENTS_PER_FOLDER:
+                    found.append((Path(entry.path), [stat.st_size, stat.st_mtime_ns]))
+    return found
+
+
+def dependencies(root: Path, projects: Sequence[str], rendered: Rendered, table: dict[tuple[str, ...], str], *,
+                 cache: dict[str, Any] | None = None) -> set[str]:
+    """The files of what the projects in ``root`` depend on besides their own memories (``Rendered.uses``): the
+    systems its documents name and its chats' commands reached, never the agent's own tools; and any file a chat
+    there named, as a pointer would have, while the folder lacked it, when it holds enough memories for a pointer,
+    which is what that mention looked for."""
+
+    found = documented(root, table, cache=cache)
+    named_there = set()
+    for target, how in needed_files(projects).items():
+        (found if how == "reached" else named_there).add(target)
+    # KnowItAll2's own file only in its own project: other projects' instructions name it ("KnowItAll2 memory").
+    itself = table.get((OWN_NAME,))
+    own = set().union(*(rendered.uses.get(project_id, set()) for project_id in projects))
+    found = {target for target in found if target in rendered.systems and target not in rendered.tools
+             and (target != itself or target in own)}
+    # Never a tool's file, even one the user named (candidate review E-L7): its knowledge belongs at the command.
+    return found | {target for target in named_there
+                    if rendered.counts.get(target, 0) >= POINTER_MINIMUM_MEMORIES and target not in rendered.tools}
+
+
+def _read_documents() -> dict[str, Any]:
+    try:
+        data = json.loads(read_text(data_home() / DOCUMENTS_FILE))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_documents(cache: dict[str, Any], roots: Sequence[Path]) -> None:
+    """Keep what the folders written now name, and the texts they hold, for the next refresh."""
+
+    wanted = {_key(root) for root in roots}
+    folders = {key: value for key, value in (cache.get("folders") or {}).items() if key in wanted}
+    held = {digest for value in folders.values() for digest in value.get("texts") or []}
+    texts = {digest: named for digest, named in (cache.get("texts") or {}).items() if digest in held}
+    try:
+        write_text_atomic(data_home() / DOCUMENTS_FILE, json.dumps(
+            {"names": cache.get("names"), "folders": folders, "texts": texts}, indent=0, sort_keys=True) + "\n")
+    except OSError as exc:
+        journal.problem("knowledge files", f"what the projects' documents name could not be kept: {exc}")
 
 
 # --- Starting a refresh -------------------------------------------------------------------------------

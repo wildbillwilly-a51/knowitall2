@@ -343,8 +343,9 @@ def changelog_since(previous: str | None, *, limit: int = 12) -> list[str]:
             continue
         if previous is not None and _version_key(match.group(1)) <= _version_key(previous):
             continue
-        for bold in re.findall(r"^- \*\*(.+?)\*\*", match.group(2), re.MULTILINE):
-            notes.append(f"{match.group(1)}: {bold.rstrip('.')}")
+        # A heading may wrap onto the next line (0.11.0's "... are told apart." did, and was left out).
+        for bold in re.findall(r"^- \*\*(.+?)\*\*", match.group(2), re.MULTILINE | re.DOTALL):
+            notes.append(f"{match.group(1)}: {' '.join(bold.split()).rstrip('.')}")
     return notes[:limit]
 
 

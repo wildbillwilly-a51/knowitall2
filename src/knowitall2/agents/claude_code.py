@@ -2,8 +2,8 @@
 
 - The MCP server is a user-scope entry under ``mcpServers`` in ``.claude.json``,
   which the CLI and the desktop app's Code tab share.
-- The session hooks (SessionStart, Stop, SessionEnd, UserPromptSubmit, and PostToolUseFailure
-  for shell commands) are exec-form entries in
+- The session hooks (SessionStart, Stop, SessionEnd, UserPromptSubmit, and PostToolUse and
+  PostToolUseFailure for shell commands) are exec-form entries in
   ``settings.json`` that run a small launcher in the KnowItAll2 data home,
   when it is there (``hook_entry``).
   Exec form (``command`` plus ``args``) involves no shell, so paths with
@@ -171,12 +171,14 @@ class ClaudeCodeAdapter(AgentAdapter):
     # Hooks ----------------------------------------------------------------
 
     def refresh_hook_launcher(self, launch: ServerLaunch) -> str | None:
+        compile_hook_modules()
         launcher = hook_launcher_path()
         if write_hook_launcher(launcher, launch, "claude-code", create=False):
             return f"refreshed the KnowItAll2 session hook launcher at {launcher}"
         return None
 
     def _install_hook(self, launch: ServerLaunch) -> str | None:
+        compile_hook_modules()
         launcher = hook_launcher_path()
         launcher_changed = write_hook_launcher(launcher, launch, "claude-code")
         for _ in range(_WRITE_ATTEMPTS):
@@ -249,16 +251,19 @@ class ClaudeCodeAdapter(AgentAdapter):
 
 # Session start adds the briefing; a turn's end learns after a commit and shows
 # what was learned; the session's end learns the rest; the user's message
-# carries news to the agent where the app does not show hook messages. After a
-# Bash or PowerShell command fails, what is known about that command (``commands``).
-HOOK_EVENTS = ("SessionStart", "Stop", "SessionEnd", "UserPromptSubmit", "PostToolUseFailure")
+# carries news to the agent where the app does not show hook messages. After
+# every Bash or PowerShell command, succeeded or failed, the tool rules and
+# lessons that command or its output calls for (``commands``): Claude Code runs
+# PostToolUse after a command that succeeded and PostToolUseFailure after one
+# that failed, never both.
+HOOK_EVENTS = ("SessionStart", "Stop", "SessionEnd", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure")
 _EVENT_ARGUMENTS = {"SessionStart": [], "Stop": ["stop"], "SessionEnd": ["session-end"],
-                    "UserPromptSubmit": ["prompt-submit"], "PostToolUseFailure": ["command"]}
+                    "UserPromptSubmit": ["prompt-submit"], "PostToolUse": ["command"], "PostToolUseFailure": ["command"]}
 _EVENT_WORDS = {"SessionStart": "session-start", "Stop": "end-of-turn", "SessionEnd": "session-end",
-                "UserPromptSubmit": "message", "PostToolUseFailure": "failed-command"}
+                "UserPromptSubmit": "message", "PostToolUse": "after-command", "PostToolUseFailure": "failed-command"}
 _EVENT_TIMEOUTS = {"SessionStart": HOOK_TIMEOUT_SECONDS, "Stop": 15, "SessionEnd": 15, "UserPromptSubmit": 10,
-                   "PostToolUseFailure": 5}
-_EVENT_MATCHERS = {"PostToolUseFailure": "Bash|PowerShell"}
+                   "PostToolUse": 5, "PostToolUseFailure": 5}
+_EVENT_MATCHERS = {"PostToolUse": "Bash|PowerShell", "PostToolUseFailure": "Bash|PowerShell"}
 
 
 def hook_launcher_path() -> Path:
@@ -280,8 +285,33 @@ def hook_entry(launch: ServerLaunch, event: str = "SessionStart") -> dict[str, A
             "timeout": _EVENT_TIMEOUTS[event]}
 
 
-_RUN_PREFIX = "import os,runpy,sys; p="
-_RUN_LAUNCHER = _RUN_PREFIX + "{path!r}; sys.argv=[p{arguments}]; os.path.isfile(p) and runpy.run_path(p, run_name='__main__')"
+# The launcher's source is run as the main script. Up to 0.11.0 ``runpy.run_path`` ran it, which loads pkgutil and
+# typing: 24 ms of each hook, and the after-command hook runs after every shell command (review 2026-10-14, E-L1).
+# A launcher damaged from outside (a disk fault, an antivirus) cannot be compiled, and Python would exit 1 with a
+# traceback after every shell command: any error before the launcher's own handling ends the hook quietly with 0
+# (review 2026-10-14 b, F-L1).
+_RUN_PREFIX = "import os,sys; sys.excepthook=lambda *a: os._exit(0); p="
+_RUN_LAUNCHER = (_RUN_PREFIX + "{path!r}; sys.argv=[p{arguments}]; os.path.isfile(p) and "
+                 "exec(compile(open(p,'rb').read(),p,'exec'),{{'__name__':'__main__','__file__':p}})")
+# How earlier versions began it (0.10.6 to 0.11.0, and the first 0.11.1 candidate): still recognised as
+# KnowItAll2's, to be replaced.
+_EARLIER_PREFIXES = ("import os,runpy,sys; p=", "import os,sys; p=")
+
+
+def compile_hook_modules() -> None:
+    """Bytecode for the whole package. Every hook runs with ``-B``, which reads bytecode but never writes it, so
+    each run compiled what it loads again: 11 ms of each shell command for ``commands.py`` (review 2026-10-14,
+    E-L1), and about 150 ms of each message for the rest (review b, F-L2). Python checks it against the source,
+    so a later change that leaves it stale costs only that again. Never in the way of setup."""
+
+    import compileall
+
+    import knowitall2
+
+    try:
+        compileall.compile_dir(str(Path(knowitall2.__file__).parent), quiet=1)
+    except Exception:
+        pass
 
 
 def render_launcher(launch: ServerLaunch) -> str:
@@ -317,7 +347,7 @@ def _is_launcher(path: object) -> bool:
 def _launcher_run_by(argument: object) -> str | None:
     """The launcher path in the words Python runs (``hook_entry``), or None."""
 
-    if not isinstance(argument, str) or not argument.startswith(_RUN_PREFIX):
+    if not isinstance(argument, str) or not argument.startswith((_RUN_PREFIX, *_EARLIER_PREFIXES)):
         return None
     try:
         statements = ast.parse(argument).body

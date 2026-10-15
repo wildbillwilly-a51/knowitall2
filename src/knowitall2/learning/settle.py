@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .. import journal
+from ..commands import RULE_TAG
 from ..memory import PREFERENCE_TAG, PROVISIONAL_TAG, Memory, significant_words
 from ..quotes import nearly_quoted_in, quoted_in, short_quote_in
 from ..store import RecordRow
@@ -327,7 +328,8 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
         merge = False
         if action == "update":
             known = _shown(shown, index, decision)
-            if known is not None:
+            # A tool rule is rewritten only from its lessons (``tool_rules``), never replaced by one more of them.
+            if known is not None and RULE_TAG not in known.tags:
                 dossier = dataclasses.replace(dossier, known=[*dossier.known, known])
                 candidate.update(relation="updates", known_id=known.id, own_text=candidate.get("text"),
                                  text=str(decision.get("text") or "").strip() or candidate.get("text"))

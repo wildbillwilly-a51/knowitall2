@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .. import commands as shell_commands
 from .. import journal
 from ..connected import maintenance_turn, renew_maintenance_turn, share_quietly
 from ..memory import Memory
@@ -32,6 +33,9 @@ from .extractor import (
 from .cataloguer import CATALOG_AGENT, CatalogReport, run_catalog
 from .command_tags import BATCH as COMMAND_BATCH, TagReport, tag_commands
 from .command_tags import waiting as command_waiting
+from .tool_rules import GROUPS_PER_CALL as RULE_GROUPS, RuleReport, write_rules
+from .tool_rules import RULES_AGENT, retire_orphans
+from .tool_rules import waiting as rules_waiting
 from .cataloguer import plan as catalog_plan
 from .learner import LEARNER_AGENT, SET_ASIDE_DAYS, LearnReport, learn
 from .maintenance import MAINTENANCE_AGENT, EngineReviewer, MaintenanceReport, maintain, retire_old_status
@@ -138,6 +142,7 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
                     journal.record(store, "catalog", filing.describe(), outcome="stopped" if filing.blocked else "ok",
                                    agent=CATALOG_AGENT, run=run, details=filing.details())
             journal.prune(store)
+            shell_commands.prune(shell_commands.home())   # what chats were given after commands: 30 days
             share_quietly(store)
             return
         run = new_run_id()
@@ -178,14 +183,19 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
                         )
                         print(filing.describe())
                         if not filing.blocked:
-                            tag_waiting_commands(store, extractor, state=state, run=run, budget=min(
+                            tagging = tag_waiting_commands(store, extractor, state=state, run=run, budget=min(
                                 COMMAND_CALLS_PER_RUN, _upkeep_budget(settings, state, "commands")))
+                            # Then the rules, from the lessons just tagged, under the same calls a day.
+                            if not tagging.blocked:
+                                write_waiting_rules(store, extractor, state=state, run=run, budget=min(
+                                    RULE_CALLS_PER_RUN, _upkeep_budget(settings, state, "commands")))
                 else:
                     print("Another computer sharing this memory is tidying it up, or the server cannot be "
                           "reached; tidying up is left for later.")
         record_learning_run(store, run, report, upkeep, engine=extractor, seconds=time.monotonic() - started,
                             filing=filing)
         journal.prune(store)
+        shell_commands.prune(shell_commands.home())   # what chats were given after commands: 30 days
         moments.prune_shown()
         share_quietly(store)
     finally:
@@ -230,6 +240,30 @@ def tag_waiting_commands(store: Store, engine: Any, *, state: LearnerState, run:
         journal.record(store, "catalog", report.describe(), outcome="stopped" if report.blocked else "ok",
                        agent=CATALOG_AGENT, run=run, details={"commands": report.keys, "calls": report.calls,
                                                               "tagged": report.tagged, "looked_at": report.looked_at})
+    return report
+
+
+# One call writes the rules of six groups: enough for what a day's learning adds. Writing them for the lessons
+# learned before 0.11.1 is ``knowitall2 catalog --rules``.
+RULE_CALLS_PER_RUN = 1
+
+
+def write_waiting_rules(store: Store, engine: Any, *, state: LearnerState, run: str, budget: int,
+                        origin: str = "commands") -> RuleReport:
+    """Write a tool rule for each quirk two chats learned, so agents get it after the commands it is about."""
+
+    # Rules whose lessons are gone go first, whatever the budget: it takes no model call (review 2026-10-14, E-M1).
+    retired = retire_orphans(Memory(store, agent=RULES_AGENT))
+    if budget <= 0:
+        return RuleReport(retired=len(retired))
+    moments.set_now({"since": moments.now_iso(), "doing": "writing tool rules from lessons learned in several chats"})
+    report = write_rules(store, engine, budget=budget, now=journal.utc_now(), state=state, origin=origin)
+    print(report.describe())
+    if report.calls or report.blocked:
+        journal.record(store, "catalog", report.describe(), outcome="stopped" if report.blocked else "ok",
+                       agent=CATALOG_AGENT, run=run, details={"rules": report.rules, "calls": report.calls,
+                                                              "written": report.written, "groups": report.groups},
+                       record_ids=report.rules)
     return report
 
 
@@ -429,6 +463,16 @@ def run_catalog_command(arguments: argparse.Namespace) -> int:
 
     settings = load_settings()
     commands_budget = getattr(arguments, "commands", None)
+    rules_budget = getattr(arguments, "rules", None)
+    if arguments.dry_run and rules_budget is not None:
+        store = Store.open(database_path())
+        try:
+            count = len(rules_waiting(store))
+        finally:
+            store.close()
+        print(f"Tool rules: {count} groups of lessons learned in several chats wait for their rules, about "
+              f"{-(-count // RULE_GROUPS)} model calls. Dry run: no model calls were made.")
+        return 0
     if arguments.dry_run and commands_budget is not None:
         store = Store.open(database_path())
         try:
@@ -468,7 +512,12 @@ def run_catalog_command(arguments: argparse.Namespace) -> int:
                 try:
                     share_quietly(store)
                     # The user asked for it now: held back neither by the daily limit nor by upkeep's own calls.
-                    if commands_budget is not None:
+                    if rules_budget is not None:
+                        # It prints its own report.
+                        write_waiting_rules(store, engine, state=state, run=run, budget=max(0, rules_budget),
+                                            origin="user")
+                        report = None
+                    elif commands_budget is not None:
                         # It prints its own report.
                         tag_waiting_commands(store, engine, state=state, run=run, budget=max(0, commands_budget),
                                              origin="user")
@@ -498,7 +547,7 @@ def maintenance_details(report: MaintenanceReport) -> dict:
     return {
         "groups": dict(report.statuses()), "calls": report.calls, "deferred": report.deferred,
         "failed": report.failed, "changes": dict(report.changes), "blocked": report.blocked,
-        "usage": dict(report.usage), "left_alone": report.left_alone,
+        "usage": dict(report.usage), "left_alone": report.left_alone, "near_repeats": report.near_repeats,
     }
 
 

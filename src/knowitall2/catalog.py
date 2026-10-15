@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from .store import Store
 
@@ -51,6 +51,25 @@ FACET_KINDS = {"howto": "procedure", "rule": "rule", "decision": "decision", "le
 _NON_WORD = re.compile(r"[\W_]+")
 
 
+# The agent's own tools on the workstation: the shells, the agents themselves, and the programs they run
+# commands with. What is known about them is quirks, which belong at the command (``commands``), so the agent
+# naming one in its own words ("run one-off PowerShell", "both Claude and Codex can use it") is no sign the
+# work needs its file: of 13 pointers to codex.md in two days, 2 were relevant, and powershell.md 1 of 6
+# (docs/research/2026-10-13-root-causes/pointers.md). Area and kind alone do not tell them from Hermes or
+# OpenClaw, which agents work on, so a system is one when its name or an alias is on this list and it is
+# filed as software (or other), or when it is a script of the workstation's own (``WORKSTATION_SCRIPTS``).
+WORKSTATION_TOOLS = (
+    "Claude Code", "Claude Code CLI", "Claude desktop app", "Claude Desktop", "Claude app", "Codex", "Codex CLI",
+    "OpenAI Codex", "Codex app", "Codex desktop app", "cua_repl", "Computer Use REPL", "PowerShell",
+    "Windows PowerShell", "pwsh", "Git Bash", "Git for Windows", "Git Bash on Windows", "Command Prompt", "cmd.exe",
+    "Windows Terminal", "WSL", "WSL2", "WSL Ubuntu", "Windows Subsystem for Linux", "Windows OpenSSH",
+    "OpenSSH on Windows", "GitHub CLI", "gh CLI", "Docker Desktop", "Visual Studio Code", "VS Code", "winget",
+)
+WORKSTATION_KINDS = ("software", "other")
+# A script the workstation runs, catalogued as software of its own (save-local-work.ps1).
+WORKSTATION_SCRIPTS = (".ps1", ".psm1", ".sh", ".bat", ".cmd")
+
+
 def area_for(kind: str, area: object) -> str:
     """The area a system is shown in: every project and practice together, others as filed."""
 
@@ -61,6 +80,20 @@ def area_for(kind: str, area: object) -> str:
 
 def normalize_name(name: str) -> str:
     return " ".join(_NON_WORD.split(name.casefold())).strip()
+
+
+_WORKSTATION_NAMES = frozenset(normalize_name(name) for name in WORKSTATION_TOOLS)
+
+
+def workstation_tool(name: str, kind: str, aliases: Sequence[str] = ()) -> bool:
+    """Whether a system is one of the agent's own tools on the workstation (``WORKSTATION_TOOLS``): decided from
+    its name, aliases, and kind alone, the same way every time, without a model."""
+
+    if kind not in WORKSTATION_KINDS:
+        return False
+    if str(name).strip().casefold().endswith(WORKSTATION_SCRIPTS):
+        return True
+    return any(normalize_name(str(item)) in _WORKSTATION_NAMES for item in (name, *aliases))
 
 
 def system_id_for(name: str) -> str:

@@ -23,6 +23,8 @@ os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 # No test starts a background rewrite of knowledge files; test_known turns them on where it tests them.
 os.environ["KNOWITALL2_KNOWN_FILES"] = "0"
 atexit.register(shutil.rmtree, _TEST_HOME, True)
+# Setup compiles the package (``claude_code.compile_hook_modules``): into the test home, not the source tree.
+sys.pycache_prefix = os.path.join(_TEST_HOME, "pycache")
 
 
 def make_repository(root: Path, remote: str | None = None, *, remote_name: str = "origin") -> Path:

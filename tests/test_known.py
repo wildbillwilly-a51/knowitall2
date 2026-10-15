@@ -75,9 +75,9 @@ class KnownTestCase(unittest.TestCase):
         options.setdefault("project_path", self.project)
         return self.memory.remember(text, **options).record
 
-    def file(self, record_id: str, system: str, *, aliases=(), facet: str = "access") -> None:
+    def file(self, record_id: str, system: str, *, aliases=(), facet: str = "access", kind: str = "device") -> None:
         system_id = "sys-" + system.casefold().replace(" ", "-")
-        self.store.upsert_system(system_id=system_id, name=system, area="Homelab", kind="device", aliases=list(aliases),
+        self.store.upsert_system(system_id=system_id, name=system, area="Homelab", kind=kind, aliases=list(aliases),
                                  now=self.clock())
         self.store.set_note(record_id, headline=system, system_id=system_id, facet=facet, written_by="catalog",
                             now=self.clock())
@@ -1119,7 +1119,7 @@ class PointerTests(KnownTestCase):
 
     def test_a_message_naming_a_system_points_once_to_its_file(self) -> None:
         folder = self.systems()
-        found = known.find_pointers(self.connection, ["the images are on nas-file1/files/cisco ap"], folder, [])
+        found = known.find_pointers(self.connection, ["the images are on nas-file1, in files/cisco ap"], folder, [])
         self.assertEqual(["synology.md"], [target for target, _ in found])
         self.assertIn(f"{known.FOLDER}/synology.md (3 memories)", found[0][1])
         self.assertIn("what is known about Synology", found[0][1])
@@ -1144,7 +1144,7 @@ class PointerTests(KnownTestCase):
             with self.subTest(text):
                 self.assertEqual([], known.find_pointers(self.connection, [text], folder, []))
         self.assertEqual(["synology.md"], [t for t, _ in known.find_pointers(
-            self.connection, ["the files are on nas-file1/files/cisco ap"], folder, [])])   # a host first in a path
+            self.connection, ["ssh codex@nas-file1"], folder, [])])   # a host after a login counts
 
     def test_knowitall2_named_in_the_agents_words_brings_no_pointer(self) -> None:
         # Agents pass on KnowItAll2's news, which pointed them to its file in every project (2026-10-10).
@@ -1156,9 +1156,7 @@ class PointerTests(KnownTestCase):
         news = ["KnowItAll2 learned 3 things from this session.", "KIA2 saved the NAS route."]
         self.assertEqual([], known.find_pointers(self.connection, ["go on"], folder, [], own_words=news))
         self.assertEqual(["synology.md"], [t for t, _ in known.find_pointers(
-            self.connection, ["go on"], folder, [], own_words=["KnowItAll2 learned how to reach nas-file1."])])
-        self.assertEqual(["knowitall2.md"], [t for t, _ in known.find_pointers(
-            self.connection, ["how do I update KnowItAll2?"], folder, [], own_words=news)])
+            self.connection, ["go on"], folder, [], own_words=["KIA2 learned how to reach nas-file1."])])
 
     def test_no_pointer_without_the_folder_knowitall2_wrote(self) -> None:
         self.systems()
@@ -1231,7 +1229,7 @@ class PointerHookTests(unittest.TestCase):
 
         hooks.session_start(json.dumps({"session_id": self.session, "transcript_path": str(self.log),
                                         "cwd": str(self.alpha), "source": "startup"}), start_learner=lambda: None)
-        context = self.message("the .tar is on nas-file1/files/cisco ap")
+        context = self.message("the .tar is on nas-file1, in files/cisco ap")
         self.assertIn(f"{known.FOLDER}/synology.md (3 memories)", context)
         self.assertNotIn("synology.md", self.message("still about nas-file1"))
         logged = (self.root / "data" / known.POINTER_LOG).read_text(encoding="utf-8").splitlines()

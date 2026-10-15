@@ -32,6 +32,10 @@ MAX_RECALL_LIMIT = 25
 DEFAULT_BRIEFING_CHARACTERS = 3600
 BRIEFING_ITEM_CHARACTERS = 240
 BRIEFING_RULE_CHARACTERS = 200
+# Three lines of tool rules (study of 2026-10-13: three answered 13 of 33 held quirk moments, all before the first
+# try, at three lines a chat; five answered 15 at five).
+BRIEFING_TOOL_RULES = 3
+BRIEFING_TOOL_RULE_CHARACTERS = 260
 # For a chat that moves to another project: that project's part of a briefing.
 CONTENTS_CHARACTERS = 1800
 # The briefing shows the project's most useful memories in full, then a table
@@ -82,7 +86,10 @@ PROVISIONAL_TAG = "provisional"
 # The weaker side of a disagreement still being checked: shown with a warning and ranked lower, until it is
 # settled (by an agent's check, the user, or after a week by the evidence).
 DISPUTED_TAG = "disputed"
-RESERVED_TAGS = frozenset({PROVISIONAL_TAG, DISPUTED_TAG})
+# A tool rule's tag (``commands.RULE_TAG``): only the rule writer sets it (``tool_rules.save_rule``). One remember
+# call with it made a rule every chat was given first (review 2026-10-14, E-H1). A rule's other tags (``shell:``,
+# ``error:``, ...) grant nothing without it and the writer's name, so they stay ordinary words (review b, F-L6).
+RESERVED_TAGS = frozenset({PROVISIONAL_TAG, DISPUTED_TAG, "tool-rule"})
 LASTING_PREFERENCE_CHATS = 3
 BRIEFING_PREFERENCES = 10
 # The reason on the user's words said again, replaced by the memory that holds the preference (``Store.times_said``).
@@ -321,6 +328,7 @@ class Memory:
         recorded_at: str | None = None,
         detect_project: bool = True,
         touch_existing: bool = True,
+        reserved_tags: Iterable[str] = (),
     ) -> RememberResult:
         """Save one memory. ``project`` and ``recorded_at`` let an import keep a
         memory's original project and date; ``detect_project`` off leaves the
@@ -352,8 +360,13 @@ class Memory:
                 "as separate arguments."
             )
         subject_list = _clean_labels(subjects, "subjects")
-        # "provisional" and "disputed" are set by the learner and the questions alone, never through remember.
+        # "provisional" and "disputed" are set by the learner and the questions alone, and the tool rule's tag by the
+        # rule writer alone: never through remember. ``reserved_tags`` is the rule writer's way (and a correction
+        # of a rule), so a rule is written with its tags in one insert (review b, F-L5).
         tag_list = [tag for tag in _clean_labels(tags, "tags") if tag.casefold() not in RESERVED_TAGS]
+        tag_list = [*(tag for tag in _clean_labels(reserved_tags, "tags") if tag not in tag_list), *tag_list]
+        if len(tag_list) > MAX_LABELS:
+            raise MemoryInputError(f"Use at most {MAX_LABELS} tags.")
         findings = find_secrets("\n".join([body, *subject_list, *tag_list]))
         if findings:
             kinds = ", ".join(sorted({finding.kind for finding in findings}))
@@ -688,10 +701,22 @@ class Memory:
         project = None
         if record.scope == "project" and record.project_id:
             project = ProjectIdentity(record.project_id, record.project_name or record.project_id, Path(""), None)
-        result = self.remember(
-            text, kind=record.kind, subjects=record.subjects, tags=record.tags, scope=record.scope, source="user",
-            replaces=record.id, project=project, detect_project=False,
-        )
+        from .commands import RULE_TAG, RULES_AGENT, rule_provenance
+
+        if RULE_TAG in record.tags and record.source_agent == RULES_AGENT:
+            # A tool rule in the user's words stays a rule, written as the rule writer writes one, naming the
+            # lessons it came from (review b, F-L4).
+            writer = Memory(self.store, agent=RULES_AGENT, clock=self._clock)
+            result = writer.remember(
+                " ".join(text.split()).rstrip() + rule_provenance(record.text), kind=record.kind,
+                subjects=record.subjects, tags=[tag for tag in record.tags if tag != RULE_TAG], reserved_tags=[RULE_TAG],
+                scope=record.scope, source="user", replaces=record.id, project=project, detect_project=False,
+            )
+        else:
+            result = self.remember(
+                text, kind=record.kind, subjects=record.subjects, tags=record.tags, scope=record.scope, source="user",
+                replaces=record.id, project=project, detect_project=False,
+            )
         if result.status == "already_known" and result.replaced is None:
             raise MemoryInputError("That is exactly what the memory already says.")
         return result
@@ -831,12 +856,14 @@ class Memory:
         rules, instructed = _without_instructed(rules, project)
         rules, elsewhere = self._rules_for_its_systems(rules, project)
         preferences = self._lasting_preferences(project_id)
+        tool_rules = self._tool_rules(project_id)
         entries, snapshots = self._contents(project) if project is not None else ([], 0)
+        entries = [entry for entry in entries if entry.record.id not in {row.id for row in tool_rules}]
         notice = self._question_notice(project_id)
         from .known import folder_line
 
         where_everything_is = folder_line(project_path)
-        if not rules and not preferences and not entries and not instructed and not elsewhere:
+        if not rules and not preferences and not entries and not instructed and not elsewhere and not tool_rules:
             self._log_usage("briefing", project, None, [])
             where = "this project" if project else "this folder"
             lines_out = [
@@ -875,6 +902,13 @@ class Memory:
             for row, times in preferences:
                 if lines.add_item(f"- [{row.id}] {_shorten(row.text, BRIEFING_RULE_CHARACTERS)} (said in {times} chats)"):
                     shown.append(row.id)
+        if tool_rules:
+            from .commands import rule_summary
+
+            lines.add("Tool rules (how commands behave on this computer, learned in several chats):")
+            for row in tool_rules:
+                if lines.add_item(f"- [{row.id}] {_shorten(rule_summary(row.text), BRIEFING_TOOL_RULE_CHARACTERS)}"):
+                    shown.append(row.id)
         shown += _add_contents(lines, entries, now=self._clock())
         self._log_usage("briefing", project, None, shown)
         omitted = lines.omitted + snapshots
@@ -887,6 +921,35 @@ class Memory:
                 lines.force(line)
         lines.force(footer)
         return lines.text()
+
+    def _tool_rules(self, project_id: str | None) -> list[RecordRow]:
+        """The checked tool rules for this agent's shells, here or everywhere, most recurrent first.
+
+        The study of 2026-10-13 found the briefing the only channel that reaches an agent before its first try
+        with no hook at all (Codex), and that two of the three lines it would show were about Claude Code's Bash
+        tool, which do not apply to Codex: so the rules are those of this agent's shells.
+
+        Only the rule writer's rules, and only while the lessons they name stand in two chats; their chats are
+        counted from those lessons, through what maintenance merged them into, not read from a tag (review
+        2026-10-14, E-H1 and E-M1, and b, F-H1); one the user restored or corrected stands on their word.
+        """
+
+        from . import commands
+
+        rows = {row.id: row for row in self.store.tagged_active(commands.RULE_TAG, limit=2000)
+                if row.kind == "lesson" and row.verification in commands.CHECKED
+                and row.source_agent == commands.RULES_AGENT
+                and not set(commands.UNCHECKED_TAGS) & set(row.tags)
+                and (row.scope == "global" or row.project_id == project_id)}
+        lookup = commands.source_lookup(self.store._connection,
+                                        [source for row in rows.values() for source in commands.rule_sources(row.text)])
+        found = [{**fields, "id": row.id, "chats": chats}
+                 for row in sorted(rows.values(), key=lambda row: row.created_at, reverse=True)
+                 for fields, chats in [(commands.rule_fields(row.tags),
+                                         commands.trusted_chats(row.source_agent, row.verification, row.text, lookup))]
+                 if fields is not None and chats]
+        return [rows[item["id"]] for item in commands.briefing_rules(found, agent=self.agent,
+                                                                     limit=BRIEFING_TOOL_RULES)]
 
     def project_contents(
         self, project_id: str, *, known: Iterable[str] = (), max_characters: int = CONTENTS_CHARACTERS,
@@ -921,26 +984,71 @@ class Memory:
         return lines.text()
 
     def added_since(
-        self, projects: Iterable[str], since: str, *, known: Iterable[str] = (),
+        self, projects: Iterable[str], since: str, *, known: Iterable[str] = (), sessions: Iterable[str] = (),
+        touched: Iterable[str] | None = None,
     ) -> list[tuple[str, str]]:
-        """Memories added from ``since`` on for these projects (their own, and their systems' shared ones),
-        newest first, as (id, "System: headline"), leaving out ``known`` ones and current-state notes."""
+        """Memories added from ``since`` on for these projects, newest first, as (id, "System: headline"), leaving
+        out ``known`` ones and current-state notes.
 
-        known = set(known)
+        Never what was learned from ``sessions`` (the chat's own): in the 2026-10-13 study, 121 of the 197 items
+        listed were what the learner had just written from that same chat, which had found them itself. With
+        ``touched`` (the systems the chat named in its commands or the user's words), a shared memory counts only
+        when it is about one of them or about the project itself; the project's own memories always count. That
+        study's replay (F2) listed 106 items instead of 462, 71% of them about what the chat then worked on
+        instead of 20%, and kept every listed item an agent went on to recall that was not the chat's own.
+        """
+
+        from .catalog import find_system
+
+        known, sessions = set(known), {session for session in sessions if session}
+        relevant = None if touched is None else set(touched)
+        systems = self.store.systems_list() if relevant is not None else []
         found: dict[str, tuple[str, str]] = {}
         for project_id in projects:
             project = self.stored_project(project_id)
             if project is None:
                 continue
+            own = find_system(systems, project.name) if relevant is not None else None
             entries, _ = self._contents(project, since=since, include_rules=True)
             for entry in sorted(entries, key=lambda item: item.record.created_at, reverse=True):
-                if entry.record.id in known or entry.record.id in found:
+                record = entry.record
+                if record.id in known or record.id in found or (record.source_session or "") in sessions:
                     continue
-                label = "rule" if entry.record.kind == "rule" else entry.group
-                note = f" ({PROVISIONAL_LABEL})" if PROVISIONAL_TAG in entry.record.tags else ""
-                found[entry.record.id] = (entry.record.created_at, f"{label}: {entry.headline}{note}")
+                if relevant is not None and record.scope != "project" and entry.system_id not in relevant and not (
+                        own and entry.system_id == own["id"]):
+                    continue
+                label = "rule" if record.kind == "rule" else entry.group
+                note = f" ({PROVISIONAL_LABEL})" if PROVISIONAL_TAG in record.tags else ""
+                found[record.id] = (record.created_at, f"{label}: {entry.headline}{note}")
         ordered = sorted(found.items(), key=lambda item: item[1][0], reverse=True)
         return [(record_id, line) for record_id, (_, line) in ordered]
+
+    def learned_in(self, sessions: Iterable[str], *, known: Iterable[str] = (),
+                   limit: int = 5) -> list[tuple[str, str]]:
+        """What learning saved from ``sessions`` (a chat's own) and still holds, newest first, as (id, line); a
+        memory not yet checked by the final pass is marked so. Current-state notes and ``known`` ones are left out.
+        """
+
+        known = set(known)
+        found: dict[str, RecordRow] = {}
+        for session in dict.fromkeys(session for session in sessions if session):
+            for row in self.store.from_session(session, limit=limit + len(known) + 20):
+                if row.id not in known:
+                    found.setdefault(row.id, row)
+        rows = list(found.values())
+        notes = self.store.notes_for([row.id for row in rows])
+        lines: list[tuple[str, str, str]] = []
+        for row in rows:
+            note = notes.get(row.id) or {}
+            if note.get("facet") == "status":
+                continue
+            group = note.get("system_name") or "Other"
+            headline = _headline(note.get("headline") or row.text, group)
+            label = "" if group == "Other" else f"{group}: "
+            checked = " (not yet checked)" if PROVISIONAL_TAG in row.tags else ""
+            lines.append((row.created_at, row.id, f"[{row.id}] {label}{headline}{checked}"))
+        lines.sort(key=lambda item: item[0], reverse=True)
+        return [(record_id, line) for _, record_id, line in lines[:limit]]
 
     def stored_project(self, project_id: str) -> ProjectIdentity | None:
         row = next((item for item in self.store.project_list() if item.get("id") == project_id), None)
@@ -968,7 +1076,8 @@ class Memory:
                 continue
             group = item["system_name"] or "Other"
             entries.append(_Entry(record, _headline(item["headline"] or record.text, group), facet, group,
-                                  item["weight"] + (1000 if own and item["system_id"] == own["id"] else 0)))
+                                  item["weight"] + (1000 if own and item["system_id"] == own["id"] else 0),
+                                  item["system_id"]))
         entries.sort(key=_entry_order)
         return entries, snapshots
 
@@ -1254,6 +1363,7 @@ class _Entry:
     facet: str
     group: str
     weight: int
+    system_id: str | None = None
 
 
 def _entry_order(entry: _Entry) -> tuple:

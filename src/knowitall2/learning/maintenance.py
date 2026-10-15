@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from .. import journal, review
+from ..commands import RULE_TAG
 from ..memory import (
     DISPUTED_TAG, PROVISIONAL_TAG, VERIFICATION_STRENGTH, Memory, MemoryInputError, _stem, in_users_words,
     is_users_choice,
@@ -82,8 +83,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
 }
 
 REVIEW_PROMPT = """You review the long-term memory of a user's coding agents. You receive one group of memories from the same scope. Each shows its id, kind, how it was verified, when it was saved, and its text. Point out only clear problems:
-- "duplicate": two or more memories that state the same knowledge, even in different words. When one says everything another says and more, the other is a duplicate. Set keep_id to the most complete and specific one and ids to the others.
-- "combine": two or more memories about the same thing, each holding details the others lack, that one memory could hold. Set ids to them, keep_id to "", and text to that one memory: it keeps every name, address, path, port, number, and "not" or "never" of each, under 600 characters, and says nothing they do not.
+- "duplicate": two or more memories that state the same knowledge, even in different words, where the one you keep already says everything each other one says. Set keep_id to the most complete and specific one and ids to the others. Before you report a "duplicate", check each copy against the one you keep: when a copy holds a name, address, path, port, number, date, version, or "not" or "never" that the kept one lacks, or says anything the kept one does not, report "combine" instead, never "duplicate". A duplicate whose copy holds such a detail is refused and changes nothing.
+- "combine": two or more memories about the same thing, each holding details the others lack, that one memory could hold. This is the usual finding for near-repeats: the same knowledge saved again, with a detail added or left out. Set ids to them, keep_id to "", and text to that one memory: it keeps every name, address, path, port, number, and "not" or "never" of each, under 600 characters, and says nothing they do not.
 - "outdated": memories that a newer memory in this group shows are no longer true. Set keep_id to the newer memory and ids to the outdated ones.
 - "snapshot": memories that only record a temporary status that was likely to change soon, such as a connection or sign-in state, a pending step, a temporary failure, or progress on a task, and that have no lasting value. Set keep_id to "" and ids to those memories.
 - "conflict": two memories that disagree, when this group does not show which one is right. Set keep_id to "" and ids to exactly those two.
@@ -138,6 +139,9 @@ class MaintenanceReport:
     usage: Counter = field(default_factory=Counter)
     # Findings the gates left alone, with why, for the run's journal entry.
     left_alone: list[str] = field(default_factory=list)
+    # Copies the model called duplicates that hold a detail the kept one lacks, and could be combined instead: left
+    # as they are, with no question and no further call, and counted (2026-10-14 catch-up: 303 such refusals).
+    near_repeats: int = 0
 
     def statuses(self) -> Counter:
         return Counter(status for _, status in self.plan)
@@ -154,6 +158,9 @@ class MaintenanceReport:
         lines.append(f"Review calls: {self.calls}{deferred}.")
         if self.changes:
             lines.append("Findings: " + ", ".join(f"{name} {count}" for name, count in sorted(self.changes.items())))
+        if self.near_repeats:
+            lines.append("Near-repeats found as duplicates but each holding a detail, left for combining: "
+                         f"{self.near_repeats}.")
         if self.failed:
             lines.append(f"Will retry later: {self.failed} group(s).")
         if self.blocked:
@@ -210,16 +217,26 @@ def maintain(
             budget -= 1
             report.calls += 1
             _record_call(state, "ok", origin)
+            made: list[str] = []
+            near: list[str] = []
             with store.transaction():
                 for finding in findings:
                     report.changes.update(apply_finding(memory, finding, group, busy, run=run,
-                                                        left_alone=report.left_alone))
+                                                        left_alone=report.left_alone, made=made, near_repeats=near))
                 # The group as it now stands is reviewed too, so its changes cost no second look.
                 remaining = [record for record in (store.get(item.id) for item in group.members)
                              if record is not None and record.status == "active"]
                 for fingerprint in {group.fingerprint, group_fingerprint(group.scope_key, remaining)}:
                     store.record_review(fingerprint, scope_key=group.scope_key, outcome="reviewed", now=memory.now())
-                mark_reviewed(memory, remaining)
+                # So is a memory this call combined from members of the group: it was made from memories reviewed
+                # with the rest, and was otherwise new to the next plan (2026-10-14: right after the catch-up
+                # combined 45 memories, 22 groups were due again). The keeper of a merged duplicate or of a
+                # replaced outdated memory is a member, unchanged, so it is in ``remaining`` already.
+                holders = [record for record in (store.get(item) for item in dict.fromkeys(made))
+                           if record is not None and record.status == "active"]
+                members = {record.id for record in remaining}
+                mark_reviewed(memory, remaining + [record for record in holders if record.id not in members])
+            report.near_repeats += len(set(near))
         cutoff = _parse_time(memory.now()) - timedelta(days=REVIEWS_KEPT_DAYS)
         store.prune_reviews(before=cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
     finally:
@@ -284,9 +301,11 @@ def mark_reviewed(memory: Memory, records: list[RecordRow]) -> None:
 def build_groups(memory: Memory) -> list[Group]:
     groups: list[Group] = []
     for scope, project_id in memory.store.active_scopes():
+        # The final pass decides provisional memories first. A tool rule says what its source lessons say, and
+        # those are kept to check it against (``tool_rules``): neither may replace the other as a duplicate.
         members = [record for record in memory.store.list_active(project_id=project_id, scope=scope,
                                                                  limit=MAX_SCOPE_MEMBERS)
-                   if PROVISIONAL_TAG not in record.tags]   # the final pass decides those first
+                   if PROVISIONAL_TAG not in record.tags and RULE_TAG not in record.tags]
         if not members:
             continue
         if scope == "global":
@@ -371,12 +390,14 @@ def render_group(group: Group) -> str:
 
 def apply_finding(
     memory: Memory, finding: dict[str, Any], group: Group, busy: set[str], *, run: str | None = None,
-    left_alone: list[str] | None = None,
+    left_alone: list[str] | None = None, made: list[str] | None = None, near_repeats: list[str] | None = None,
 ) -> list[str]:
     """Apply one finding through the gates; returns an outcome name per affected memory.
 
     Each change is recorded in the journal, with the memory it keeps; a finding the gates turn down goes into
-    ``left_alone``, which the run's journal entry keeps.
+    ``left_alone``, which the run's journal entry keeps. The id of a memory a combination made goes into
+    ``made``; a copy refused as a duplicate because it holds a detail, which could be combined instead, into
+    ``near_repeats``.
     """
 
     def changed(outcome: str, record: RecordRow, keep: RecordRow | None, why: str) -> str:
@@ -421,7 +442,7 @@ def apply_finding(
     outcomes: list[str] = []
     if kind == "combine":
         outcomes.extend(_combine(memory, [current[item] for item in ids], str(finding.get("text") or ""),
-                                 detail, changed, left_alone))
+                                 detail, changed, left_alone, made))
     elif kind == "duplicate":
         # The model's choice is the most complete copy. It replaces only copies that say
         # the same thing (two different rules of the user's were merged, 2026-10-11) and
@@ -438,6 +459,8 @@ def apply_finding(
                 outcomes.append("kept (better verified)")
             elif not may_merge(record, keep):
                 outcomes.append(kept("not the same statement", record, keep))
+                if near_repeats is not None and _not_combinable([record, keep]) is None:
+                    near_repeats.append(record.id)   # asked nothing more: a later review can combine them
             elif (record.kind == "rule" and keep.kind != "rule") or (
                     record.kind == keep.kind and record.verification == keep.verification == "user_stated"
                     and record.created_at > keep.created_at):
@@ -544,7 +567,7 @@ def retire_old_status(memory: Memory) -> int:
 
 
 def _combine(memory: Memory, records: list[RecordRow], text: str, detail: str, changed: Any,
-             left_alone: list[str] | None) -> list[str]:
+             left_alone: list[str] | None, made: list[str] | None = None) -> list[str]:
     """Combine near-repeats into one memory through the gates; the inputs are kept, superseded, to undo it.
 
     The gate refused about 400 duplicate findings in one catch-up, because each copy held a detail the kept one
@@ -559,12 +582,9 @@ def _combine(memory: Memory, records: list[RecordRow], text: str, detail: str, c
         return [f"kept ({why})"]
 
     combined = " ".join(text.split())
-    if any(record.verification == "user_stated" or record.kind in ("rule", "note") for record in records):
-        return refused("the user's own words, a rule, or a note")
-    if len({record.verification for record in records}) > 1:
-        return refused("verified differently")
-    if len({(record.scope, record.project_id) for record in records}) > 1:
-        return refused("filed in different places")
+    why = _not_combinable(records)
+    if why:
+        return refused(why)
     if not 20 <= len(combined) <= COMBINED_CHARACTERS:
         return refused("combined text missing or too long")
     if not keeps_everything([record.text for record in records], combined):
@@ -584,6 +604,8 @@ def _combine(memory: Memory, records: list[RecordRow], text: str, detail: str, c
     except MemoryInputError as exc:
         return refused(f"not accepted ({exc})"[:120])
     holder = result.record
+    if made is not None:
+        made.append(holder.id)
     outcomes = []
     for record in records:
         if record.id == holder.id:
@@ -592,6 +614,18 @@ def _combine(memory: Memory, records: list[RecordRow], text: str, detail: str, c
                                reason=f"{REASON_PREFIX}combined into [{holder.id}]{detail}")
         outcomes.append(changed("combined", record, holder, detail.lstrip(": ")))
     return outcomes
+
+
+def _not_combinable(records: list[RecordRow]) -> str | None:
+    """Why these memories may never be combined, whatever the text; None when they may."""
+
+    if any(record.verification == "user_stated" or record.kind in ("rule", "note") for record in records):
+        return "the user's own words, a rule, or a note"
+    if len({record.verification for record in records}) > 1:
+        return "verified differently"
+    if len({(record.scope, record.project_id) for record in records}) > 1:
+        return "filed in different places"
+    return None
 
 
 def keeps_everything(sources: list[str], combined: str) -> bool:

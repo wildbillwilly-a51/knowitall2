@@ -222,6 +222,43 @@ class SilentAppTests(MomentTestCase):
                       context["additionalContext"])
         self.assertEqual({}, self.prompt())
 
+    def test_learning_news_is_passed_on_once_a_chat_and_later_only_shown_as_a_notice(self) -> None:
+        # 2026-10-12 review: "KnowItAll2 learned N things" after each commit was passed on to the user every time,
+        # opening most replies (42 of 58), and each relay could set off a pointer. Held to once a chat.
+        self.assertIn(hooks.RELAY, self.prompt()["hookSpecificOutput"]["additionalContext"])
+        moments.add_news({"reason": "commit", "detail": "5e6f7a8", "status": "done", "folders": [str(self.project)],
+                          "sessions": moments.session_keys(str(self.log_path), SESSION),
+                          "saved": [{"id": "k-3", "text": "The homelab switch is sw01."}]})
+        later = self.prompt()
+        self.assertNotIn(hooks.RELAY, later.get("hookSpecificOutput", {}).get("additionalContext", ""))
+        self.assertIn("KnowItAll2 learned 1 thing from this session (after your commit 5e6f7a8)",
+                      later["systemMessage"])
+        self.assertEqual({}, self.prompt())
+        moments.add_news({"reason": "commit", "status": "limit", "limit": 60, "folders": [str(self.project)],
+                          "sessions": moments.session_keys(str(self.log_path), SESSION)})
+        needs_the_user = self.prompt()["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(hooks.RELAY, needs_the_user)  # what the user must act on is still passed on
+        self.assertIn("has not learned from this session yet", needs_the_user)
+
+    def test_a_compacted_chat_that_passed_on_its_news_does_not_pass_it_on_again(self) -> None:
+        self.prompt()
+        moments.add_news({"reason": "commit", "detail": "5e6f7a8", "status": "done", "folders": [str(self.project)],
+                          "sessions": moments.session_keys(str(self.log_path), SESSION),
+                          "saved": [{"id": "k-3", "text": "The homelab switch is sw01."}]})
+        output = json.loads(hooks.session_start(self.payload(source="compact"), start_learner=lambda: None))
+        self.assertNotIn(hooks.RELAY, output["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("after your commit 5e6f7a8", output["systemMessage"])
+
+    def test_news_that_could_not_be_passed_on_is_still_passed_on_later(self) -> None:
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise OSError("the pipe is closed")
+
+        with mock.patch("sys.stdout", Broken()):
+            self.assertEqual(0, hooks.main(["claude-code", "prompt-submit"],
+                                           stdin=self.payload(hook_event_name="UserPromptSubmit", prompt="next")))
+        self.assertIn(hooks.RELAY, self.prompt()["hookSpecificOutput"]["additionalContext"])
+
     def test_waiting_for_the_limit_is_told_once_however_many_commits_hit_it(self) -> None:
         moments.mark_shown(moments.news(), transcript=str(self.log_path), session_id=SESSION)
         for _ in range(2):
@@ -596,6 +633,66 @@ class HookSpeedTests(unittest.TestCase):
         done = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=60,
                               env={**os.environ, "PYTHONPATH": str(source)})
         self.assertEqual("False", done.stdout.strip(), done.stderr)
+
+    def test_the_hook_after_every_shell_command_loads_only_the_light_module(self) -> None:
+        # It runs after every Bash and PowerShell command (0.11.1): the user accepted about 0.16 s a command
+        # (2026-10-13), so it reads one precompiled index and never the store, the memory, or the other hooks.
+        heavy = ("sqlite3", "knowitall2.store", "knowitall2.memory", "knowitall2.hooks", "knowitall2.secrets",
+                 "knowitall2.known", "knowitall2.chats", "knowitall2.learning", "knowitall2.connected",
+                 "urllib.request", "subprocess", "pathlib")
+        source = Path(__file__).resolve().parents[1] / "src"
+        with tempfile.TemporaryDirectory() as folder:
+            rule = {"id": "k-0000000001", "text": "Write the script with the Write tool.", "verification": "observed",
+                    "shell": "bash", "programs": [], "pattern": "heredoc-escapes", "chats": 3}
+            index = {"version": 2, "rules": [rule], "errors": [
+                {"id": "k-0000000002", "text": "Use rg -g.", "verification": "observed", "phrase": "os error 123",
+                 "rule": False}]}
+            (Path(folder) / "commands.json").write_text(json.dumps(index), encoding="utf-8")
+            payload = json.dumps({"hook_event_name": "PostToolUse", "session_id": SESSION, "cwd": folder,
+                                  "tool_name": "Bash", "tool_input": {"command": "python - <<'EOF'\nprint('a')\nEOF"},
+                                  "tool_response": {"stdout": "rg: x (os error 123)", "stderr": ""}})
+            code = ("import json, sys; from knowitall2.commands import main; "
+                    f"out = main('claude-code', {folder!r}, sys.stdin.buffer.read()); "
+                    "loaded = [name for name in " + repr(heavy) + " if name in sys.modules or any("
+                    "module.startswith(name + '.') for module in sys.modules)]; "
+                    "print(json.dumps([json.loads(out)['hookSpecificOutput']['additionalContext'], loaded]))")
+            done = subprocess.run([sys.executable, "-B", "-c", code], input=payload.encode("utf-8"),
+                                  capture_output=True, timeout=60, env={**os.environ, "PYTHONPATH": str(source)})
+            context, loaded = json.loads(done.stdout)
+            self.assertEqual([], loaded, done.stderr)
+            self.assertIn("k-0000000001", context)
+            self.assertIn("k-0000000002", context)
+
+    def test_the_registered_hook_route_after_a_command_imports_nothing_it_can_do_without(self) -> None:
+        # Review 2026-10-14, E-L1: the route as Claude Code runs it (hook_entry, the launcher, run_hook) loaded
+        # runpy, pkgutil, typing, pathlib, and hashlib: about 50 ms of each command's budget.
+        from knowitall2.agents import claude_code
+        from knowitall2.agents.base import ServerLaunch
+
+        heavy = ("typing", "pathlib", "runpy", "pkgutil", "hashlib", "_hashlib", "sqlite3", "urllib.parse",
+                 "knowitall2.paths", "knowitall2.store", "knowitall2.memory", "knowitall2.hooks")
+        source = Path(__file__).resolve().parents[1] / "src"
+        with tempfile.TemporaryDirectory() as folder:
+            launch = ServerLaunch(sys.executable, (), {"PYTHONPATH": str(source), "KNOWITALL2_HOME": folder})
+            with mock.patch.dict(os.environ, {"KNOWITALL2_HOME": folder}):
+                entry = claude_code.hook_entry(launch, "PostToolUse")
+                launcher = claude_code.hook_launcher_path()
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text(claude_code.render_launcher(launch), encoding="utf-8")
+            rule = {"id": "k-0000000001", "text": "Write the script with the Write tool.", "verification": "observed",
+                    "shell": "bash", "programs": [], "pattern": "heredoc-escapes", "chats": 3}
+            (Path(folder) / "commands.json").write_text(json.dumps({"version": 2, "rules": [rule], "errors": []}),
+                                                        encoding="utf-8")
+            payload = json.dumps({"hook_event_name": "PostToolUse", "session_id": SESSION, "cwd": folder,
+                                  "tool_name": "Bash", "tool_input": {"command": "python - <<'EOF'\nprint('a')\nEOF"},
+                                  "tool_response": {"stdout": "a", "stderr": ""}})
+            done = subprocess.run([entry["command"], "-X", "importtime", *entry["args"]], input=payload.encode(),
+                                  capture_output=True, timeout=60, env={**os.environ, "KNOWITALL2_HOME": folder})
+        loaded = {line.rsplit("|", 1)[-1].strip() for line in done.stderr.decode("utf-8", "replace").splitlines()
+                  if line.startswith("import time:")}
+        self.assertIn("k-0000000001", json.loads(done.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("knowitall2.commands", loaded)
+        self.assertEqual([], [name for name in heavy if name in loaded])
 
     def test_with_learning_off_and_no_server_the_turn_and_session_end_hooks_load_no_network_code(self) -> None:
         heavy = ("urllib.request", "http.client", "knowitall2.connected", "knowitall2.secrets", "sqlite3")
