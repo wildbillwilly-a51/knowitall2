@@ -414,6 +414,208 @@ class HintTests(CommandTestCase):
         self.assertTrue(known.due(self.store._connection))
 
 
+class CodexHintTests(CommandTestCase):
+    """0.11.2: Codex's PostToolUse, as codex-cli 0.162 sends it (the hook test of 2026-10-15): tool_name "Bash"
+    whatever the shell, the command in tool_input, the output as a plain string."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.heredoc = self.rule("Write the script with the Write tool and run the file, instead of a heredoc",
+                                 shell="bash", pattern="heredoc-escapes", chats=5)
+        self.foreach = self.rule("Assign the foreach statement's output to a variable, then pipe the variable",
+                                 shell="powershell", pattern="foreach-pipe", chats=3)
+        self.codex = self.rule("Run one statement per command in Codex's shell", shell="codex",
+                               programs=["set-location"], chats=2)
+        self.glob = self.lesson(GLOB)
+        known.refresh(self.store._connection)
+
+    def codex_ran(self, command: str, output: str = "", *, session: str = "01a140dc-2d97-7c63-945a") -> str:
+        payload = {"hook_event_name": "PostToolUse", "session_id": session, "turn_id": "t-1", "cwd": str(self.alpha),
+                   "transcript_path": str(self.root / "rollout.jsonl"), "model": "gpt", "tool_name": "Bash",
+                   "tool_input": {"command": command}, "tool_response": output, "tool_use_id": "exec-1"}
+        return commands.hint(payload, str(self.home), agent="codex")
+
+    def test_codex_on_windows_gets_powershell_rules_and_never_the_bash_tools(self) -> None:
+        with mock.patch.object(commands, "WINDOWS", True):
+            self.assertIn(self.foreach, self.codex_ran("foreach ($x in 1..3) { $x } | Format-Table", "1"))
+            self.assertIn(self.codex, self.codex_ran("Set-Location C:\\work; git status"))
+            self.assertEqual("", self.codex_ran("python - <<'EOF'\nprint('a\\\\b')\nEOF", session="s-2"))
+
+    def test_a_command_wrapped_in_pwsh_is_powershell_and_matched_inside(self) -> None:
+        wrapped = ('"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '
+                   "'foreach ($x in 1..3) { $x } | Format-Table'")
+        with mock.patch.object(commands, "WINDOWS", False):
+            self.assertIn(self.foreach, self.codex_ran(wrapped, "An empty pipe element is not allowed."))
+        self.assertEqual("foreach ($x in 1..3) { $x } | Format-Table", commands.unwrap(wrapped)[0])
+        self.assertEqual(("Write-Output 'it's' now", "powershell"),
+                         commands.unwrap("powershell.exe -NoProfile -Command 'Write-Output ''it''s'' now'"))
+        self.assertEqual(("cat a.txt", "bash"), commands.unwrap("/bin/bash -lc 'cat a.txt'"))
+        self.assertEqual(("git status", ""), commands.unwrap("git status"))
+
+    def test_error_text_in_codexs_output_string_and_once_a_chat(self) -> None:
+        output = "rg: src/*.py: The filename, directory name, or volume label syntax is incorrect. (os error 123)"
+        self.assertIn(self.glob, self.codex_ran("rg -n TODO src/*.py", output))
+        self.assertEqual("", self.codex_ran("rg -n TODO lib/*.py", output))
+        self.assertIn(self.glob, self.codex_ran("rg -n TODO lib/*.py", output, session="another-chat"))
+
+    def test_a_rule_codexs_briefing_gave_is_not_given_again(self) -> None:
+        session = "01a140dc-2d97-7c63-945a-65f9a9a5db74"
+        chats.start(chats.chat_key(session, None), since="2026-10-15T00:00:00Z", project_id=None,
+                    told=[self.foreach], transcript=None)
+        with mock.patch.object(commands, "WINDOWS", True):
+            self.assertEqual("", self.codex_ran("foreach ($x in 1..3) { $x } | Format-Table", session=session))
+
+    def test_codexs_launcher_runs_the_light_path(self) -> None:
+        launcher = self.root / "codex_session_start.py"
+        launcher.write_text(render_hook_launcher(
+            ServerLaunch(sys.executable, (), {"PYTHONPATH": str(SOURCE_ROOT), "KNOWITALL2_HOME": str(self.home)}),
+            "codex"), encoding="utf-8")
+        payload = json.dumps({"hook_event_name": "PostToolUse", "session_id": "codex-s", "cwd": str(self.alpha),
+                              "tool_name": "Bash", "tool_input": {"command": "rg x src/*.py"},
+                              "tool_response": "(os error 123)\r\n"})
+        done = subprocess.run([sys.executable, "-B", str(launcher), "command"], input=payload.encode("utf-8"),
+                              capture_output=True, timeout=60)
+        self.assertEqual(0, done.returncode, done.stderr)
+        output = json.loads(done.stdout)["hookSpecificOutput"]
+        self.assertEqual("PostToolUse", output["hookEventName"])
+        self.assertIn(self.glob, output["additionalContext"])
+
+    def test_a_command_given_as_an_argument_vector_is_matched_inside_its_shell(self) -> None:
+        # Review 2026-10-15: the vector joined with spaces read as `pwsh foreach`, and the rule for what the shell
+        # ran was never found.
+        with mock.patch.object(commands, "WINDOWS", True):
+            self.assertIn(self.codex, self.codex_ran(["pwsh", "-NoProfile", "-Command", "Set-Location C:\\w; ls"]))
+        self.assertIn(self.glob, self.codex_ran(["/bin/bash", "-lc", "rg -n TODO src/*.py"],
+                                                "(os error 123)", session="s-3"))
+
+    def test_a_payload_that_starts_with_a_byte_order_mark_is_read(self) -> None:
+        # Review 2026-10-15: json refuses a leading BOM, so a shell that adds one would silence every hint.
+        payload = {"hook_event_name": "PostToolUse", "session_id": "bom", "cwd": str(self.alpha), "tool_name": "Bash",
+                   "tool_input": {"command": "rg -n TODO src/*.py"}, "tool_response": "(os error 123)"}
+        output = commands.main("codex", str(self.home), b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
+        self.assertIn(self.glob, json.loads(output)["hookSpecificOutput"]["additionalContext"])
+
+
+class UnwrapTests(unittest.TestCase):
+    """Review 2026-10-15: what ``unwrap`` takes for the command a shell was handed."""
+
+    def test_only_one_whole_quoted_argument_is_unwrapped(self) -> None:
+        for command in ("bash -lc 'git status' && bash -lc 'git log'", "pwsh -Command 'a' ; pwsh -Command 'b'",
+                        "bash -c \"echo \"x\" y\"", "python -c 'print(1)'", "bash -C 'x'"):
+            with self.subTest(command=command):
+                self.assertEqual((command, ""), commands.unwrap(command))
+
+    def test_options_with_values_short_flags_and_shell_quoting(self) -> None:
+        cases = {
+            "pwsh -NoProfile -ExecutionPolicy Bypass -Command 'Get-AppxPackage'": ("Get-AppxPackage", "powershell"),
+            "pwsh -c 'Get-ChildItem'": ("Get-ChildItem", "powershell"),
+            'powershell.exe -Command "Write-Output ""hi"" `"there`""': ('Write-Output "hi" "there"', "powershell"),
+            "bash -o pipefail -c 'cat a | wc -l'": ("cat a | wc -l", "bash"),
+            "bash -lc 'echo '\"'\"'hi'\"'\"' and '\\''x'\\'''": ("echo 'hi' and 'x'", "bash"),
+            'bash -lc "echo \\"hi\\" \\$HOME"': ('echo "hi" $HOME', "bash"),
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(expected, commands.unwrap(command))
+
+    def test_an_encoded_command_is_decoded(self) -> None:
+        import base64
+
+        script = "Get-AppxPackage -Name 'Probe' | Format-List"
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        for flag in ("-EncodedCommand", "-enc", "-ec", "-e"):
+            with self.subTest(flag=flag):
+                self.assertEqual((script, "powershell"), commands.unwrap(f"pwsh -NoProfile {flag} {encoded}"))
+        for broken in ("pwsh -EncodedCommand abc", "pwsh -EncodedCommand ////", "bash -EncodedCommand " + encoded):
+            with self.subTest(broken=broken):
+                self.assertEqual((broken, ""), commands.unwrap(broken))
+
+
+APPX_ERROR = "operation is not supported on this platform"
+APPX_OUTPUT = ("Get-AppxPackage: \r\nLine |\r\n   2 |  Get-AppxPackage -Name Probe\r\n     | The 'Get-AppxPackage' "
+               "command was found in the module 'Appx', but the module could not be loaded due to the following "
+               "error: [Operation is not supported on this platform. (0x80131539)]\r\n")
+
+
+class RuleSourceTests(CommandTestCase):
+    """Review 2026-10-15: Codex's first hint after a failing Get-AppxPackage gave its tool rule and, beside it, one of
+    the lessons the rule was made from, with the same advice. A rule's source lessons are not given with it, nor
+    after it in the same chat, in Claude Code or Codex."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.first = self.lesson("In PowerShell 7 Get-AppxPackage fails with 'Operation is not supported on this "
+                                 "platform'; run it through Windows PowerShell 5.1 instead.", session="appx-1")
+        self.second = self.lesson("Get-AppxPackage in pwsh says 'Operation is not supported on this platform' "
+                                  "(0x80131539); use powershell.exe -NoProfile -Command for it.", session="appx-2")
+
+    def save_rule(self, *, error: str, sources=None) -> str:
+        from knowitall2.learning import tool_rules
+
+        sources = sources or [self.first, self.second]
+        rule = tool_rules.save_rule(self.memory, advice="Run Get-AppxPackage through Windows PowerShell 5.1",
+                                    shell="powershell", programs=["get-appxpackage"], pattern="", error=error,
+                                    sources=[self.store.get(record_id) for record_id in sources]).id
+        known.refresh(self.store._connection)
+        return rule
+
+    def codex_ran(self, command: str, output: str, *, session: str = "codex-chat") -> str:
+        payload = {"hook_event_name": "PostToolUse", "session_id": session, "cwd": str(self.alpha),
+                   "tool_name": "Bash", "tool_input": {"command": command}, "tool_response": output}
+        return commands.hint(payload, str(self.home), agent="codex")
+
+    def test_a_rule_given_for_its_error_comes_without_its_source_lessons(self) -> None:
+        rule = self.save_rule(error=APPX_ERROR)
+        with mock.patch.object(commands, "WINDOWS", True):
+            for context in (self.ran("Get-AppxPackage -Name Probe", APPX_OUTPUT, tool="PowerShell"),
+                            self.codex_ran("Get-AppxPackage -Name Probe", APPX_OUTPUT)):
+                with self.subTest(context=context[:60]):
+                    self.assertIn(f"[{rule}]", context)
+                    self.assertNotIn(self.first, context)
+                    self.assertNotIn(self.second, context)
+            # Nor later in the chat: the rule already said it.
+            self.assertEqual("", self.ran("Get-AppxPackage | Select-Object Name", APPX_OUTPUT, tool="PowerShell"))
+            self.assertEqual("", self.codex_ran("Get-AppxPackage *probe*", APPX_OUTPUT))
+
+    def test_a_rule_given_for_its_command_displaces_a_source_lesson_its_error_brought(self) -> None:
+        rule = self.save_rule(error="")
+        with mock.patch.object(commands, "WINDOWS", True):
+            context = self.ran("Get-AppxPackage -Name Probe", APPX_OUTPUT, tool="PowerShell")
+        self.assertIn(f"[{rule}]", context)
+        self.assertEqual(1, context.count("\n- [") + context.startswith("- ["))
+        self.assertNotIn(self.first, context)
+        self.assertNotIn(self.second, context)
+
+    def test_the_source_lessons_of_a_rule_the_briefing_gave_are_not_given(self) -> None:
+        rule = self.save_rule(error=APPX_ERROR)
+        chats.start(chats.chat_key("told-chat", None), since="2026-10-15T00:00:00Z", project_id=None, told=[rule],
+                    transcript=None)
+        with mock.patch.object(commands, "WINDOWS", True):
+            self.assertEqual("", self.ran("Get-AppxPackage -Name Probe", APPX_OUTPUT, tool="PowerShell",
+                                          session="told-chat"))
+
+    def test_a_source_lesson_merged_into_another_is_still_the_rules_source(self) -> None:
+        rule = self.save_rule(error=APPX_ERROR)
+        holder = self.lesson("Get-AppxPackage cannot load Appx in PowerShell 7 ('Operation is not supported on this "
+                             "platform'); call Windows PowerShell 5.1's powershell.exe for it.", session="appx-3")
+        self.store.supersede(self.first, holder, now=self.memory.now(), reason="combined")
+        known.refresh(self.store._connection)
+        with mock.patch.object(commands, "WINDOWS", True):
+            context = self.codex_ran("Get-AppxPackage -Name Probe", APPX_OUTPUT)
+        self.assertIn(f"[{rule}]", context)
+        self.assertNotIn(holder, context)
+        self.assertNotIn(self.second, context)
+
+    def test_a_lesson_that_is_not_the_rules_source_is_still_given_with_it(self) -> None:
+        other = self.lesson("On this computer Get-AppxPackage also says 'Operation is not supported on this "
+                            "platform' inside Windows Sandbox, where Appx is absent.", session="appx-4")
+        rule = self.save_rule(error=APPX_ERROR)
+        with mock.patch.object(commands, "WINDOWS", True):
+            context = self.ran("Get-AppxPackage -Name Probe", APPX_OUTPUT, tool="PowerShell")
+        self.assertIn(f"[{rule}]", context)
+        self.assertIn(f"[{other}]", context)
+
+
 class FakeEngine:
     def __init__(self, *answers) -> None:
         self.answers = list(answers)

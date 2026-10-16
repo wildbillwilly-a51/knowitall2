@@ -51,7 +51,7 @@ class SetupCommandTests(unittest.TestCase):
         code, output, _ = self.run_cli("setup", "codex")
         self.assertEqual(0, code)
         self.assertIn("registered the knowitall2 MCP server", output)
-        self.assertIn("trust the KnowItAll2 SessionStart, Stop, and UserPromptSubmit hooks", output)
+        self.assertIn("trust the KnowItAll2 SessionStart, Stop, UserPromptSubmit, and PostToolUse hooks", output)
         code, output, _ = self.run_cli("setup", "claude-code")
         self.assertEqual(0, code)
         self.assertIn("Quit and reopen Claude Code", output)

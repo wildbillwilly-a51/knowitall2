@@ -15,7 +15,8 @@ Bash or PowerShell command, failed or not) reads only that file, and gives, once
 
 - a rule whose shell, programs, and pattern match the command (the first heredoc of a chat teaches the heredoc
   rule before a damaging one is written);
-- a rule or checked lesson whose quoted error text appears in the command's output, even when it exited 0.
+- a rule or checked lesson whose quoted error text appears in the command's output, even when it exited 0;
+- never a lesson that a rule given in the chat (or its briefing) was made from, which says what the rule says.
 
 Why (study of 2026-10-13, ``docs/research/2026-10-13-root-causes/quirks.md``): quirks are needed while the agent
 writes a command, before anything has failed, and the failure signal the earlier reminder waited for was missing
@@ -559,6 +560,10 @@ def build_index(connection: Any) -> dict[str, Any]:
         phrases = error_phrases(body)
         if fields is not None:
             entry["text"] = rule_summary(body)[:TEXT_LIMIT]
+            # The lessons it was made from, as named and as held now, which the hook does not give beside it.
+            named = rule_sources(str(text))
+            entry["sources"] = list(dict.fromkeys([*named, *(lookup[item]["holder"] for item in named
+                                                             if item in lookup)]))
             if not (fields["programs"] or fields["pattern"] or fields["error"]):
                 continue
             entry["shell"] = fields["shell"]
@@ -690,6 +695,80 @@ def briefing_rules(rules: Sequence[dict[str, Any]], *, agent: str | None, limit:
 
 # --- The hook ----------------------------------------------------------------------------------------------------
 
+# A command one shell hands another: pwsh -NoProfile -Command '<inner>', pwsh -EncodedCommand <base64>, or
+# bash -lc '<inner>', after options that may take a word (-ExecutionPolicy Bypass, -o pipefail).
+_WRAPPED = re.compile(
+    r"""^\s*(?:&\s*)?(?P<program>"[^"]*"|'[^']*'|\S+)(?:\s+-{1,2}[A-Za-z][\w-]*(?:\s+[A-Za-z]\w*)?)*?"""
+    r"""\s+(?P<flag>-Command|-EncodedCommand|-e|-[A-Za-z]*c)\s+(?P<argument>'.*'|".*"|[A-Za-z0-9+/=]+)\s*$""",
+    re.DOTALL | re.IGNORECASE)
+_POWERSHELLS = ("pwsh", "powershell")
+_POSIX_SHELLS = ("bash", "sh", "zsh")
+# A single-quoted Bash word may close, add a quote, and open again: '\'' or '"'.
+_BASH_QUOTE = re.compile(r"'\\''|'\"'\"'")
+
+
+def _shell_inner(program: str, flag: str, argument: str, *, quoted: bool) -> tuple[str, str] | None:
+    """What ``program flag argument`` runs, and in which shell; None when it is not one whole command for a shell.
+    ``argument`` is as written when ``quoted`` (one quoted word), else one word of an argument vector."""
+
+    shell = _base(program.strip("\"'"))
+    if shell in _POWERSHELLS and len(flag) > 1 and (flag.casefold() == "-ec"
+                                                    or "-encodedcommand".startswith(flag.casefold())):
+        import binascii   # built in, as cheap as re
+
+        try:
+            return binascii.a2b_base64(argument.encode("ascii"), strict_mode=True).decode("utf-16-le"), "powershell"
+        except (ValueError, UnicodeError):
+            return None
+    if shell in _POWERSHELLS and flag.casefold() in ("-c", "-command"):
+        kind = "powershell"
+    elif shell in _POSIX_SHELLS and re.fullmatch(r"-[a-z]*c", flag):
+        kind = "bash"
+    else:
+        return None
+    if not quoted:
+        return argument, kind
+    quote, inner = argument[:1], argument[1:-1]
+    if quote not in ("'", '"') or len(argument) < 2:
+        return None
+    if kind == "powershell" and quote == "'":
+        # In PowerShell a quote inside a single-quoted string is doubled; a lone one would end the string.
+        return (inner.replace("''", "'"), kind) if "'" not in inner.replace("''", "") else None
+    if kind == "powershell":
+        escaped = re.compile(r'`.|""', re.DOTALL)
+        return (escaped.sub(lambda match: match.group(0)[-1], inner), kind) if '"' not in escaped.sub("", inner) else None
+    if quote == "'":
+        return (_BASH_QUOTE.sub("'", inner), kind) if "'" not in _BASH_QUOTE.sub("", inner) else None
+    # In Bash's double quotes a backslash escapes only $ ` " \ and a newline.
+    if '"' in re.sub(r"\\.", "", inner, flags=re.DOTALL):
+        return None
+    return re.sub(r"\\([$`\"\\\n])", r"\1", inner), kind
+
+
+def unwrap(command: str) -> tuple[str, str]:
+    """The command a shell was asked to run, and which shell: ("<inner>", "powershell") for pwsh or
+    powershell -Command '<inner>' (or -EncodedCommand), ("<inner>", "bash") for bash or sh -c '<inner>', else
+    (command, ""). Only one whole quoted word is unwrapped: ``bash -c 'a' && bash -c 'b'`` is left as it is."""
+
+    match = _WRAPPED.match(command or "")
+    if match is None:
+        return command, ""
+    found = _shell_inner(match.group("program"), match.group("flag"), match.group("argument"),
+                         quoted=match.group("argument")[:1] in ("'", '"'))
+    return found if found is not None else (command, "")
+
+
+def unwrap_argv(words: Sequence[str]) -> tuple[str, str]:
+    """``unwrap`` for a command given as its argument vector, such as ["bash", "-lc", "git status"]: the last
+    word is what the shell runs. Any other vector is joined with spaces."""
+
+    if len(words) >= 3:
+        found = _shell_inner(words[0], words[-2], words[-1], quoted=False)
+        if found is not None:
+            return found
+    return " ".join(words), ""
+
+
 def _output(payload: dict[str, Any]) -> str:
     """What the command printed: Claude Code gives ``tool_response`` after a command, ``error`` after a failure."""
 
@@ -712,6 +791,9 @@ def hint(payload: dict[str, Any], home: str, *, agent: str = "claude-code") -> s
         event = str(payload.get("hook_event_name") or "")
         tool_input = payload.get("tool_input")
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        wrapper = ""
+        if isinstance(command, list) and all(isinstance(word, str) for word in command):
+            command, wrapper = unwrap_argv(command)   # an engine that passes the argument vector
         if not isinstance(command, str) or event not in EVENTS:
             return ""
         try:
@@ -722,7 +804,11 @@ def hint(payload: dict[str, Any], home: str, *, agent: str = "claude-code") -> s
         if not isinstance(index, dict) or index.get("version") != INDEX_VERSION:
             return ""   # an index written before 0.11.1 holds lessons by command, not rules
         if agent == "codex":
-            shell = "codex"
+            # Codex names every shell command "Bash" (codex-cli 0.162, 2026-10-15); its shell is PowerShell on
+            # Windows. A command it wraps in pwsh -Command '...' or bash -lc '...' is matched inside.
+            if not wrapper:
+                command, wrapper = unwrap(command)
+            shell = "powershell" if wrapper == "powershell" and not WINDOWS else "codex"
         else:
             shell = TOOL_SHELLS.get(str(payload.get("tool_name") or ""), "any")
         chat = _chat(payload)
@@ -741,14 +827,22 @@ def hint(payload: dict[str, Any], home: str, *, agent: str = "claude-code") -> s
         room = min(HINTS_PER_COMMAND, HINTS_PER_CHAT - len(given))
         if room <= 0:
             return ""
+        # A rule says what its source lessons say: once it is given, they are not (review 2026-10-15).
+        covered = [item for item in state.get("covered") or [] if isinstance(item, str)] if isinstance(
+            state.get("covered"), list) else []
         chosen = pick(index, command=command, shell=shell, output=_output(payload), cwd=str(payload.get("cwd") or ""),
-                      seen=given, limit=room + TOLD_SLACK)
+                      seen=[*given, *covered], limit=room + TOLD_SLACK)
         if chosen:   # the briefing's memories are read only when something would be given
             told = set(_told(home, payload))
-            chosen = [(entry, why) for entry, why in chosen if entry["id"] not in told][:room]
+            told |= _sources(rule for rule in index.get("rules") or []
+                             if isinstance(rule, dict) and rule.get("id") in told)
+            chosen = [(entry, why) for entry, why in chosen if entry["id"] not in told]
+            sources = _sources(entry for entry, _ in chosen)
+            chosen = [(entry, why) for entry, why in chosen if entry["id"] not in sources][:room]
         if not chosen:
             return ""
         given += [entry["id"] for entry, _ in chosen]
+        state["covered"] = sorted({*covered, *_sources(entry for entry, _ in chosen)})
         os.makedirs(folder, exist_ok=True)
         _write_atomic(state_path, json.dumps(state))
         _log(home, agent, chat, event, chosen)
@@ -785,6 +879,13 @@ def _write_atomic(path: str, text: str) -> None:
             os.remove(temporary)
         except OSError:
             pass
+
+
+def _sources(entries: Iterable[dict[str, Any]]) -> set[str]:
+    """The lessons the rules among ``entries`` were made from (``build_index``), which say what those rules say."""
+
+    return {source for entry in entries if isinstance(entry.get("sources"), list)
+            for source in entry["sources"] if isinstance(source, str)}
 
 
 def _message(chosen: Sequence[tuple[dict[str, Any], str]]) -> str:
@@ -902,7 +1003,8 @@ def main(agent: str, home: str, stdin_bytes: bytes) -> str:
     """What the hook prints: the JSON that adds the context, or nothing."""
 
     try:
-        payload = json.loads(stdin_bytes.decode("utf-8", "replace") or "{}")
+        # utf-8-sig: a shell between the agent and the hook may start what it passes on with a byte order mark.
+        payload = json.loads(stdin_bytes.decode("utf-8-sig", "replace") or "{}")
     except ValueError:
         return ""
     if not isinstance(payload, dict):

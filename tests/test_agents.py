@@ -205,6 +205,37 @@ class CodexAdapterTests(unittest.TestCase):
         self.adapter.uninstall()
         self.assertEqual(original, json.loads(hooks.read_text(encoding="utf-8")))
 
+    def test_the_after_command_hook_is_registered_checked_and_removed(self) -> None:
+        # 0.11.2: Codex runs PostToolUse after every shell command (the hook test of 2026-10-15), and gives the
+        # model the hook's additionalContext.
+        hooks = self.codex_home / "hooks.json"
+        self.adapter.setup(LAUNCH)
+        [group] = json.loads(hooks.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+        self.assertNotIn("matcher", group)   # its tool_name is "Bash" whatever the shell; tested without one
+        [entry] = group["hooks"]
+        self.assertEqual(codex.hook_entry(LAUNCH, "PostToolUse"), entry)
+        self.assertIn("codex_session_start.py", entry["command"])
+        self.assertTrue(entry["command"].endswith(" command"))
+        if sys.platform == "win32":
+            self.assertTrue(entry["commandWindows"].endswith("codex_session_start.py command"))
+            self.assertNotIn("'", entry["commandWindows"])
+            self.assertNotIn('"', entry["commandWindows"])
+        self.assertEqual(5, entry["timeout"])
+        self.assertNotIn("statusMessage", entry)
+        self.assertIn("PostToolUse", self.adapter.restart_hint())
+        hook_check = [check for check in self.adapter.checks(LAUNCH) if check.name == "Codex session hook"][0]
+        self.assertIn("after-command", hook_check.detail)
+        self.assertIn("/hooks", hook_check.detail)
+        data = json.loads(hooks.read_text(encoding="utf-8"))
+        del data["hooks"]["PostToolUse"]
+        hooks.write_text(json.dumps(data), encoding="utf-8")
+        hook_check = [check for check in self.adapter.checks(LAUNCH) if check.name == "Codex session hook"][0]
+        self.assertEqual((False, "the after-command hook is not installed"), (hook_check.ok, hook_check.detail))
+        self.adapter.setup(LAUNCH)
+        self.adapter.uninstall()
+        left = json.loads(hooks.read_text(encoding="utf-8")) if hooks.exists() else {}
+        self.assertNotIn("PostToolUse", left.get("hooks", {}))
+
     def test_a_changed_hook_is_replaced_where_it_is(self) -> None:
         # Codex keys its trust in a hook by its position, so the user's hooks after ours must not move.
         hooks = self.codex_home / "hooks.json"
@@ -235,8 +266,8 @@ class CodexAdapterTests(unittest.TestCase):
         self.config.write_text(text.replace("# END knowitall2", "\n" + trust + "# END knowitall2"), encoding="utf-8")
         hook_check = [check for check in self.adapter.checks(LAUNCH) if check.name == "Codex session hook"][0]
         # Until the end-of-turn and message hooks are trusted too, doctor says so.
-        self.assertIn("runs the end-of-turn and message hooks once you trust them", hook_check.detail)
-        for name in ("stop", "user_prompt_submit"):
+        self.assertIn("runs the end-of-turn, message, and after-command hooks once you trust them", hook_check.detail)
+        for name in ("stop", "user_prompt_submit", "post_tool_use"):
             other_key = str(self.codex_home / "hooks.json") + f":{name}:0:0"
             trust += f"[hooks.state.'{other_key}']\ntrusted_hash = \"sha256:def\"\n"
         # Codex appends new tables before the file's last comment, which is our end marker.

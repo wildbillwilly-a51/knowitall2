@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.2 (2026-10-16)
+
+- **Codex gets tool rules after each shell command too.** Codex now has the
+  hook Claude Code has had since 0.11.1: after a shell command, it gives the
+  tool rule that command calls for (PowerShell's, not Claude Code's Bash
+  tool's), or the lesson whose error text its output shows, once a chat and
+  never one the briefing already gave. Replayed on the same 31 chats, tool
+  rules now reach 20 of 33 quirks agents met (16 without it), 14 before the
+  first try. Codex starts hooks through PowerShell, so it costs about half a
+  second per shell command, which you chose to accept (2026-10-15). **Trust
+  the new hook once with /hooks in Codex** (it shows as new); until then
+  Codex does not run it.
+- **A tool rule comes without the lessons it was made from.** After a
+  command, Claude Code and Codex were given a rule and, beside it, one of
+  its own source lessons with the same advice. Now a rule's source lessons
+  are not given with it, nor later in that chat, nor after the briefing
+  showed the rule.
+
 ## 0.11.1 (2026-10-15)
 
 Getting what KnowItAll2 knows to agents at the moment it helps, from the

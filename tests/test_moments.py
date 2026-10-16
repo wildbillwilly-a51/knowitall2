@@ -694,6 +694,39 @@ class HookSpeedTests(unittest.TestCase):
         self.assertIn("knowitall2.commands", loaded)
         self.assertEqual([], [name for name in heavy if name in loaded])
 
+    def test_codexs_registered_after_command_hook_imports_nothing_it_can_do_without(self) -> None:
+        # 0.11.2: the command as registered in hooks.json, run by Codex after every shell command.
+        import shlex
+
+        from knowitall2.agents import codex
+        from knowitall2.agents.base import ServerLaunch, render_hook_launcher
+
+        heavy = ("typing", "pathlib", "runpy", "pkgutil", "hashlib", "_hashlib", "sqlite3", "urllib.parse",
+                 "knowitall2.paths", "knowitall2.store", "knowitall2.memory", "knowitall2.hooks")
+        source = Path(__file__).resolve().parents[1] / "src"
+        with tempfile.TemporaryDirectory() as folder:
+            launch = ServerLaunch(sys.executable, (), {"PYTHONPATH": str(source), "KNOWITALL2_HOME": folder})
+            with mock.patch.dict(os.environ, {"KNOWITALL2_HOME": folder}):
+                entry = codex.hook_entry(launch, "PostToolUse")
+                launcher = codex.hook_launcher_path()
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text(render_hook_launcher(launch, "codex"), encoding="utf-8")
+            rule = {"id": "k-0000000001", "text": "Assign the foreach output first.", "verification": "observed",
+                    "shell": "powershell", "programs": [], "pattern": "foreach-pipe", "chats": 3}
+            (Path(folder) / "commands.json").write_text(json.dumps({"version": 2, "rules": [rule], "errors": []}),
+                                                        encoding="utf-8")
+            payload = json.dumps({"hook_event_name": "PostToolUse", "session_id": SESSION, "cwd": folder,
+                                  "tool_name": "Bash", "tool_input": {
+                                      "command": "\"C:\\pwsh.exe\" -Command 'foreach ($x in 1..3) { $x } | Out-String'"},
+                                  "tool_response": "1\r\n"})
+            words = shlex.split(entry["command"])
+            done = subprocess.run([words[0], "-X", "importtime", *words[1:]], input=payload.encode(),
+                                  capture_output=True, timeout=60, env={**os.environ, "KNOWITALL2_HOME": folder})
+        loaded = {line.rsplit("|", 1)[-1].strip() for line in done.stderr.decode("utf-8", "replace").splitlines()
+                  if line.startswith("import time:")}
+        self.assertIn("k-0000000001", json.loads(done.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual([], [name for name in heavy if name in loaded])
+
     def test_with_learning_off_and_no_server_the_turn_and_session_end_hooks_load_no_network_code(self) -> None:
         heavy = ("urllib.request", "http.client", "knowitall2.connected", "knowitall2.secrets", "sqlite3")
         source = Path(__file__).resolve().parents[1] / "src"

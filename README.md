@@ -5,7 +5,7 @@ learn about your projects, systems, and preferences, learns more as you work,
 and gives Codex, Claude Code, and other MCP-capable agents the right context
 when they need it, without you having to manage it.
 
-> **Status:** pre-release, version 0.11.1. Source-available: free to install
+> **Status:** pre-release, version 0.11.2. Source-available: free to install
 > and use on your own computers; see [`NOTICE`](NOTICE). Testers: start with [`docs/testing.md`](docs/testing.md).
 
 ## Installing

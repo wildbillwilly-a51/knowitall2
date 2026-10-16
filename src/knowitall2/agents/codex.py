@@ -10,7 +10,7 @@
 - A short block in the user's global ``AGENTS.md`` (or ``AGENTS.override.md``
   when there is one, since Codex then reads only that) makes KnowItAll2 part
   of how every chat orients itself.
-- The SessionStart, Stop, and UserPromptSubmit hooks are entries in ``hooks.json`` that run a
+- The SessionStart, Stop, UserPromptSubmit, and PostToolUse hooks are entries in ``hooks.json`` that run a
   small launcher in the KnowItAll2 data home. Codex hands hook commands to the
   session shell (PowerShell or cmd on Windows), so the Windows command avoids
   quoting: it uses the short form of folders whose names contain spaces. When
@@ -66,13 +66,19 @@ HOOK_STATUS = "Loading KnowItAll2 memory"
 INERT_LAUNCHER = ('"""Left by `knowitall2 uninstall codex` for Codex chats still open with its hooks: '
                   'it does nothing."""\nraise SystemExit(0)\n')
 # Session start adds the briefing; a turn's end learns after a commit and shows
-# what was learned; the user's message adds what is new since the chat began.
+# what was learned; the user's message adds what is new since the chat began;
+# after each shell command, the tool rules and lessons it calls for (``commands``,
+# 0.11.2: the hook test of 2026-10-15 found Codex runs PostToolUse after every
+# shell command, with tool_name "Bash", and gives the model its additionalContext).
 # Codex has no hook for a session's end.
-HOOK_EVENTS = ("SessionStart", "Stop", "UserPromptSubmit")
-_EVENT_ARGUMENTS = {"SessionStart": [], "Stop": ["stop"], "UserPromptSubmit": ["prompt-submit"]}
-_EVENT_WORDS = {"SessionStart": "session-start", "Stop": "end-of-turn", "UserPromptSubmit": "message"}
-_TRUST_NAMES = {"SessionStart": "session_start", "Stop": "stop", "UserPromptSubmit": "user_prompt_submit"}
-_EVENT_TIMEOUTS = {"SessionStart": HOOK_TIMEOUT_SECONDS, "Stop": 15, "UserPromptSubmit": 10}
+HOOK_EVENTS = ("SessionStart", "Stop", "UserPromptSubmit", "PostToolUse")
+_EVENT_ARGUMENTS = {"SessionStart": [], "Stop": ["stop"], "UserPromptSubmit": ["prompt-submit"],
+                    "PostToolUse": ["command"]}
+_EVENT_WORDS = {"SessionStart": "session-start", "Stop": "end-of-turn", "UserPromptSubmit": "message",
+                "PostToolUse": "after-command"}
+_TRUST_NAMES = {"SessionStart": "session_start", "Stop": "stop", "UserPromptSubmit": "user_prompt_submit",
+                "PostToolUse": "post_tool_use"}
+_EVENT_TIMEOUTS = {"SessionStart": HOOK_TIMEOUT_SECONDS, "Stop": 15, "UserPromptSubmit": 10, "PostToolUse": 5}
 _WRITE_ATTEMPTS = 3
 
 
@@ -105,8 +111,8 @@ class CodexAdapter(AgentAdapter):
         doctor = f"then run `{cli_command('doctor')}` to confirm the registration."
         if self._hooks_skipped:
             return f"Start a new Codex session to load KnowItAll2, {doctor}"
-        return ("Start Codex, open /hooks and trust the KnowItAll2 SessionStart, Stop, and UserPromptSubmit hooks once, "
-                + doctor)
+        return ("Start Codex, open /hooks and trust the KnowItAll2 SessionStart, Stop, UserPromptSubmit, and PostToolUse "
+                "hooks once, " + doctor)
 
     def preflight(self) -> None:
         if not self.installed():
@@ -359,7 +365,9 @@ class CodexAdapter(AgentAdapter):
         if not untrusted:
             return Check(name, True, f"installed in {self.hooks_path} and trusted in Codex")
         noun = "hook once you trust it" if len(untrusted) == 1 else "hooks once you trust them"
-        return Check(name, True, f"installed in {self.hooks_path}; Codex runs the {' and '.join(untrusted)} "
+        named = untrusted[0] if len(untrusted) == 1 else (
+            f"{untrusted[0]} and {untrusted[1]}" if len(untrusted) == 2 else f"{', '.join(untrusted[:-1])}, and {untrusted[-1]}")
+        return Check(name, True, f"installed in {self.hooks_path}; Codex runs the {named} "
                                  f"{noun} with /hooks")
 
     def _hook_trusted(self, event: str = "SessionStart") -> bool:
