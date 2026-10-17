@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.11.3 (2026-10-17)
+
+- **Learning preserves complete statements and technical spelling.**
+  caller-controlled shell arguments and file searches stay unverified.
+- **Tool results survive checkpoints and restarts,** including several results
+  in one transcript record and slices of the final learning pass.
+- **Explicit rule promotions converge across offline computers** without
+  duplicate cycles, lost authority, or stale confirmations demoting a rule.
+- **Synchronization validates shared fields and question choices,** including
+  canonical UTC times before applying rows, and compares legacy times as dates.
+- **The application's own access keys are screened.** They are redacted and refused as memories.
+- **Sync returns the canonical changes made during a push** before it
+  completes. Invalid legacy questions fail safely when answered or settled.
+
 ## 0.11.2 (2026-10-16)
 
 - **Codex gets tool rules after each shell command too.** Codex now has the

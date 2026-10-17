@@ -447,7 +447,7 @@ class ValidationTests(LearningTestCase):
         for kind in ("rule", "preference"):
             with self.subTest(kind=kind):
                 checked, _ = self.check(text="Fix the DNS on the routers.", kind=kind, evidence="Please fix DNS on the router")
-                self.assertEqual(("note", "user", ["preference"]), (checked["kind"], checked["source"], checked["tags"]))
+                self.assertEqual(("note", "inferred", ["preference"]), (checked["kind"], checked["source"], checked["tags"]))
         # The user's words, re-typed: still the user's preference, though not word for word.
         checked, _ = self.check(text=rule, kind="rule", evidence="always keep router backup in /srv/backups")
         self.assertEqual(("note", "inferred", ["preference"]), (checked["kind"], checked["source"], checked["tags"]))
@@ -516,7 +516,7 @@ class ValidationTests(LearningTestCase):
         self.assertEqual(("fact", "inferred"), (checked["kind"], checked["source"]))
         # The same words, restated with other endings, still count; words of the model's own do not.
         checked, _ = self.check(text="Fix the DNS on the routers.", evidence=harmless)
-        self.assertEqual("user", checked["source"])
+        self.assertEqual("inferred", checked["source"])
         checked, _ = self.check(text="Fix the DNS of the homelab router when asked.", evidence=harmless)
         self.assertEqual("inferred", checked["source"])
         # Half the user's words around someone else's command: never the user's own (review 2026-10-04, L-M2).
@@ -550,7 +550,7 @@ class ValidationTests(LearningTestCase):
             with self.subTest(text=text):
                 checked, _ = self.check(text=text, kind="preference", evidence=quote, subjects=["changelog"])
                 self.assertEqual(("note", "user", ["preference"]), (checked["kind"], checked["source"], checked["tags"]))
-                self.assertEqual("Keep each changelog entry to one short paragraph.", checked["text"])
+                self.assertEqual(said, checked["text"])
         checked, _ = self.check(text="For the homelab release notes, keep each changelog entry to one short paragraph.",
                                 kind="preference", evidence=quote, subjects=["changelog"])
         self.assertEqual(["changelog", "homelab release notes"], checked["subjects"])

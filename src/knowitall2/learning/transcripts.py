@@ -59,6 +59,8 @@ class Event:
     end: int = 0  # byte offset just past the log record that produced this event
     cwd: str | None = None  # the folder a command ran in, when the log records it apart from the command
     at: str | None = None  # when the log recorded it
+    start: int = 0
+    index: int = 0
 
 
 @dataclass
@@ -220,6 +222,7 @@ def read_claude_code_session(path: Path, *, start: int = 0, stop: int | None = N
 
     session = Session(agent="claude-code", session_id=path.stem, path=path)
     pending: dict[str, tuple[str, dict[str, Any]]] = {}
+    previous: dict[str, tuple[str, dict[str, Any]]] | None = None
     offset = start
     with path.open("rb") as stream:
         stream.seek(start)
@@ -232,12 +235,62 @@ def read_claude_code_session(path: Path, *, start: int = 0, stop: int | None = N
             except ValueError:
                 continue
             if isinstance(record, dict):
+                missing = [ident for ident in _claude_result_ids(record) if ident not in pending]
+                if start and missing:
+                    # The checkpoint can follow the assistant record that started
+                    # a call. Recover outstanding calls, without replaying earlier
+                    # events or persisting another copy of their (possibly secret)
+                    # arguments. Only an orphaned result needs this one prefix read.
+                    if previous is None:
+                        history, previous = _claude_prefix(path, start)
+                        session.cwd = session.cwd or history.cwd
+                        session.session_id = history.session_id
+                    for ident in missing:
+                        call = previous.pop(ident, None)
+                        if call is not None:
+                            pending[ident] = call
                 before = len(session.events)
                 _consume(record, session, pending)
                 at = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
                 for index in range(before, len(session.events)):
-                    session.events[index] = replace(session.events[index], end=offset, at=at)
+                    session.events[index] = replace(session.events[index], end=offset, at=at,
+                                                    start=offset - len(raw), index=index - before)
     return session, offset
+
+
+def _claude_result_ids(record: dict[str, Any]) -> list[str]:
+    if (record.get("type") != "user" or any(record.get(flag) for flag in
+            ("isSidechain", "isMeta", "isApiErrorMessage", "isCompactSummary", "isVisibleInTranscriptOnly"))):
+        return []
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [block["tool_use_id"] for block in content if isinstance(block, dict)
+            and block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str)
+            ] if isinstance(content, list) else []
+
+
+def _claude_prefix(path: Path, end: int) -> tuple[Session, dict[str, tuple[str, dict[str, Any]]]]:
+    """Parser dependencies at a checkpoint; old results remove completed calls.
+
+    This is lazy and read at most once per resumed read. Ordinary incremental
+    reads still seek directly to their offset. No prior event is emitted again.
+    """
+
+    history = Session(agent="claude-code", session_id=path.stem, path=path)
+    pending: dict[str, tuple[str, dict[str, Any]]] = {}
+    with path.open("rb") as stream:
+        while stream.tell() < end:
+            raw = stream.readline()
+            if not raw.endswith(b"\n"):
+                break
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                _consume(record, history, pending)
+                history.events.clear()
+    return history, pending
 
 
 def _consume(record: dict[str, Any], session: Session, pending: dict[str, tuple[str, dict[str, Any]]]) -> None:
@@ -383,7 +436,8 @@ def read_codex_session(path: Path, *, start: int = 0, stop: int | None = None) -
                 _consume_codex(record, session)
                 at = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
                 for index in range(before, len(session.events)):
-                    session.events[index] = replace(session.events[index], end=offset, at=at)
+                    session.events[index] = replace(session.events[index], end=offset, at=at,
+                                                    start=offset - len(raw), index=index - before)
     return session, offset
 
 

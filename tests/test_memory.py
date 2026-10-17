@@ -61,7 +61,7 @@ class MemoryTests(unittest.TestCase):
     def test_duplicate_confirms_and_strengthens_instead_of_repeating(self) -> None:
         first = self.remember("Backups run nightly at 02:00.")
         self.clock.value = "2026-09-28T08:00:00Z"
-        second = self.remember("backups   run nightly at 02:00", source="observed")
+        second = self.remember("Backups   run nightly at 02:00", source="observed")
         self.assertEqual("already_known", second.status)
         self.assertEqual(first.record.id, second.record.id)
         self.assertEqual("observed", second.record.verification)
@@ -506,6 +506,20 @@ class RemoteAddedLaterTests(unittest.TestCase):
         again = memory.remember("Gamma deploys by copying files.", scope="project", project_path=self.folder)
         self.assertEqual(("already_known", retired.record.id), (again.status, again.record.id))
         self.assertIsNone(self.memory().rejoin(after))
+
+    def test_rejoin_preserves_case_distinct_technical_statements(self) -> None:
+        early = self.memory().remember("Use /srv/Production/Backups for database backups.",
+                                       scope="project", project_path=self.folder).record
+        clone = make_repository(self.root / "clone", "git@gitlab.example.com:team/gamma.git")
+        later = self.memory().remember("Use /srv/production/backups for database backups.",
+                                       scope="project", project_path=clone).record
+        self.add_remote(self.folder)
+        after = self.memory().project_for(self.folder)
+        for record in (early, later):
+            saved = self.store.get(record.id)
+            self.assertEqual("active", saved.status)
+            self.assertEqual(after.id, saved.project_id)
+            self.assertEqual(record.text, saved.text)
 
     def test_a_memory_the_project_already_has_is_kept_once(self) -> None:
         early = self.memory().remember("Gamma builds with make dist.", scope="project", project_path=self.folder)

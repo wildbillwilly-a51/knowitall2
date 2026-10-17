@@ -783,7 +783,7 @@ def _start_from_now(agent: str) -> int:
                     continue
                 entry = state.entry(log)
                 if int(entry.get("offset", 0)) < boundary:
-                    entry.update({"offset": boundary, "status": "baseline", "baseline_to": boundary,
+                    entry.update({"offset": boundary, "event_index": 0, "status": "baseline", "baseline_to": boundary,
                                   "updated_at": moment})
                     marked += 1
             state.save()

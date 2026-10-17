@@ -33,6 +33,7 @@ from .memory import (
     is_users_choice,
 )
 from .store import RecordRow, Store
+from .question_schema import check_question
 
 UNCONFIRMED_RULE_PREFIX = "Possible rule, not confirmed by the user: "
 LIST_LIMIT = 5
@@ -369,11 +370,10 @@ def answer(memory: Memory, question_id: str, choice: str) -> str:
     """
 
     question = _still_open(memory, question_id)
-    keys = [option["key"] for option in question["options"]]
-    if choice not in keys:
-        raise MemoryInputError(f"Unknown choice {choice!r}; use one of: {', '.join(keys)}.")
+    _check_choice(question, choice)
     with memory.store.transaction():
         question = _still_open(memory, question_id)
+        _check_choice(question, choice)
         records = [memory.store.get(record_id) for record_id in question["record_ids"]]
         if any(record is None or record.status != "active" for record in records):
             _close(memory, question["id"], f"{choice} (memories had already changed)")
@@ -410,6 +410,9 @@ def settle(memory: Memory, question: dict[str, Any], choice: str, *, by: str, ev
         current = memory.store.question(question["id"])
         if current is None or current["status"] != "open":
             return f"[{question['id']}] was already answered; nothing was changed."
+        _check_question(current)
+        if current["kind"] != "conflict":
+            return None  # the question changed kind since it was offered
         records = [memory.store.get(record_id) for record_id in current["record_ids"]]
         if any(record is None or record.status != "active" for record in records):
             _close(memory, current["id"], "memories had already changed")
@@ -679,6 +682,20 @@ def _learned_in(store: Store, record_ids: list[str]) -> str | None:
             if event["project_id"]:
                 return event["project_id"]
     return None
+
+
+def _check_question(question: dict) -> None:
+    try:
+        check_question(question["kind"], record_ids=question["record_ids"], options=question["options"])
+    except ValueError as exc:
+        raise MemoryInputError(f"Invalid saved question [{question['id']}]: {exc}.") from None
+
+
+def _check_choice(question: dict, choice: str) -> None:
+    _check_question(question)
+    keys = [option["key"] for option in question["options"]]
+    if choice not in keys:
+        raise MemoryInputError(f"Unknown choice {choice!r}; use one of: {', '.join(keys)}.")
 
 
 def _apply(memory: Memory, question: dict, records: list[RecordRow], choice: str) -> str:

@@ -22,7 +22,7 @@ from ..memory import (
     _stem, _tokens, in_users_words, is_users_choice, keywords, may_replace_unasked, significant_words,
 )
 from ..quotes import _ELISION, letters, nearly_quoted_in as _nearly_quoted_in, quoted_in as _quoted_in
-from ..quotes import short_quote_in, too_short
+from ..quotes import short_quote_in, too_short, same_statement_text, complete_statement_in
 from ..secrets import contains_secret, redact
 from ..store import RecordRow, StoreError
 from .dossier import Dossier, build_dossiers, file_by_work
@@ -60,6 +60,8 @@ _LASTING = re.compile(r"\bfrom\s+now\s+on\b|\balways\b|\bnever\b", re.IGNORECASE
 # A log's entry while its set-aside part is caught up: read up to here, then go on from ``RESUME_AT``.
 LEARN_TO = "learn_to"
 RESUME_AT = "resume_at"
+RESUME_EVENT_INDEX = "resume_event_index"
+SETTLED_EVENT_INDEX = "settled_event_index"
 # How far into a log the final pass has read; the quick pass's progress is ``offset``.
 SETTLED = "settled"
 SETTLED_PRINT = "settled:"
@@ -367,7 +369,9 @@ def learn(
                 continue
             # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
             session, end = read_session(log, start=start, stop=int(entry.get(LEARN_TO) or 0) or None)
-            dossiers = build_dossiers(session, require_user=start == 0,
+            event_index = int(entry.get("event_index" if quick else SETTLED_EVENT_INDEX, 0))
+            session.events = [event for event in session.events if event.start != start or event.index >= event_index]
+            dossiers = build_dossiers(session, require_user=start == 0 and event_index == 0,
                                       **({} if quick else {"budget": PART_CHARACTERS}))
             if memory is not None:
                 # What was learned belongs to the project the work was in, not always the chat's folder.
@@ -404,7 +408,8 @@ def learn(
                 # The same stretch was settled already, from another copy of the log.
                 report.outcomes["duplicate dossier"] += len(dossiers)
                 confirm_session(memory, session.session_id)
-                _finish(entry, session.session_id, end, moment, settled=True)
+                _finish(entry, session.session_id, end, moment, settled=True,
+                        event_index=dossiers[-1].end_event_index if dossiers else 0)
                 continue
             if not quick:
                 if settings.max_calls_per_day - calls_today - report.calls < needed_calls(dossiers):
@@ -435,7 +440,8 @@ def learn(
                     if entry["failures"] >= MAX_FAILURES:
                         # Give up on this stretch: what the quick pass saved stands.
                         confirm_session(memory, session.session_id)
-                        _finish(entry, session.session_id, end, moment, settled=True)
+                        _finish(entry, session.session_id, end, moment, settled=True,
+                        event_index=dossiers[-1].end_event_index if dossiers else 0)
                         entry["status"] = "skipped"
                         report.skipped.append(session.session_id)
                     else:
@@ -453,17 +459,18 @@ def learn(
                 report.results.extend(settled.results)
                 for mark in prints:
                     state.mark_seen(mark)
-                _finish(entry, session.session_id, end, moment, settled=True)
+                _finish(entry, session.session_id, end, moment, settled=True,
+                        event_index=dossiers[-1].end_event_index if dossiers else 0)
                 continue
             budget = remaining()
-            progress: int | None = None
+            progress: dict[str, int] | None = None
             completed = True
             current: Dossier | None = None
             try:
                 for dossier in dossiers:
                     if any(dossier is item for item in duplicates):
                         report.outcomes["duplicate dossier"] += 1
-                        progress = dossier.end_offset
+                        progress = _checkpoint(dossier)
                         continue
                     if budget <= 0:
                         completed = False
@@ -483,10 +490,10 @@ def learn(
                         report.results.append({"outcome": outcome, "ids": record_ids,
                                                "text": result_text(outcome, candidate)})
                     state.mark_seen(dossier.fingerprint)
-                    progress = dossier.end_offset
+                    progress = _checkpoint(dossier)
             except ExtractionError as exc:
                 if progress is not None:
-                    entry["offset"] = progress
+                    entry.update(progress)
                 if exc.blocking:
                     # The backend itself is unusable: keep progress, blame no session, stop the run.
                     report.blocked = str(exc)
@@ -501,7 +508,7 @@ def learn(
                 if entry["failures"] >= MAX_FAILURES:
                     # Give up on the excerpt that keeps failing, not on the rest of the session.
                     last = current is None or current is dossiers[-1]
-                    entry["offset"] = end if last else current.end_offset
+                    entry.update({"offset": end, "event_index": 0} if last else _checkpoint(current))
                     entry["failures"] = 0
                     entry["status"] = "skipped" if last else "partial"
                     report.skipped.append(session.session_id)
@@ -513,7 +520,7 @@ def learn(
                 # The memory store failed (a write held too long by another process, say): keep what this
                 # session already gave, blame no session, and stop; the next run carries on from here.
                 if progress is not None:
-                    entry.update({"offset": progress, "session_id": session.session_id, "status": "partial",
+                    entry.update({**progress, "session_id": session.session_id, "status": "partial",
                                   "updated_at": moment.isoformat()})
                 report.blocked = f"the memory store failed: {exc}"
                 journal.problem("learning", f"learning stopped because the memory store failed: {exc}")
@@ -523,7 +530,7 @@ def learn(
                 continue
             # The budget ran out part-way: keep what was learned and continue next run.
             if progress is not None:
-                entry["offset"] = progress
+                entry.update(progress)
             entry.update({"session_id": session.session_id, "status": "partial", "updated_at": moment.isoformat()})
             report.deferred += 1
     finally:
@@ -676,6 +683,12 @@ def _record_candidate(
 
 
 def _publish(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, provisional: bool = False,
+             merge: bool = False) -> tuple[str, list[str]]:
+    with memory.store.transaction():
+        return _save_candidate(memory, candidate, dossier, provisional=provisional, merge=merge)
+
+
+def _save_candidate(memory: Memory, candidate: dict[str, Any], dossier: Dossier, *, provisional: bool = False,
              merge: bool = False) -> tuple[str, list[str]]:
     checked, reason = validate(candidate, dossier)
     if checked is None:
@@ -1040,9 +1053,20 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
     tags: list[str] = []
     if kind in ("rule", "preference"):
         quoted = _quoted_in(evidence, dossier.user_texts)
-        if quoted and not _in_the_users_words(text, evidence):
-            text, subjects = _the_users_sentence(text, evidence, subjects)
-        in_their_words = quoted and _in_the_users_words(text, evidence)
+        actual = _complete_user_quote(evidence, dossier.user_texts) if quoted else None
+        if (actual is not None and _says_what_was_quoted(actual, text, share=USER_STATEMENT_SHARE)
+                and not any(_matters(token) and token.strip(".,;:!?()[]{}\"'`") not in
+                            {part.strip(".,;:!?()[]{}\"'`") for part in actual.split()}
+                            for token in text.split())):
+            # Preserve the source sentence, including conditions and technical
+            # spelling, rather than authorizing the model's paraphrase.
+            context = _CONTEXT_CLAUSE.match(text)
+            if context and len(subjects) < 8:
+                work = context.group(1).strip()
+                if work.casefold() not in {subject.casefold() for subject in subjects}:
+                    subjects.append(work)
+            text = actual
+        in_their_words = quoted and _authorized_statement(text, dossier.user_texts)
         if kind == "rule" and in_their_words and _made_a_rule(evidence, dossier.user_texts):
             source = "user"   # the user plainly made it a rule
         elif quoted or _nearly_quoted_in(evidence, dossier.user_texts):
@@ -1053,7 +1077,7 @@ def validate(candidate: dict[str, Any], dossier: Dossier) -> tuple[dict[str, Any
             kind = "note"   # an instruction an agent wrote, not the user's
         if work_state and source != "user":
             return None, "work state"
-    elif _quoted_in(evidence, dossier.user_texts) and _in_the_users_words(text, evidence):
+    elif _quoted_in(evidence, dossier.user_texts) and _authorized_statement(text, dossier.user_texts):
         source = "user"   # the user's own words stay theirs, whatever a command printed (candidate review, C-H3)
     elif _observed(text, evidence, dossier):
         source = "observed"
@@ -1154,6 +1178,24 @@ def _says_what_was_quoted(text: str, quote: str, *, share: float = USER_WORDS_SH
     return found / len(words) >= share
 
 
+def _complete_user_quote(evidence: str, sources: list[str]) -> str | None:
+    if _ELISION.search(evidence):
+        return None
+    for source in sources:
+        statements = [source[start:end].strip() for start, end in _sentence_spans(source)]
+        instruction = _rule_instruction(source) if _made_a_rule(evidence, [source]) else ""
+        for statement in [instruction, *statements]:
+            if (MIN_TEXT_CHARACTERS <= len(statement) <= MAX_TEXT_CHARACTERS
+                    and _quoted_in(evidence, [statement])):
+                return statement
+    return None
+
+
+def _authorized_statement(text: str, sources: list[str]) -> bool:
+    return complete_statement_in(text, sources) or any(
+        same_statement_text(text, _rule_instruction(said)) for said in sources if _made_a_rule(said, [said]))
+
+
 def _in_the_users_words(text: str, quote: str) -> bool:
     """Whether ``text`` says what the user said in ``quote``, and nothing more that matters.
 
@@ -1163,11 +1205,14 @@ def _in_the_users_words(text: str, quote: str) -> bool:
     path, option, or command it names.
     """
 
-    if not _says_what_was_quoted(text, quote, share=USER_STATEMENT_SHARE):
-        return False
-    said = {_bare(token) for token in quote.split()}
-    return all(_bare(token) in said for token in text.split() if _matters(token))
-
+    if same_statement_text(text, quote):
+        return True
+    # Only capitalization of a prose instruction's initial verb is formatting;
+    # paths, options, identifiers and every following character stay exact.
+    verbs = {"always", "never", "run", "push", "use", "keep", "require", "do", "avoid", "ask", "get", "make"}
+    first = text.split(maxsplit=1)[0].casefold() if text.strip() else ""
+    return (first in verbs and bool(quote) and bool(text)
+            and same_statement_text(text[0].lower() + text[1:], quote[0].lower() + quote[1:]))
 
 def _the_users_sentence(text: str, quote: str, subjects: list[str]) -> tuple[str, list[str]]:
     """A preference or rule as the user's own words, without the work the model wrote around them.
@@ -1182,6 +1227,9 @@ def _the_users_sentence(text: str, quote: str, subjects: list[str]) -> tuple[str
     """
 
     sentence = quote.strip()
+    context = _CONTEXT_CLAUSE.match(text)
+    if context is None or not same_statement_text(text[context.end():], sentence):
+        return text, subjects
     if _ELISION.search(sentence) or not MIN_TEXT_CHARACTERS <= len(sentence) <= MAX_TEXT_CHARACTERS:
         return text, subjects
     if not _says_what_was_quoted(sentence, text, share=USER_STATEMENT_SHARE):
@@ -1193,7 +1241,6 @@ def _the_users_sentence(text: str, quote: str, subjects: list[str]) -> tuple[str
     work = context.group(1).strip() if context else ""
     if work and len(subjects) < 8 and work.casefold() not in {item.casefold() for item in subjects}:
         subjects = [*subjects, work]
-    sentence = sentence[0].upper() + sentence[1:]
     return (sentence if sentence[-1] in ".!?" else sentence + "."), subjects
 
 
@@ -1251,24 +1298,33 @@ def _set_aside(entry: dict[str, Any], log: Path, moment: datetime) -> bool:
         return False
     if end <= int(entry.get("offset", 0)):
         return False
-    entry.update({"offset": end, SETTLED: end, "status": SKIPPED, SET_ASIDE_TO: end, "failures": 0,
+    entry.update({"offset": end, "event_index": 0, SETTLED: end, SETTLED_EVENT_INDEX: 0, "status": SKIPPED, SET_ASIDE_TO: end, "failures": 0,
                   "updated_at": moment.isoformat()})
     return True
 
 
-def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime, *, settled: bool = False) -> None:
+def _checkpoint(dossier: Dossier) -> dict[str, int]:
+    return {"offset": dossier.end_offset, "event_index": dossier.end_event_index}
+
+
+def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime, *, settled: bool = False, event_index: int = 0) -> None:
     """Note that ``entry``'s log was read up to ``end``: by the quick pass, or (``settled``) by the final pass,
     which also leaves the quick pass nothing before it to read."""
 
     bound = int(entry.get(LEARN_TO) or 0)
     if bound and end >= bound:
         # The set-aside part is caught up: carry on from where learning had already got to.
-        end = max(end, int(entry.pop(RESUME_AT, 0) or 0))
+        resume = int(entry.pop(RESUME_AT, 0) or 0)
+        resume_index = int(entry.pop(RESUME_EVENT_INDEX, 0) or 0)
+        if resume >= end:
+            end, event_index = resume, resume_index
         entry.pop(LEARN_TO, None)
     if settled:
-        entry[SETTLED] = end
-        end = max(end, int(entry.get("offset", 0)))
+        entry[SETTLED], entry[SETTLED_EVENT_INDEX] = end, event_index
+        previous = (int(entry.get("offset", 0)), int(entry.get("event_index", 0)))
+        end, event_index = max((end, event_index), previous)
     entry.update(
-        {"session_id": session_id, "offset": end, "status": "done", "failures": 0, "last_error": None,
+        {"session_id": session_id, "offset": end, "event_index": event_index,
+         "status": "partial" if event_index else "done", "failures": 0, "last_error": None,
          "updated_at": moment.isoformat()}
     )

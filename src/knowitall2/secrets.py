@@ -45,6 +45,8 @@ _PRIVATE_KEY_BLOCK = (
 # A prefix that can repeat inside its own token ("sk-sk-sk-...") starts only
 # where no token character comes before it.
 _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # accounts.redeem: a fixed prefix and token_urlsafe(32), independent of the surrounding key name.
+    ("KnowItAll2 access key", re.compile(r"(?<![\w-])ki" + r"a_[A-Za-z0-9_-]{43}(?![\w-])")),
     ("private key", re.compile(_PRIVATE_KEY_BLOCK)),
     ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,})")),

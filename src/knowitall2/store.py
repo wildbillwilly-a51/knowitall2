@@ -771,17 +771,30 @@ class Store:
         row = self._connection.execute(f"SELECT {_COLUMNS} {_FROM} WHERE r.id = ?", (record_id,)).fetchone()
         return RecordRow.from_row(row) if row else None
 
-    def find_active_duplicate(self, content_hash: str) -> RecordRow | None:
-        row = self._connection.execute(
-            f"SELECT {_COLUMNS} {_FROM} WHERE r.content_hash = ? AND r.status = 'active' LIMIT 1",
+    def find_active_duplicate(self, content_hash: str, *, text: str | None = None) -> RecordRow | None:
+        from .quotes import same_statement_text
+
+        rows = self._connection.execute(
+            f"SELECT {_COLUMNS} {_FROM} WHERE r.content_hash = ? AND r.status = 'active' ORDER BY r.seq",
             (content_hash,),
-        ).fetchone()
-        return RecordRow.from_row(row) if row else None
+        ).fetchall()
+        # Older hashes fold case: use them as an index, never as equality proof.
+        return next((record for row in rows if (record := RecordRow.from_row(row))
+                     and (text is None or same_statement_text(record.text, text))), None)
 
     def confirm(self, record_id: str, *, verification: str, now: str) -> None:
         self._connection.execute(
             "UPDATE records SET verification = ?, confirmed_at = ?, updated_at = ? WHERE id = ?",
             (verification, now, now, record_id),
+        )
+
+    def promote_to_rule(self, record_id: str, *, agent: str | None, now: str) -> None:
+        """The user's explicit promotion of an active memory, keeping its id and links."""
+
+        self._connection.execute(
+            "UPDATE records SET kind = 'rule', verification = 'user_stated', source_kind = 'user', "
+            "source_agent = ?, updated_at = ?, confirmed_at = ? WHERE id = ? AND status = 'active'",
+            (agent, now, now, record_id),
         )
 
     def said_in_sessions(self, record_id: str) -> set[str]:
@@ -983,6 +996,9 @@ class Store:
         The check and the insert are one transaction, so two processes asking at once ask once.
         """
 
+        from .question_schema import check_question
+
+        check_question(kind, record_ids=record_ids, options=options)
         key = json.dumps(sorted(record_ids))
         with self.transaction():
             for row in self._connection.execute(

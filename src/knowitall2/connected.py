@@ -388,6 +388,10 @@ def sync_now(store: Store, *, agent: str | None = None, remote: RemoteClient | N
                     report.received += pull(store, remote)
                     sent, refused = push(store, remote, columns)
                     report.sent, report.refused = report.sent + sent, report.refused + refused
+                    if sent:
+                        # A duplicate push can also promote another, canonical
+                        # row. Receive those changes before this sync finishes.
+                        report.received += pull(store, remote)
                     report.uses += push_usage(store, remote)
                     if not _again():
                         break

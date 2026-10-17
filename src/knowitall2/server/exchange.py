@@ -23,10 +23,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
 from ..secrets import contains_secret
+from ..quotes import same_statement_text
 from ..store import BY_KEY, SYNCED_TABLES, Store, SyncedTable
 from ..sync import SyncError, check_key, check_row, delete_row, read_row, stamp, table_for, write_row
 from . import later
@@ -130,6 +132,15 @@ def _apply_one(store: Store, connection_id: str, operation: object, now: str) ->
         seq = _latest_seq(connection, operation["table"], operation["key"])
         if seq:
             answer["seq"] = seq
+        current = _current(connection, operation)
+        requested = operation.get("row")
+        if current is not None and isinstance(requested, dict) and any(
+            column in current[0] and current[0][column] != value for column, value in requested.items()
+        ):
+            # Normalization may keep stronger authority or avoid a duplicate
+            # cycle without creating a new change. Return the actual row even
+            # when the sender's pull cursor already passed its change number.
+            answer["row"] = current[0]
     connection.execute(
         "INSERT INTO server_applied (op_id, connection_id, result, at) VALUES (?, ?, ?, ?)",
         (op_id, connection_id, json.dumps(answer), now),
@@ -181,30 +192,87 @@ def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], n
         return {"result": "applied"}
     if operation.get("op") != "upsert":
         raise SyncError("op must be upsert or delete")
-    row = check_row(table, key, operation.get("row"))
+    row = check_row(table, key, operation.get("row"), existing=existing)
     # Only new or changed text is screened: retiring or replacing a memory kept
     # since before the screening knew its shape must never be refused.
-    if (table.name == "records" and isinstance(row.get("text"), str)
-            and (existing is None or row["text"] != existing.get("text")) and contains_secret(row["text"])):
-        raise SyncError("the memory looks like it holds a secret; save where the secret is kept instead")
+    if table.name == "records":
+        replacement = row.get("superseded_by")
+        if existing is not None and row.get("status") == "superseded" and replacement:
+            target = read_row(connection, table, replacement)
+            # A same-text promotion may arrive as a new id followed by a
+            # replacement of the old id. If the new id was folded into the
+            # old one, that replacement must not turn the pair into a cycle.
+            if (target is not None and target.get("retired_reason") == DUPLICATE_REASON
+                    and target.get("superseded_by") == key and _same_memory(existing, target)):
+                row.update(status=existing["status"], superseded_by=existing["superseded_by"],
+                           retired_reason=existing["retired_reason"])
+        changed_text = [row[column] for column in ("text", "subjects", "tags")
+                        if isinstance(row.get(column), str)
+                        and (existing is None or row[column] != existing.get(column))]
+        if contains_secret("\n".join(changed_text)):
+            raise SyncError("the memory looks like it holds a secret; save where the secret is kept instead")
     if existing is None:
         if table.name == "records" and row.get("status") == "active" and row.get("content_hash"):
-            first = connection.execute(
-                "SELECT id FROM records WHERE content_hash = ? AND status = 'active' AND id != ? LIMIT 1",
+            candidates = connection.execute(
+                "SELECT id FROM records WHERE content_hash = ? AND status = 'active' AND id != ? ORDER BY seq",
                 (row["content_hash"], key),
-            ).fetchone()
+            ).fetchall()
+            first = next((found for candidate in candidates
+                          if (found := read_row(connection, table, candidate[0])) and _same_memory(found, row)), None)
             if first is not None:
-                row.update(status="superseded", superseded_by=first[0], retired_reason=DUPLICATE_REASON)
+                _merge_duplicate(connection, table, first, row, now)
+                row.update(status="superseded", superseded_by=first["id"], retired_reason=DUPLICATE_REASON)
                 write_row(connection, table, row)
                 current = _current(connection, operation)
                 assert current is not None
-                return {"result": "duplicate", "kept": first[0], "row": current[0], "seq": current[1]}
+                return {"result": "duplicate", "kept": first["id"], "row": current[0], "seq": current[1]}
         write_row(connection, table, row)
         return {"result": "applied"}
     if table.name == "records":
+        # An offline peer can promote an id already folded into another id.
+        # Follow only server-created duplicate links; ordinary replacements
+        # can describe a different statement and must not inherit authority.
+        if existing.get("retired_reason") == DUPLICATE_REASON and existing.get("superseded_by"):
+            target = existing
+            seen = {key}
+            while target.get("retired_reason") == DUPLICATE_REASON and target.get("superseded_by") not in seen:
+                seen.add(target["superseded_by"])
+                following = read_row(connection, table, target["superseded_by"])
+                if following is None:
+                    break
+                target = following
+            if row.get("status", existing["status"]) == "active" and _same_memory(target, {**existing, **row}):
+                if target["status"] == "active":
+                    _merge_duplicate(connection, table, target, {**existing, **row}, now)
+                current = _current(connection, operation)
+                assert current is not None
+                return {"result": "duplicate", "kept": target["id"], "row": current[0], "seq": current[1]}
         # Use counts are the server's own, from the usage computers send.
         row.pop("recall_count", None)
         row.pop("last_used_at", None)
+        if existing["status"] == row.get("status", existing["status"]) == "active" and _same_memory(
+            existing, {**existing, **row}
+        ):
+            explicit_rule = (row.get("kind") == "rule" and row.get("verification") == "user_stated"
+                             and row.get("source_kind") == "user")
+            if (explicit_rule
+                    and (existing["kind"] != "rule" or existing["verification"] != "user_stated")):
+                # Promotion expresses a user instruction, not a newer snapshot
+                # of a note. Converge it before choosing by timestamp, just as
+                # for independently created duplicate ids.
+                _merge_duplicate(connection, table, existing, {**existing, **row}, now)
+                current = _current(connection, operation)
+                assert current is not None
+                return {"result": "applied", "row": current[0], "seq": current[1]}
+            strength = {"unverified": 0, "observed": 1, "user_stated": 2}
+            if strength.get(row.get("verification", existing["verification"]), -1) < strength[existing["verification"]]:
+                for column in ("verification", "source_kind", "source_agent", "source_session", "source_computer"):
+                    row[column] = existing[column]
+            if existing["kind"] == "rule" and existing["verification"] == "user_stated":
+                row["kind"] = "rule"
+                if not explicit_rule:
+                    for column in ("source_kind", "source_agent", "source_session", "source_computer", "tags", "subjects"):
+                        row[column] = existing[column]
     if all(existing.get(column) == value for column, value in row.items()):
         return {"result": "applied"}  # the server has this version already: nothing to settle or to change
     if _changed_by_others(connection, table, key, base, connection_id):
@@ -228,6 +296,38 @@ def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], n
     return {"result": "applied"}
 
 
+def _same_memory(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    return (first.get("scope") == second.get("scope") and first.get("project_id") == second.get("project_id")
+            and isinstance(first.get("text"), str) and isinstance(second.get("text"), str)
+            and same_statement_text(first["text"], second["text"]))
+
+
+def _merge_duplicate(connection: sqlite3.Connection, table: SyncedTable, kept: dict[str, Any],
+                     incoming: dict[str, Any], now: str) -> None:
+    """Converge authority and user promotion without dropping the canonical id."""
+    strength = {"unverified": 0, "observed": 1, "user_stated": 2}
+    merged = dict(kept)
+    user = incoming.get("verification") == "user_stated" and incoming.get("source_kind") == "user"
+    if user and incoming.get("kind") == "rule":
+        merged.update(kind="rule", text=incoming["text"])
+    if (user and incoming.get("kind") == "rule") or (
+        strength.get(incoming.get("verification"), -1) > strength.get(kept.get("verification"), -1)
+    ):
+        for column in ("verification", "source_kind", "source_agent", "source_session", "source_computer"):
+            if column in incoming:
+                merged[column] = incoming[column]
+    if kept["kind"] != "rule" or user:
+        for column in ("tags", "subjects"):
+            values = list(dict.fromkeys([*json.loads(kept[column]), *json.loads(incoming.get(column, "[]"))]))
+            merged[column] = json.dumps(values, ensure_ascii=False)
+    if any(merged[column] != kept[column] for column in kept):
+        merged.update(updated_at=now, confirmed_at=now)
+        # Two individually valid label arrays can exceed the wire limit when
+        # combined. Never publish a row that clients would have to reject.
+        check_row(table, kept["id"], {column: value for column, value in merged.items() if value != kept[column]})
+        write_row(connection, table, merged)
+
+
 def _arrived(connection: sqlite3.Connection, table: SyncedTable, key: str) -> str | None:
     """When the server got the version of a row it holds (its newest change), if it noted one."""
 
@@ -236,17 +336,23 @@ def _arrived(connection: sqlite3.Connection, table: SyncedTable, key: str) -> st
     return row[0] if row else None
 
 
-def _no_later_than(value: str | None, arrived: str) -> str | None:
+def _no_later_than(value: str | None, arrived: str) -> datetime | None:
     """A version's time, or the moment it arrived plus the allowed clock difference, whichever is earlier.
 
-    Times compare as text, as they do everywhere in KnowItAll2, so "9999-..." counts as that moment.
+    Parse both versions, including legacy rows whose dates were not padded.
     """
 
+    if value is None:
+        return None
     try:
-        ceiling = later(arrived, seconds=CLOCK_SKEW_SECONDS)
+        moment = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
-        return value
-    return ceiling if value is not None and value > ceiling else value
+        return None
+    try:
+        ceiling = datetime.strptime(arrived, "%Y-%m-%dT%H:%M:%SZ") + timedelta(seconds=CLOCK_SKEW_SECONDS)
+    except (ValueError, OverflowError):
+        return moment
+    return min(moment, ceiling)
 
 
 def _changed_by_others(

@@ -16,6 +16,39 @@ from functools import lru_cache
 MIN_QUOTE_LETTERS = 12
 
 
+def same_statement_text(first: str, second: str) -> bool:
+    """The same statement, allowing whitespace and a final full stop only.
+
+    Word overlap is useful for search, never for transferring the user's authority:
+    a missing negation, reordered roles, or changed option can reverse an instruction.
+    """
+
+    def normalized(text: str) -> str:
+        # Case and Unicode spelling can carry meaning in paths, identifiers and
+        # arguments. Only layout and a sentence's final period are dispensable.
+        return " ".join(text.split()).removesuffix(".")
+
+    return bool(first.strip()) and normalized(first) == normalized(second)
+
+
+def complete_statement_in(quote: str, sources: list[str]) -> bool:
+    """A complete user statement, rather than words selected from inside a condition.
+
+    Only sentence boundaries count, not line wrapping, colons, semicolons or
+    elisions. The conventional 'From now on,' introduction does not change an
+    otherwise verbatim standing instruction.
+    """
+
+    for source in sources:
+        for statement in [source, *re.split(r"(?<=[.!?])\s+", source)]:
+            if same_statement_text(quote, statement):
+                return True
+            introduced = re.sub(r"^from now on,\s+", "", statement.strip(), flags=re.IGNORECASE)
+            if same_statement_text(quote, introduced):
+                return True
+    return False
+
+
 def quoted_in(quote: str, sources: list[str]) -> bool:
     """Whether ``quote`` appears in one of ``sources``.
 

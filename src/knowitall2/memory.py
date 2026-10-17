@@ -17,6 +17,7 @@ from . import journal
 from .identity import ProjectIdentity, identify, path_project_id
 from .quotes import quoted_in
 from .secrets import find_secrets, redact
+from .quotes import same_statement_text
 from .store import RecordRow, Store
 
 KINDS = ("fact", "procedure", "decision", "lesson", "rule", "note")
@@ -237,11 +238,13 @@ def same_statement(record: RecordRow, *, kind: str, text: str) -> bool:
 
     if record.kind != kind:
         return False
-    first, second = _tokens(record.text), _tokens(text)
-    if "".join(first) == "".join(second):
+    if same_statement_text(record.text, text):
         return True
-    words, others = set(first), set(second)
-    return bool(words | others) and len(words & others) / len(words | others) >= SAME_STATEMENT_SHARE
+    # Prose punctuation is formatting; technical tokens retain their exact spelling.
+    technical = re.compile(r"[\\/=@$`\"]|--|\w[.:]\w|[0-9]")
+    if technical.search(record.text) or technical.search(text):
+        return False
+    return re.findall(r"\w+|[^\w\s.,;:-]", record.text) == re.findall(r"\w+|[^\w\s.,;:-]", text)
 
 
 class Memory:
@@ -396,10 +399,13 @@ class Memory:
         content_hash = _content_hash(body, effective_scope, project_id)
         now = self._clock()
         with self.store.transaction():
-            existing = self.store.find_active_duplicate(content_hash)
+            existing = self.store.find_active_duplicate(content_hash, text=body)
             if existing is not None and not touch_existing:
                 return RememberResult("already_known", existing, None, None)
             if existing is not None:
+                promoted = kind == "rule" and source == "user" and existing.kind != "rule"
+                if promoted:
+                    self.store.promote_to_rule(existing.id, agent=self.agent, now=now)
                 stronger = max(existing.verification, verification, key=VERIFICATION_STRENGTH.__getitem__)
                 self.store.confirm(existing.id, verification=stronger, now=now)
                 have = {tag.casefold() for tag in existing.tags}
@@ -411,7 +417,8 @@ class Memory:
                 replaced, kept = self._to_replace(replaces, verification, keeping=existing.id)
                 if replaced is not None:
                     self.store.supersede(replaced.id, existing.id, now=now)
-                known = RememberResult("already_known", self.store.get(existing.id) or existing, replaced, kept)
+                known = RememberResult("promoted" if promoted else "already_known",
+                                       self.store.get(existing.id) or existing, replaced, kept)
                 # The journal notes the project the agent worked in, even for a global memory.
                 self.record_event(
                     "remember", body, outcome="updated" if replaced else "already known",
@@ -746,7 +753,7 @@ class Memory:
         before = record.project_name or record.project_id
         # The check and the move are one transaction, so two moves at once leave one copy.
         with self.store.transaction():
-            duplicate = self.store.find_active_duplicate(content_hash)
+            duplicate = self.store.find_active_duplicate(content_hash, text=record.text)
             if duplicate is not None:
                 raise MemoryInputError(f"Project {project.name} already has this memory as [{duplicate.id}]; "
                                        f"forget [{record.id}] instead.")
@@ -784,7 +791,7 @@ class Memory:
         with nullcontext() if dry_run else self.store.transaction():
             records = self.store.project_records(old_id)
             moves = [(record, _content_hash(record.text, "project", project.id)) for record in records]
-            twins = {record.id: self.store.find_active_duplicate(content_hash)
+            twins = {record.id: self.store.find_active_duplicate(content_hash, text=record.text)
                      for record, content_hash in moves if record.status == "active"}
             if not dry_run:
                 self.store.ensure_project(project, now)

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import ntpath
+import posixpath
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
@@ -31,12 +34,27 @@ _COMMAND_TOOLS = frozenset({"Bash", "PowerShell", "shell"})
 _FETCHES = re.compile(
     r"https?://|\b(?:curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm|Start-BitsTransfer)\b"
     r"|\bgh\s+api\b|\bgit\s+(?:show|log|diff|blame|cat-file)\b", re.IGNORECASE)
-# A command that prints files, and the rest of its part of the command line (its arguments). PowerShell's names
-# in any case; the Unix ones as they are typed, so ``git rev-parse HEAD`` is not ``head``.
-_PRINTS = re.compile(
-    r"(?:^|[\s;&|(`'\"])(?:(?i:type|Get-Content|gc)|cat|head|tail|less|more|bat|tac|nl|sed\s+-n)\s+([^|;&\n]*)")
-_ABSOLUTE = re.compile(r"^(?:/|~|\$HOME\b|\$env:|[A-Za-z]:[\\/]|\\\\)")
-_SED_SCRIPT = re.compile(r"[\d,$]+[pd]?")
+# A positive list of command shapes whose output describes system state. Unknown
+# commands, searches, pipelines and scripts remain unverified: absence from a
+# blacklist is never proof of provenance.
+_PRINTERS = frozenset({"cat", "type", "get-content", "gc", "head", "tail", "less", "more", "bat", "tac", "nl"})
+# Complete argv shapes: unknown arguments can echo literals, select authored
+# content or invoke a formatter. A command name alone is not a trust boundary.
+_STATUS_SHAPES = {
+    "uname": {(), ("-a",), ("-r",)}, "uptime": {()}, "hostname": {()},
+    "whoami": {()}, "id": {()}, "ls": {()}, "df": {(), ("-h",)},
+    "free": {(), ("-h",)}, "ss": {(), ("-lnt",), ("-lntp",)},
+    "get-service": {()}, "get-process": {()}, "get-computerinfo": {()},
+    "get-netipaddress": {()}, "get-date": {()},
+    "git": {("status",), ("status", "--short"), ("status", "--porcelain"),
+            ("rev-parse", "HEAD"), ("rev-parse", "--show-toplevel"),
+            ("rev-parse", "--is-inside-work-tree"), ("ls-files",)},
+    "docker": {("ps",), ("ps", "-a"), ("version",), ("info",)},
+    "podman": {("ps",), ("ps", "-a"), ("version",), ("info",)},
+    "ip": {("addr",), ("address",), ("route",), ("link",)},
+    "ubus": {("call", "system", "board")},
+}
+_VERSION_COMMANDS = frozenset({"python", "python3", "git", "docker", "podman", "node", "npm"})
 
 
 @dataclass
@@ -55,6 +73,7 @@ class Dossier:
     trusted_calls: list[tuple[str, str]] = field(default_factory=list)
     body_start: int = 0
     end_offset: int = 0  # log offset just past this dossier's last event, for resuming
+    end_event_index: int = 0  # when inside a record, number of its events already consumed
     known: list = field(default_factory=list)  # related existing memories shown to the model
     tool_inputs: list[str] = field(default_factory=list)  # commands, paths, and folders its tool calls used
     worked_elsewhere: bool = False  # filed under the project its work was in, not the session folder's
@@ -82,13 +101,14 @@ def build_dossiers(
     because a later stretch of a long session may hold only tool work.
     """
 
-    if len(session.events) < 2 or (require_user and not any(event.kind == "user" for event in session.events)):
+    if not session.events or (require_user and
+            (len(session.events) < 2 or not any(event.kind == "user" for event in session.events))):
         return []
     project = identify(session.cwd) if session.cwd else None
     header = _header(session, project)
     dossiers: list[Dossier] = []
     current = _new_dossier(session, project, header, 0)
-    for event in session.events:
+    for position, event in enumerate(session.events):
         entry, user_text, output = _render(event)
         if not entry:
             continue
@@ -96,7 +116,11 @@ def build_dossiers(
             dossiers.append(current)
             current = _new_dossier(session, project, header, len(dossiers))
         current.text += entry
-        current.end_offset = max(current.end_offset, event.end)
+        following = session.events[position + 1] if position + 1 < len(session.events) else None
+        if event.end and following is not None and following.end == event.end:
+            current.end_offset, current.end_event_index = event.start, event.index + 1
+        else:
+            current.end_offset, current.end_event_index = event.end, 0
         current.ended_at = event.at or current.ended_at
         if user_text:
             current.user_texts.append(user_text)
@@ -205,24 +229,66 @@ def _trusted_output(event: Event, folder: str | None = None) -> bool:
     command = event.text or ""
     if _reads_document(event) or _DOCUMENT_SEARCH.search(command) or _FETCHES.search(command):
         return False
-    return not _prints_a_project_file(command, event.cwd or folder)
+    return _trusted_command(command, event.cwd or folder)
 
 
-def _prints_a_project_file(command: str, folder: str | None) -> bool:
-    """Whether ``command`` prints a file by a relative path, or by a path inside ``folder``."""
+def _trusted_command(command: str, folder: str | None, *, remote: bool = False) -> bool:
+    if not command.strip() or re.search(r"[\n\r;&|()`$<>]", command):
+        return False  # compound commands and expansion need a shell parser, not a provenance guess
+    try:
+        parser = shlex.shlex(command, posix=True)
+        parser.whitespace_split, parser.escape, parser.commenters = True, "", ""
+        tokens = list(parser)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = tokens[0].casefold()
+    arguments = tokens[1:]
+    if name == "ssh" and not remote:
+        # Skip only options with known arity, then the destination. Quoted remote
+        # commands are parsed again; arbitrary wrappers and nested ssh are not trusted.
+        while arguments and arguments[0].startswith("-"):
+            option = arguments.pop(0)
+            if option == "-p" and arguments and arguments[0].isdigit():
+                arguments.pop(0)
+            elif option == "-l" and arguments and re.fullmatch(r"[A-Za-z0-9_.-]+", arguments[0]):
+                arguments.pop(0)
+            elif option not in {"-T", "-t", "-n", "-q"}:
+                return False
+        if len(arguments) < 2:
+            return False
+        rest = arguments[1:]
+        return _trusted_command(rest[0] if len(rest) == 1 else shlex.join(rest), folder, remote=True)
+    if name in _PRINTERS:
+        # Bare explicit paths only; flags have different arities in each printer.
+        return bool(arguments) and folder is not None and all(_external_file(value, folder) for value in arguments)
+    if name in _VERSION_COMMANDS and arguments == ["--version"]:
+        return True
+    if name in {"ping", "getent"}:
+        host = arguments[-1] if arguments else ""
+        prefix = tuple(arguments[:-1])
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", host)) and (
+            (name == "ping" and prefix in {("-c1",), ("-c", "1"), ("-n", "1")})
+            or (name == "getent" and prefix == ("hosts",)))
+    return tuple(arguments) in _STATUS_SHAPES.get(name, set())
 
-    inside = _comparable(folder) if folder else None
-    for match in _PRINTS.finditer(command):
-        for argument in match.group(1).split():
-            argument = argument.strip("'\"`()")
-            if (not argument or argument.startswith("-") or not re.search(r"[./\\]", argument)
-                    or _SED_SCRIPT.fullmatch(argument)):
-                continue  # options, line counts, and words such as a sed script's ``1,80p``
-            if not _ABSOLUTE.match(argument):
-                return True
-            if inside and (_comparable(argument) + "/").startswith(inside + "/"):
-                return True
-    return False
+
+def _external_file(path: str, folder: str) -> bool:
+    """An explicit absolute file outside the project, after resolving dot segments.
+
+    Variables, globbing and relative paths are ambiguous, including extensionless
+    names. Documents remain unverified even when read from outside the project.
+    """
+
+    if re.search(r"[*?\[\]~]", path) or path.casefold().endswith((".md", ".markdown", ".txt", ".rst", ".adoc")):
+        return False
+    windows = bool(re.match(r"^[A-Za-z]:[\\/]|^\\\\", path))
+    if not windows and not path.startswith("/"):
+        return False
+    normalize = ntpath.normpath if windows else posixpath.normpath
+    file, inside = _comparable(normalize(path)), _comparable(normalize(folder))
+    return file != inside and not (file + "/").startswith(inside + "/")
 
 
 def _comparable(path: str) -> str:

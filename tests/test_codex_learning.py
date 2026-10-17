@@ -123,7 +123,7 @@ class CodexReaderTests(CodexTestCase):
         [dossier] = build_dossiers(session)
         for evidence, source in (
             ("DISTRIB_RELEASE='23.05.3'", "observed"),  # a command the agent ran
-            ("(exit code 1) cannot find path", "observed"),
+            ("(exit code 1) cannot find path", "inferred"),  # a relative project-file read
             ("dnsmasq manual", "inferred"),  # an MCP tool's answer
             ("Deploy with make ship from jump01.", "inferred"),  # a document the agent read
         ):

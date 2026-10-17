@@ -17,17 +17,52 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
+from datetime import datetime
 from typing import Any, Iterable, Sequence
 
 from . import journal
+from .question_schema import check_question
 from .store import APPLYING_KEY, SYNCED_TABLES, TRACK_KEY, Store, SyncedTable
 
 MAX_TEXT = 20_000
 CURSOR_KEY = "sync.cursor"
 SOURCE_KEY = "sync.source"
 EPOCH_KEY = "sync.server_epoch"
+
+# The wire contract follows the fields' readers, not SQLite's permissive types.
+# It applies to both directions; omitted columns still support older peers.
+_NULLABLE = {
+    "projects": {"remote"},
+    "systems": {"profiled"},
+    "records": {"project_id", "source_agent", "source_session", "confirmed_at", "superseded_by",
+                "retired_reason", "last_used_at", "source_computer"},
+    "record_notes": {"system_id"},
+    "questions": {"answered_at", "answer"},
+    "question_stages": {"plain", "reason"},
+    "agent_tasks": {"question_id", "system_id", "project_id", "facet", "result"},
+}
+_INTEGERS = {("records", "recall_count"), ("agent_tasks", "offered"), ("reviews", "failures")}
+
+
+def _check_json(table: str, column: str, value: str) -> None:
+    try:
+        decoded = json.loads(value)
+    except (ValueError, RecursionError):
+        raise SyncError(f"{table}.{column} must hold JSON text") from None
+    if (table, column) == ("question_stages", "labels"):
+        valid = isinstance(decoded, dict) and all(isinstance(label, str) for label in decoded.values())
+    elif (table, column) == ("questions", "options"):
+        valid = isinstance(decoded, list) and all(
+            isinstance(option, dict) and isinstance(option.get("key"), str)
+            and isinstance(option.get("label"), str) for option in decoded
+        )
+    else:
+        valid = isinstance(decoded, list) and all(isinstance(item, str) for item in decoded)
+    if not valid:
+        raise SyncError(f"{table}.{column} has the wrong JSON structure")
 
 
 class SyncError(ValueError):
@@ -61,6 +96,11 @@ def read_row(connection: sqlite3.Connection, table: SyncedTable, key: str) -> di
 def write_row(connection: sqlite3.Connection, table: SyncedTable, row: dict[str, Any]) -> None:
     """Insert a row, or update the columns it carries; columns it leaves out keep their value."""
 
+    # SQLite checks INSERT's required fields before reaching ON CONFLICT.
+    # Merge first so valid partial updates work even for required columns.
+    row = {**(read_row(connection, table, row[table.key]) or {}), **row}
+    if table.name == "questions":
+        _check_question_row(row)
     columns = list(row)
     updates = [column for column in columns if column != table.key]
     conflict = (
@@ -83,7 +123,7 @@ def check_key(key: object) -> str:
     return key
 
 
-def check_row(table: SyncedTable, key: str, row: object) -> dict[str, Any]:
+def check_row(table: SyncedTable, key: str, row: object, *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
     """A cleaned copy of a row sent for ``table``, or :class:`SyncError` saying what is wrong."""
 
     if not isinstance(row, dict):
@@ -95,17 +135,42 @@ def check_row(table: SyncedTable, key: str, row: object) -> dict[str, Any]:
         raise SyncError(f"the row's {table.key} does not match the change's key")
     cleaned = {table.key: key}
     for column, value in row.items():
-        if value is not None and (isinstance(value, bool) or not isinstance(value, (str, int, float))):
-            raise SyncError(f"{table.name}.{column} must be text, a number, or empty")
+        field = f"{table.name}.{column}"
+        if value is None:
+            if column not in _NULLABLE.get(table.name, set()):
+                raise SyncError(f"{field} may not be empty")
+            cleaned[column] = None
+            continue
+        if (table.name, column) in _INTEGERS:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise SyncError(f"{field} must be a nonnegative whole number")
+        elif not isinstance(value, str):
+            raise SyncError(f"{field} must be text")
         if isinstance(value, str) and len(value) > MAX_TEXT:
-            raise SyncError(f"{table.name}.{column} is longer than {MAX_TEXT} characters")
-        if column in table.json_columns and value is not None:
+            raise SyncError(f"{field} is longer than {MAX_TEXT} characters")
+        if column in table.json_columns:
+            _check_json(table.name, column, value)
+        if column.endswith("_at"):
             try:
-                json.loads(value)
-            except (TypeError, ValueError):
-                raise SyncError(f"{table.name}.{column} must hold JSON text") from None
+                if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value):
+                    raise ValueError("noncanonical time")
+                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                raise SyncError(f"{field} must be a UTC time in YYYY-MM-DDTHH:MM:SSZ form") from None
         cleaned[column] = value
+    if table.name == "questions":
+        _check_question_row({**(existing or {}), **cleaned})
     return cleaned
+
+
+def _check_question_row(row: dict[str, Any]) -> None:
+    if "kind" not in row:
+        return  # a partial update is checked against the stored kind by write_row
+    try:
+        fields = {column: json.loads(row[column]) for column in ("record_ids", "options") if column in row}
+        check_question(row["kind"], **fields)
+    except ValueError as exc:
+        raise SyncError(str(exc)) from None
 
 
 def stamp(table: SyncedTable, row: dict[str, Any]) -> str | None:
@@ -205,7 +270,7 @@ def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int
                 row = item.get("row")
                 if isinstance(row, dict):
                     row = {name: value for name, value in row.items() if name in table.columns}
-                row = check_row(table, key, row)
+                row = check_row(table, key, row, existing=current)
                 write_row(connection, table, row)
                 if current is None or any(current.get(column) != value for column, value in row.items()
                                           if column not in _USE_COUNTS):
@@ -241,6 +306,23 @@ def without_parents(store: Store, changes: Sequence[dict[str, Any]]) -> list[dic
     would break the link, and the whole page with it.
     """
 
+    # Validate before dependency inspection too: malformed foreign keys must not
+    # reach hashing or SQLite parameter binding before check_row sees them.
+    recognized = []
+    for item in changes:
+        if not isinstance(item, dict):
+            raise SyncError("each fetched change must be an object")
+        table = SYNCED_TABLES.get(item.get("table")) if isinstance(item.get("table"), str) else None
+        if table is None:
+            continue
+        key = check_key(item.get("key"))
+        if item.get("op") != "delete":
+            row = item.get("row")
+            if isinstance(row, dict):
+                row = {column: value for column, value in row.items() if column in table.columns}
+            check_row(table, key, row)
+        recognized.append(item)
+    changes = recognized
     connection = store.connection
     links: dict[str, list[tuple[str, SyncedTable, str]]] = {}
     held: list[dict[str, Any]] = []

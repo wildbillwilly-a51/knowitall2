@@ -249,8 +249,10 @@ class ConnectingTests(TwoComputers):
             record_id = self.remember(store, "The build server is build-1.")
             remote = OlderServer(self.address, key=connected.load().key_for(None)[1], agent="codex")
             self.assertEqual(connected.sync_now(store, remote=remote).sent, 1)
-            self.assertIsNone(store.connection.execute("SELECT seq FROM sync_seen WHERE key = ?",
-                                                       (record_id,)).fetchone())
+            # The post-push pull supplies the change number even when an older
+            # server's push acknowledgement does not include it.
+            self.assertIsNotNone(store.connection.execute("SELECT seq FROM sync_seen WHERE key = ?",
+                                                          (record_id,)).fetchone())
             self.assertFalse(sync.has_pending(store))
         self.assertEqual(self.on_server(record_id), "active")
 
@@ -350,6 +352,29 @@ class SyncingTests(TwoComputers):
         super().setUp()
         self.connect("a")
         self.connect("b", upload=False)
+
+    def test_an_offline_duplicate_promotion_is_visible_when_the_sync_returns(self) -> None:
+        text = "Require explicit approval before deploying production changes."
+        with self.on("a") as store:
+            canonical = Memory(store, agent="codex", clock=Clock()).remember(
+                text, kind="note", detect_project=False).record.id
+        with self.on("b") as store:
+            memory = Memory(store, agent="codex", clock=Clock())
+            alias = memory.remember(text, kind="note", detect_project=False).record.id
+            memory.remember(text, kind="rule", source="user", detect_project=False)
+        self.sync("a")
+        report = self.sync("b")
+        self.assertIsNone(report.problem)
+        with self.on("b") as store:
+            self.assertEqual(("rule", "user_stated", "active"),
+                             (store.get(canonical).kind, store.get(canonical).verification, store.get(canonical).status))
+            self.assertEqual("superseded", store.get(alias).status)
+            self.assertIn(canonical, Memory(store, agent="codex").briefing(project_path=self.plain))
+            self.assertFalse(sync.has_pending(store))
+        self.sync("a")
+        with self.on("a") as store:
+            self.assertEqual("rule", store.get(canonical).kind)
+            self.assertEqual("superseded", store.get(alias).status)
 
     def test_a_memory_saved_on_one_computer_reaches_the_other(self) -> None:
         with self.on("a") as store:

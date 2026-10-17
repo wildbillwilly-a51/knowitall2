@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .dossier import build_dossiers
-from .learner import LEARN_TO, RESUME_AT, SETTLED
+from .learner import LEARN_TO, RESUME_AT, RESUME_EVENT_INDEX, SETTLED, SETTLED_EVENT_INDEX
 from .settle import PART_CHARACTERS, needed_calls
 from .state import LearnerState, learner_lock
 from .transcripts import read_session, session_folder, session_logs
@@ -133,11 +133,12 @@ def catch_up(folder: str, *, since: str | None = None, max_calls: int | None = N
                 calls += needed
             entry = state.entry(log)
             resume, bound = int(entry.get("offset") or 0), int(entry.get(SET_ASIDE_TO) or 0)
-            entry.update({"offset": 0, SETTLED: 0, "status": "new", "failures": 0, "updated_at": moment,
+            resume_index = int(entry.get("event_index") or 0)
+            entry.update({"offset": 0, "event_index": 0, SETTLED: 0, SETTLED_EVENT_INDEX: 0, "status": "new", "failures": 0, "updated_at": moment,
                           "caught_up_at": moment})
             if bound and resume > bound:
                 # Learning went on past the set-aside part: read only that part, then carry on from there.
-                entry.update({LEARN_TO: bound, RESUME_AT: resume})
+                entry.update({LEARN_TO: bound, RESUME_AT: resume, RESUME_EVENT_INDEX: resume_index})
             marked += 1
         state.save()
     return marked

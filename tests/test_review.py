@@ -275,8 +275,8 @@ class ConcurrentWriteTests(unittest.TestCase):
         waited = []
         check = self.first.find_active_duplicate
 
-        def the_other_moves_meanwhile(content_hash: str):
-            found = check(content_hash)
+        def the_other_moves_meanwhile(content_hash: str, **options):
+            found = check(content_hash, **options)
             try:
                 self.other.move(theirs.id, beta)
             except sqlite3.OperationalError:
