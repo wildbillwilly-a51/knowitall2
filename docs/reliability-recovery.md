@@ -22,6 +22,12 @@ or advances the settled cursor. Malformed or incomplete final decisions fail
 closed. Stale promotion excludes sessions that still have pending reviews.
 An explicit choice to disable learning retains its existing accept-as-is policy.
 
+Final-pass duplicates, sibling repeats, and maintenance use conservative detail
+preservation checks. A proposed replacement must retain every significant source
+word and technical token; otherwise the original remains. Explicit corrections
+are distinguished from duplicates. Incomplete decisions name their record IDs
+and remain pending; an unexplained retirement cannot complete a review.
+
 Call budgets retain the complete active window, regardless of call volume.
 Call timestamps describe individual completion, not the learning run's start.
 Learning and user call histories retain seven days; journal reports retain their

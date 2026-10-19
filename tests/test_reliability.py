@@ -59,6 +59,217 @@ class IntegrityTests(unittest.TestCase):
             self.assertEqual("quota", error.category)
             self.assertIsNotNone(error.retry_at)
 
+    def repeat_case(self, original, target, *, first_pass=False, reason="repeat"):
+        t = self.learning()
+        (fixtures.LogBuilder(t.project).user("Inspect the backup procedure.")
+         .assistant(fixtures.text(original)).write(t.log_path, idle=False))
+        known = t.memory.remember(target, kind="procedure", subjects=["backup"], source="observed").record
+        candidate = {"text": original, "kind": "procedure", "subjects": ["backup"], "scope": "global",
+                     "project": "", "evidence": original, "relation": "new", "known_id": ""}
+        t.learn(fixtures.FakeEngine([[candidate]]), quick=True)
+        [record] = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        decision = fixtures.review("p1", "retire", retire_reason=reason, repeat_of=known.id) if first_pass else fixtures.review("p1", "confirm")
+        check = {"decisions": [{"index": 0, "action": "repeat", "known_id": known.id, "text": "", "reason": "same topic"}]}
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [decision], "memories": []}], checks=[] if first_pass else [check]))
+        self.assertEqual([], report.failed)
+        self.assertEqual("active", t.store.get(record.id).status)
+        self.assertEqual(original, t.store.get(record.id).text)
+        self.assertEqual([], t.provisional())
+        self.assertEqual("active", t.store.get(known.id).status)
+
+    def test_final_repeat_cannot_discard_a_backup_safety_step(self):
+        original = "SQLite production backups run online using mode=ro and integrity_check before deployment."
+        target = "SQLite production backups run online before deployment."
+        for first_pass in (False, True):
+            with self.subTest(first_pass=first_pass):
+                self.repeat_case(original, target, first_pass=first_pass)
+
+    def test_same_topic_is_not_a_duplicate_of_technical_details(self):
+        from knowitall2.learning.maintenance import keeps_everything
+        base = "The database backup procedure runs online before each production deployment and preserves the current store"
+        for detail in ("mode=ro", "integrity_check", "--verify", "backup()", "snapshot.copy()", "`PRAGMA quick_check`", "port 5353", "/srv/snapshots", "never delete originals"):
+            with self.subTest(detail=detail):
+                self.assertFalse(keeps_everything([base + " with " + detail + "."], base + "."))
+
+    def test_self_or_missing_repeat_targets_never_retire_the_only_copy(self):
+        for target in ("p1", "k-missing"):
+            t = self.learning()
+            t.sample_log().write(t.log_path, idle=False)
+            t.learn(fixtures.FakeEngine([[t.DNSMASQ]]), quick=True)
+            [record] = t.provisional()
+            fixtures.quiet_longer(t.log_path)
+            report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [fixtures.review("p1", "retire", retire_reason="repeat", repeat_of=target)], "memories": []}]))
+            self.assertEqual([], report.failed)
+            self.assertEqual("active", t.store.get(record.id).status)
+            self.assertEqual([], t.provisional())
+
+    def test_a_repeat_of_a_retired_sibling_cannot_lose_its_extra_path(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        t.learn(fixtures.FakeEngine([[t.ROUTER, t.DNSMASQ]]), quick=True)
+        first, second = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        t.learn(fixtures.FakeEngine(finals=[{"reviews": [fixtures.review("p1", "retire", retire_reason="overturned"), fixtures.review("p2", "retire", retire_reason="repeat", repeat_of="p1")], "memories": []}]))
+        self.assertEqual("retired", t.store.get(first.id).status)
+        self.assertEqual("active", t.store.get(second.id).status)
+
+    def test_a_new_candidate_cannot_be_dropped_as_a_partial_earlier_repeat(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        fixtures.quiet_longer(t.log_path)
+        repeat = {**t.DNSMASQ, "relation": "repeats", "known_id": "c0"}
+        engine = fixtures.FakeEngine(finals=[{"reviews": [], "memories": [t.ROUTER, repeat]}], checks=[{"decisions": [
+            {"index": 0, "action": "new", "known_id": "", "text": "", "reason": ""},
+            {"index": 1, "action": "repeat", "known_id": "c0", "text": "", "reason": "same router"}]}])
+        report = t.learn(engine)
+        self.assertEqual([], report.failed)
+        self.assertEqual(2, t.store.count_active(project_id=None, scope="all"))
+
+    def test_duplicate_retirement_cannot_drop_an_ordinary_safety_qualifier(self):
+        self.repeat_case("The database backup procedure creates encrypted nightly copies and verifies the stored snapshot before deployment.",
+                         "The database backup procedure creates nightly copies and verifies the stored snapshot before deployment.")
+
+    def test_an_empty_retirement_reason_cannot_bypass_duplicate_preservation(self):
+        self.repeat_case("SQLite backups use mode=ro and integrity_check before deployment.",
+                         "SQLite backups run before deployment.", first_pass=True, reason="")
+
+    def test_an_unexplained_retirement_keeps_the_review_pending(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        t.learn(fixtures.FakeEngine([[t.DNSMASQ]]), quick=True)
+        [record] = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [fixtures.review("p1", "retire")], "memories": []}]))
+        self.assertTrue(report.failed)
+        self.assertEqual(record.id, t.provisional()[0].id)
+        self.assertEqual(0, t.state.entry(t.log_path)["settled"])
+
+    def test_explicit_overturned_retirement_does_not_create_a_duplicate_link(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        known = t.memory.remember("The homelab router runs OpenWrt.", subjects=["router"]).record
+        t.learn(fixtures.FakeEngine([[t.DNSMASQ]]), quick=True)
+        [record] = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [fixtures.review("p1", "retire", retire_reason="overturned", repeat_of=known.id)], "memories": []}]))
+        self.assertEqual([], report.failed)
+        self.assertEqual("retired", t.store.get(record.id).status)
+        self.assertIsNone(t.store.get(record.id).superseded_by)
+
+    def test_reconciliation_new_overrides_an_extraction_repeat_label(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        fixtures.quiet_longer(t.log_path)
+        candidate = {**t.ROUTER, "relation": "repeats", "known_id": "k-missing"}
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [], "memories": [candidate]}]))
+        self.assertEqual([], report.failed)
+        self.assertEqual(1, t.store.count_active(project_id=None, scope="all"))
+
+    def test_a_merge_cannot_omit_a_new_candidates_backup_safety_step(self):
+        t = self.learning()
+        original = "SQLite production backups run online using mode=ro and integrity_check before deployment."
+        partial = "SQLite production backups run online before deployment."
+        (fixtures.LogBuilder(t.project).user("Inspect the database backup procedure.")
+         .assistant(fixtures.text(original)).write(t.log_path, idle=False))
+        known = t.memory.remember(partial, kind="procedure", subjects=["backup"], source="observed").record
+        candidate = {"text": original, "kind": "procedure", "subjects": ["backup"], "scope": "global", "project": "",
+                     "evidence": original, "relation": "new", "known_id": ""}
+        fixtures.quiet_longer(t.log_path)
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [], "memories": [candidate]}], checks=[{"decisions": [
+            {"index": 0, "action": "update", "known_id": known.id, "text": partial, "reason": "merge"}]}]))
+        self.assertEqual([], report.failed)
+        self.assertEqual("active", t.store.get(known.id).status)
+        self.assertTrue(any(row.text==original for row in t.store.list_active(project_id=None, scope="all", limit=20)))
+
+    def test_a_correction_can_repeat_a_known_fact_without_reconfirming_the_wrong_original(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        known = t.memory.remember(t.DNSMASQ["text"], kind="lesson", subjects=["router", "dnsmasq"], source="observed").record
+        wrong = {**t.DNSMASQ, "text": "On the homelab router, dnsmasq never needs a restart after editing /etc/config/dhcp."}
+        t.learn(fixtures.FakeEngine([[wrong]]), quick=True)
+        [record] = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        correction = fixtures.review("p1", "correct", text=t.DNSMASQ["text"], kind="lesson", scope="global", subjects=["router", "dnsmasq"], evidence=t.DNSMASQ["evidence"])
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [correction], "memories": []}], checks=[{"decisions": [
+            {"index": 0, "action": "repeat", "known_id": known.id, "text": "", "reason": "corrected fact"}]}]))
+        self.assertEqual([], report.failed)
+        self.assertEqual("superseded", t.store.get(record.id).status)
+        self.assertEqual(known.id, t.store.get(record.id).superseded_by)
+
+    def test_upkeep_cannot_undo_the_final_pass_safety_qualifier(self):
+        from knowitall2.learning.maintenance import may_merge, keeps_everything
+        t = self.learning()
+        original = t.memory.remember("The database backup procedure creates encrypted nightly copies and verifies the stored snapshot before deployment.", source="observed").record
+        partial = t.memory.remember("The database backup procedure creates nightly copies and verifies the stored snapshot before deployment.", source="observed").record
+        self.assertFalse(may_merge(original, partial))
+        self.assertFalse(keeps_everything([original.text], partial.text))
+
+    def test_a_later_invalid_repeat_never_confirms_an_original_already_found_wrong(self):
+        t = self.learning()
+        builder = t.sample_log()
+        for _ in range(8):
+            builder.assistant(fixtures.text("Additional unrelated output. " + "x " * 800))
+        builder.write(t.log_path, idle=False)
+        wrong = {**t.DNSMASQ, "text": "On the homelab router, dnsmasq never needs a restart after editing /etc/config/dhcp."}
+        t.learn(fixtures.FakeEngine([[wrong]]), quick=True)
+        [record] = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        class Engine(fixtures.FakeEngine):
+            def run(self, text, *, schema, system_prompt):
+                self.inputs.append(("final", text))
+                if "review so far: pending" in text:
+                    answer = fixtures.review("p1", "correct", text=t.DNSMASQ["text"], kind="lesson", scope="global", evidence=t.DNSMASQ["evidence"])
+                elif "review so far: corrected" in text:
+                    answer = fixtures.review("p1", "retire", retire_reason="repeat", repeat_of="k-missing")
+                else:
+                    return {"reviews": [], "memories": []}
+                return {"reviews": [answer], "memories": []}
+        engine = Engine()
+        with mock.patch("knowitall2.learning.settle.PART_CHARACTERS", 4000):
+            report = t.learn(engine)
+        self.assertGreater(len(engine.inputs), 1)
+        self.assertTrue(report.failed)
+        self.assertEqual(record.id, t.provisional()[0].id)
+        self.assertEqual(0, t.state.entry(t.log_path)["settled"])
+
+    def test_reconciliation_cannot_replace_an_observation_by_a_weaker_duplicate(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        known = t.memory.remember("OpenWrt 23.05.3 runs on the homelab router.", subjects=["router"]).record
+        t.learn(fixtures.FakeEngine([[t.ROUTER]]), quick=True)
+        [record] = t.provisional()
+        self.assertEqual("observed", record.verification)
+        fixtures.quiet_longer(t.log_path)
+        t.learn(fixtures.FakeEngine(finals=[{"reviews": [fixtures.review("p1", "confirm")], "memories": []}], checks=[{"decisions": [
+            {"index": 0, "action": "repeat", "known_id": known.id, "text": "", "reason": "same"}]}]))
+        self.assertEqual("active", t.store.get(record.id).status)
+        self.assertEqual("observed", t.store.get(record.id).verification)
+
+    def test_a_new_memory_survives_an_incomplete_known_repeat(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        known = t.memory.remember("The homelab router runs OpenWrt.", subjects=["router"]).record
+        fixtures.quiet_longer(t.log_path)
+        candidate = {**t.ROUTER, "relation": "repeats", "known_id": known.id}
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [], "memories": [candidate]}], checks=[{"decisions": [
+            {"index": 0, "action": "repeat", "known_id": known.id, "text": "", "reason": "same router"}]}]))
+        self.assertEqual([], report.failed)
+        self.assertEqual(2, t.store.count_active(project_id=None, scope="all"))
+
+    def test_an_incomplete_review_names_the_undecided_record(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        t.learn(fixtures.FakeEngine([[t.DNSMASQ]]), quick=True)
+        [record] = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        engine = fixtures.FakeEngine(finals=[{"reviews": [fixtures.review("p1", "not_here")], "memories": []}])
+        report = t.learn(engine)
+        self.assertTrue(report.failed)
+        self.assertIn(record.id, t.state.entry(t.log_path)["last_error"])
+        self.assertIn("deferred", t.state.entry(t.log_path)["last_error"])
+        self.assertIn("original evidence (session data)", engine.inputs[0][1])
+
     def test_structured_quota_does_not_need_english_words(self):
         payload = {"type": "error", "error": {"type": "rate_limit_error", "message": "indisponible",
                                                "retry_after": 3600}}

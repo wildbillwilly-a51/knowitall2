@@ -1658,14 +1658,14 @@ class TwoPassTests(LearningTestCase):
                                                       "text": merged, "reason": ""}]}]))
         return self.store.get(known.id), self.store.get(lesson.id)
 
-    def test_a_merge_takes_the_known_memorys_place_and_label_when_a_command_shows_what_it_says(self) -> None:
+    def test_an_observed_merge_keeps_the_original_when_it_omits_its_path(self) -> None:
         self.sample_log().write(self.log_path, idle=False)
         merged = ("On the homelab router at 10.20.30.1 (OpenWrt 23.05.3), dnsmasq serves DNS for the lab and needs "
                   "a restart after DHCP edits.")
         known, lesson = self.merge_into("On the homelab router, dnsmasq serves DNS for the lab.", merged)
-        holder = self.store.get(known.superseded_by)
-        self.assertEqual((merged, "observed"), (holder.text, holder.verification))
-        self.assertEqual("superseded", lesson.status)
+        self.assertEqual("active", known.status)
+        self.assertEqual("observed", known.verification)
+        self.assertEqual("active", lesson.status)
         self.assertEqual([], self.store.open_questions(limit=5))
 
     def unearned_merge(self, source: str) -> None:
@@ -1704,7 +1704,7 @@ class TwoPassTests(LearningTestCase):
 
     def test_a_repeat_the_check_finds_is_folded_into_the_known_memory(self) -> None:
         self.sample_log().write(self.log_path, idle=False)
-        known = self.memory.remember("OpenWrt 23.05.3 runs on the homelab router.", subjects=["router"]).record
+        known = self.memory.remember("OpenWrt 23.05.3 runs on the homelab router.", subjects=["router"], source="observed").record
         self.learn(FakeEngine([[self.ROUTER]]), quick=True)
         [router] = self.provisional()
         quiet_longer(self.log_path)

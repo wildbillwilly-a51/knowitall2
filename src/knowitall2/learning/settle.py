@@ -25,7 +25,7 @@ from typing import Any
 
 from .. import journal
 from ..commands import RULE_TAG
-from ..memory import PREFERENCE_TAG, PROVISIONAL_TAG, Memory, significant_words
+from ..memory import PREFERENCE_TAG, PROVISIONAL_TAG, VERIFICATION_STRENGTH, Memory, significant_words
 from ..quotes import nearly_quoted_in, quoted_in, short_quote_in
 from ..store import RecordRow
 from .dossier import Dossier, _render
@@ -56,6 +56,8 @@ class _Item:
     part: int | None = None           # where a correction or an addition was made
     reason: str = ""
     repeat_of: str = ""
+    shown: set[str] = field(default_factory=set)
+    corrected: bool = False
 
 
 @dataclass
@@ -138,10 +140,12 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         _review(items, reviews, number)
         for candidate in [item for item in memories if isinstance(item, dict)][:FINAL_CANDIDATES]:
             items.append(_Item(f"n{len(items) + 1}", candidate, status="added", part=number))
-    for item in items:
-        if reviewing and (item.status == "pending" or
-                (item.status == "deferred" and _in_parts(item.candidate, parts))):
-            raise ExtractionError("the final pass left a memory unreviewed; its range remains pending", counted=True)
+    undecided = [item for item in items if reviewing and (item.status == "pending" or
+                 (item.status == "deferred" and _in_parts(item.candidate, parts)))]
+    if undecided:
+        keys = ", ".join(f"{item.key} ({item.record.id if item.record else 'new'}, {item.status})"
+                         for item in undecided[:10])
+        raise ExtractionError(f"the final pass left memories unreviewed: {keys}; its range remains pending", counted=True)
     kept = [item for item in items if item.status in ("confirmed", "corrected", "added")]
     decisions: dict[int, dict[str, Any]] = {}
     shown: dict[int, list[RecordRow]] = {}
@@ -203,16 +207,25 @@ def _final_input(memory: Memory, items: list[_Item], part: Dossier, number: int,
         if place == "project" and candidate.get("project"):
             place += f" {candidate['project']}"
         lines.append(f"- [{item.key}] {candidate.get('kind')} ({place}): {_line(candidate.get('text'))}")
+        lines.append(f"    review so far: {item.status}")
+        if candidate.get("evidence"):
+            lines.append(f"    original evidence (session data): {_line(candidate['evidence'])[:1000]}")
         for _share, row in memory.nearest(_about(candidate), project_id=None, scope="everywhere",
                                           limit=NEAR_PER_PROVISIONAL, exclude=mine):
+            item.shown.add(row.id)
             lines.append(f"    nearest existing [{row.id}] {row.kind} ({_where(row)}): "
                          f"{_line(row.text)[:NEAR_ITEM_CHARACTERS]}")
+        item.shown.update(row.id for row in part.known)
     body = render_input(part).replace("Session excerpt:\n", f"Session, part {number + 1} of {total}:\n", 1)
     if not part.known:
         body = f"Session, part {number + 1} of {total}:\n" + body
     last = number == total - 1 and not partial   # a slice's last part is not the end (D-M3)
     tail = ("\n\nThis part is the end of the stretch." if last else
             "\n\nHow the stretch ended (its closing messages):\n" + ending)
+    if last:
+        waiting = ", ".join(item.key for item in living if item.status in ("pending", "deferred"))
+        tail += (f"\nStill undecided before this part: {waiting or 'none'}. Review these explicitly. "
+                 "A not_here decision leaves an in-range memory pending; it does not complete its review.")
     return "\n".join(lines) + "\n\n" + body + tail
 
 
@@ -228,9 +241,12 @@ def _review(items: list[_Item], reviews: list[Any], number: int) -> None:
         if action == "retire" and not _lasting_lesson(item, review):
             item.status, item.reason = "retired", str(review.get("retire_reason") or "")
             item.repeat_of = str(review.get("repeat_of") or "").strip().strip("[]")
+            if item.repeat_of and not item.reason:
+                item.reason = "repeat"
         elif action == "correct":
             item.candidate = _corrected(item.candidate, review)
             item.status, item.part = "corrected", number
+            item.corrected = True
         elif action in ("confirm", "retire"):
             if item.status != "corrected":
                 item.status = "confirmed"
@@ -313,54 +329,80 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
         report.outcomes[outcome] += 1
         report.results.append({"outcome": outcome, "ids": ids, "text": result_text(outcome, item.candidate)})
 
+    def retire(item: _Item) -> bool:
+        changed = _retire(memory, item, run)
+        note("retired" if changed else "kept (repeat would lose details)", item, [item.record.id])
+        return changed
+
     siblings = {item.key: item for item in items if item.record is not None}
     repeats: list[tuple[_Item, _Item]] = []   # repeats of another provisional memory, decided after it is
     for item in items:
         if item.status == "retired" and item.record is not None:
             sibling = siblings.get(item.repeat_of)
-            if sibling is not None and sibling is not item:
+            if item.reason == "repeat" and sibling is not None and sibling is not item:
                 repeats.append((item, sibling))
                 continue
-            _retire(memory, item, run)
-            note("retired", item, [item.record.id])
+            retire(item)
     for index, item in enumerate(kept):
         decision = decisions.get(index) or {"action": "new"}
         action = decision.get("action")
+        denied_repeat = False
         earlier = _earlier_candidate(decision, index)
         if action == "repeat" and earlier is not None:
             target = _standing(memory, standing.get(earlier))
-            if target is not None:
+            row = memory.store.get(target) if target else None
+            if row is not None and _repeat_preserves(item.candidate, row, _dedup_record(item)):
                 if item.record is not None and target != item.record.id:
                     item.reason, item.repeat_of = "repeat", target
-                    _retire(memory, item, run)
-                    note("retired", item, [item.record.id])
+                    item.shown.add(target)
+                    changed = retire(item)
+                    if not changed:
+                        standing[index] = item.record.id
+                        continue
                 elif item.record is None:
                     note("rejected (repeat)", item, [])
+                else:
+                    _confirm(memory, item.record)
+                    note("confirmed", item, [item.record.id])
                 standing[index] = target
                 continue
             # What it repeats did not stand: it is decided on its own (second candidate review, D-M5).
             decision, action = {"action": "new"}, "new"
+            denied_repeat = True
         if action in ("repeat", "drop"):
             known = _shown(shown, index, decision)
-            if item.record is not None:
-                item.reason = "repeat" if action == "repeat" else "not lasting"
-                item.repeat_of = known.id if known is not None else ""
-                _retire(memory, item, run)
-                note("retired", item, [item.record.id])
+            if action == "repeat" and not _repeat_preserves(item.candidate, known, _dedup_record(item)):
+                # An incomplete duplicate is ordinary knowledge, not permission to discard its details.
+                decision, action = {"action": "new"}, "new"
+                denied_repeat = True
             else:
-                note(f"rejected ({'repeat' if action == 'repeat' else 'not lasting'})", item, [])
-            standing[index] = known.id if action == "repeat" and known is not None else None
-            continue
+                if item.record is not None:
+                    item.reason = "repeat" if action == "repeat" else "not lasting"
+                    item.repeat_of = known.id if known is not None else ""
+                    if known is not None:
+                        item.shown.add(known.id)
+                    changed = retire(item)
+                    standing[index] = (known.id if known is not None else None) if changed else item.record.id
+                else:
+                    note(f"rejected ({'repeat' if action == 'repeat' else 'not lasting'})", item, [])
+                    standing[index] = known.id if action == "repeat" and known is not None else None
+                continue
         candidate = dict(item.candidate)
+        if denied_repeat or (item.record is None and index in decisions):
+            candidate.update(relation="new", known_id="")
         dossier = _dossier_for(candidate, item, parts)
         merge = False
         if action == "update":
+            from .maintenance import keeps_everything
+
             known = _shown(shown, index, decision)
+            merged_text = str(decision.get("text") or "").strip() or candidate.get("text")
             # A tool rule is rewritten only from its lessons (``tool_rules``), never replaced by one more of them.
-            if known is not None and RULE_TAG not in known.tags:
+            if (known is not None and RULE_TAG not in known.tags and
+                    keeps_everything([str(candidate.get("text") or "")], str(merged_text))):
                 dossier = dataclasses.replace(dossier, known=[*dossier.known, known])
                 candidate.update(relation="updates", known_id=known.id, own_text=candidate.get("text"),
-                                 text=str(decision.get("text") or "").strip() or candidate.get("text"))
+                                 text=merged_text)
                 merge = True
         preference = item.record is not None and PREFERENCE_TAG in item.record.tags and not merge
         if preference:
@@ -392,8 +434,7 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
             # The final pass found something wrong with it, and its correction did not pass the checks: neither
             # is kept, as in the tested design (the 2026-10-13 replay of the built code).
             item.reason = "wrong"
-            _retire(memory, item, run)
-            note("retired", item, [item.record.id])
+            retire(item)
             standing[index] = None
         elif not ids or outcome.startswith("rejected") or ids[0] == item.record.id:
             # A preference checked again and turned down for a reason of the checks' own stands as it was.
@@ -401,6 +442,13 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
             note("confirmed", item, [item.record.id])
             standing[index] = item.record.id
         else:
+            target = memory.store.get(ids[0])
+            if item.status == "confirmed" and not _repeat_preserves(
+                    {"text": item.record.text}, target, item.record):
+                _confirm(memory, item.record)
+                note("kept (repeat would lose details)", item, [item.record.id])
+                standing[index] = item.record.id
+                continue
             memory.store.supersede(item.record.id, ids[0], now=memory.now(),
                                    reason=f"the final pass corrected it as [{ids[0]}]")
             note("corrected" if outcome in ("saved", "saved with a question") else outcome, item, ids)
@@ -416,9 +464,16 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
             continue
         item.repeat_of = target or ""
         if target is None:
+            source = _dedup_record(item)
+            if not _repeat_preserves({"text": source.text}, _dedup_record(sibling), source,
+                                     require_active=False):
+                _confirm(memory, item.record)
+                note("kept (repeat would lose details)", item, [item.record.id])
+                continue
             item.reason = sibling.reason or "repeat"
-        _retire(memory, item, run)
-        note("retired", item, [item.record.id])
+        else:
+            item.shown.add(target)
+        retire(item)
     if shown:
         # What was checked against its nearest memories needs no maintenance review until it changes.
         from .maintenance import mark_reviewed
@@ -466,20 +521,55 @@ def _confirm(memory: Memory, record: RecordRow) -> None:
         memory.store.set_tags(record.id, [tag for tag in current.tags if tag != PROVISIONAL_TAG], now=memory.now())
 
 
-def _retire(memory: Memory, item: _Item, run: str | None) -> None:
+def _repeat_preserves(candidate: dict[str, Any], target: RecordRow | None, record: RecordRow | None = None,
+                      *, require_active: bool = True) -> bool:
+    """All duplicate paths use the same conservative detail and authority gates as upkeep."""
+    from .maintenance import keeps_everything, may_merge
+
+    if target is None or (require_active and target.status != "active"):
+        return False
+    if record is not None:
+        if VERIFICATION_STRENGTH[record.verification] > VERIFICATION_STRENGTH[target.verification]:
+            return False
+        if (record.kind == "rule" and target.kind != "rule") or not may_merge(record, target):
+            return False
+    return keeps_everything([str(candidate.get("text") or "")], target.text, minimum_word_share=1.0)
+
+
+def _dedup_record(item: _Item) -> RecordRow | None:
+    """An explicit correction changes the statement being deduplicated, not its evidence strength."""
+    if item.record is None or not item.corrected:
+        return item.record
+    return dataclasses.replace(item.record, text=str(item.candidate.get("text") or ""))
+
+
+def _retire(memory: Memory, item: _Item, run: str | None) -> bool:
     record = item.record
     assert record is not None
+    if not item.reason and not item.repeat_of:
+        raise ExtractionError(f"the final review gave no retirement reason for {record.id}; its range remains pending",
+                              counted=True)
     why = _RETIRED.get(item.reason, item.reason or "not kept")
     now = memory.now()
-    target = memory.store.get(item.repeat_of) if item.repeat_of else None
+    target_id = _standing(memory, item.repeat_of) if item.repeat_of else None
+    target = memory.store.get(target_id) if target_id else None
+    source = _dedup_record(item)
+    if item.reason == "repeat" and (item.repeat_of not in item.shown or target_id == record.id or
+            not _repeat_preserves({"text": source.text}, target, source)):
+        if item.corrected:
+            raise ExtractionError(f"the corrected memory {record.id} has no safe duplicate target; its range remains pending",
+                                  counted=True)
+        _confirm(memory, record)
+        return False
     with memory.store.transaction():
-        if target is not None and target.status == "active" and target.id != record.id:
+        if item.reason == "repeat" and target is not None and target.status == "active" and target.id != record.id:
             memory.store.supersede(record.id, target.id, now=now, reason=f"the final pass found it {why} [{target.id}]")
         else:
             memory.store.retire(record.id, reason=f"the final pass retired it ({why})", now=now)
     journal.record(memory.store, "candidate", record.text, outcome="retired", agent=memory.agent,
                    project_id=record.project_id, session=record.source_session, run=run, record_ids=[record.id],
                    details={"result": "retired by the final pass", "reason": why}, at=now)
+    return True
 
 
 # Two candidates of one pass this alike are shown to the check side by side.

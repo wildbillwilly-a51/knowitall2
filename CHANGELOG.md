@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.5 (2026-10-18)
+
+- **Final reviews preserve details when a proposed duplicate is incomplete.**
+  Every repeat path checks technical details, all significant source words,
+  evidence strength and the resolved target before retiring an existing memory
+  or dropping a new candidate. Unsafe duplicate judgments keep the original.
+  A confirmed original also survives a merge that omits its details; a merge
+  cannot discard the new candidate's own information either.
+- **Technical preservation includes flags, identifiers and code expressions.**
+  Shared maintenance checks recognize assignment syntax, underscores, command
+  flags, quoted code and function calls, alongside paths, numbers and polarity.
+  Maintenance duplicates and merges also retain every significant source word.
+- **Incomplete reviews identify the undecided memories.** Final inputs show
+  earlier review states and original evidence; the last part explicitly revisits
+  outstanding decisions. Missing decisions still leave the range pending.
+
 ## 0.11.4 (2026-10-18)
 
 - **Backend allowance failures preserve pending learning.** Structured quota
@@ -618,7 +634,7 @@ update again first. Claude Code needs nothing.
 ## 0.4.2 (2026-09-29)
 
 - **Briefings and news no longer vanish over one character.** A memory
-  containing a character such as "≥" or "→" made the session-start briefing
+  containing a character such as "â‰¥" or "â†’" made the session-start briefing
   and the news KnowItAll2 passes to the agent fail on Windows, silently; the
   news was then counted as shown and never delivered. Hook output is now
   plain-ASCII JSON, news counts as shown only once it has been written, and

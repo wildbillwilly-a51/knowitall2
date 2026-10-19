@@ -398,7 +398,7 @@ class GateTests(MaintenanceTestCase):
         # as long as the copy's numbers are in the kept memory and neither turns the other around.
         full = self.save("The build host's Docker daemon listens on port 2376 with TLS; connect with "
                          "`docker --tlsverify -H build1.example.test:2376`.")
-        terse = self.save("Docker on build1.example.test is reached over TLS on port 2376.")
+        terse = self.save("On build1.example.test, Docker listens on port 2376 with TLS.")
         other_port = self.save("Docker on build1.example.test is reached over TLS on port 2377.")
         turned = self.save("The build host's Docker daemon does not listen on port 2376 with TLS.")
         report = self.run_maintenance(FakeReviewer([[
@@ -415,7 +415,7 @@ class GateTests(MaintenanceTestCase):
         # must all be in the kept memory, in any case.
         postgres = self.save("The inventory service stores its data in PostgreSQL on the shared database host.")
         mysql = self.save("The inventory service keeps its data in MySQL.")
-        lower = self.save("The inventory service keeps its data in postgresql.")
+        lower = self.save("The inventory service stores its data in postgresql.")
         coral = self.save("The NVR runs Frigate with the Coral TPU detector.")
         openvino = self.save("The NVR runs Frigate with the OpenVINO detector.")
         # In nearly the same words too: the copy names another product.

@@ -511,10 +511,12 @@ def apply_finding(
 def may_merge(copy: RecordRow, keep: RecordRow) -> bool:
     """Whether ``copy`` may be merged into ``keep`` as a duplicate. Never when the copy names a thing ``keep``
     does not ("in PostgreSQL" is no duplicate of "in MySQL", even in otherwise the same words). The user's own
-    words only when both say the same thing (``says_the_same``); learned copies also in other words, on the
-    model's finding, as long as every name, address, path, and number in the copy is in ``keep`` and neither has
+    words only when both say the same thing (``says_the_same``); learned copies on the
+    model's finding only when every significant source word, name, address, path, and number is in ``keep`` and neither has
     a "not" or "never" the other lacks ("the NAS is nas01" is no duplicate of "the router is rtr01")."""
 
+    if not keeps_everything([copy.text], keep.text, minimum_word_share=1.0):
+        return False
     if not _proper_names(copy.text) <= {word.casefold() for word in _WORD.findall(keep.text)}:
         return False
     if says_the_same(copy, keep):
@@ -628,7 +630,7 @@ def _not_combinable(records: list[RecordRow]) -> str | None:
     return None
 
 
-def keeps_everything(sources: list[str], combined: str) -> bool:
+def keeps_everything(sources: list[str], combined: str, *, minimum_word_share: float | None = None) -> bool:
     """Whether ``combined`` keeps what makes each of ``sources`` specific: every proper name, every name with a
     digit or a dot, slash, colon, or at sign in it (hosts, addresses, paths), every number, and the same words
     that turn a statement around ("not", "never"). A merged or combined memory may reword; it may not lose."""
@@ -639,14 +641,14 @@ def keeps_everything(sources: list[str], combined: str) -> bool:
     return all(
         _proper_names(source) <= words and all(name in kept for name in _names(source))
         and set(_NUMBERS.findall(source)) <= numbers and _polarity(source) == polarity
-        and _share_kept(source, meaning) >= KEPT_WORDS_SHARE
+        and _share_kept(source, meaning) >= (KEPT_WORDS_SHARE if minimum_word_share is None else minimum_word_share)
         for source in sources
     )
 
 
-# Most of each input's own words stay too: "nightly", "encrypted", "restic", "read-only" carry meaning that
+# Each input's significant words stay too: "nightly", "encrypted", "restic", "read-only" carry meaning that
 # names and numbers alone do not (candidate review, C-M8).
-KEPT_WORDS_SHARE = 0.8
+KEPT_WORDS_SHARE = 1.0
 
 
 def _share_kept(source: str, meaning: set[str]) -> float:
@@ -662,10 +664,12 @@ def _share_kept(source: str, meaning: set[str]) -> float:
 def _names(text: str) -> set[str]:
     """Words that name one thing: with a digit, or a dot, slash, colon, or at sign inside (hosts, addresses, paths)."""
 
-    names = set()
+    names = {" ".join(code.casefold().split()) for code in re.findall(r"`([^`\n]+)`", text)}
+    names.update(call.casefold() for call in re.findall(r"[\w.]+\([^()\n]*\)", text))
     for token in text.split():
         bare = token.strip(".,;:!?()[]{}\"'`").casefold()
-        if any(character.isdigit() for character in bare) or any(mark in bare for mark in "./\\:@"):
+        if (any(character.isdigit() for character in bare) or any(mark in bare for mark in "./\\:@=_")
+                or bare.startswith("-") or re.search(r"\w+\([^)]*\)", bare)):
             names.add(bare)
     return names
 
