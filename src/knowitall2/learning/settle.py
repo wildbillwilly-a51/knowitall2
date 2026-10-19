@@ -110,8 +110,9 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         provisional = [record for record in memory.store.from_session(session_id, limit=100_000)
                        if record.source_agent == "learner" and record.verification != "user_stated"]
     candidates = [(record, _as_candidate(memory, record)) for record in provisional]
-    if partial:
-        # A slice reviews only what it shows; the rest waits for the slice that reads its stretch (C-L11).
+    if partial or recovery:
+        # An approved recovery prefix can be one of several histories of the same session. Review only
+        # evidence this slice shows; keep the full session excluded from duplicate/update targets below.
         candidates = [(record, candidate) for record, candidate in candidates if _in_parts(candidate, parts)]
     items = [_Item(f"p{number}", candidate, record) for number, (record, candidate) in enumerate(candidates, 1)]
     mine = {record.id for record in provisional}
@@ -238,6 +239,12 @@ def _review(items: list[_Item], reviews: list[Any], number: int) -> None:
         if item is None or item.status == "retired":
             continue
         action = review.get("action")
+        if action == "retire" and item.corrected and (
+                review.get("retire_reason") == "repeat" or
+                (not review.get("retire_reason") and review.get("repeat_of"))):
+            # A later part calling the correction a duplicate must not discard it before reconciliation.
+            # The central check validates repeats/merges against the corrected text and its evidence.
+            continue
         if action == "retire" and not _lasting_lesson(item, review):
             item.status, item.reason = "retired", str(review.get("retire_reason") or "")
             item.repeat_of = str(review.get("repeat_of") or "").strip().strip("[]")
@@ -306,7 +313,10 @@ def _reconcile(memory: Memory, extractor: Any, report: Settled, kept: list[_Item
             earlier = _earlier_candidate(decision, decision["index"])
             if _shown(shown, decision["index"], decision) is None and not (
                     decision["action"] == "repeat" and earlier is not None):
-                raise ExtractionError("the reconciliation referenced a memory it was not shown", counted=True)
+                raise ExtractionError(f"the reconciliation referenced a memory it was not shown: candidate "
+                                      f"{decision['index']}, action {decision['action']}, "
+                                      f"target {str(decision.get('known_id') or '')[:100]}; its range remains pending",
+                                      counted=True)
     if set(decisions) != set(range(len(kept))):
         raise ExtractionError("the reconciliation left a memory unchecked", counted=True)
     return decisions, shown

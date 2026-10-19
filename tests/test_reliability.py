@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import argparse
 import subprocess
 import tempfile
@@ -205,33 +206,63 @@ class IntegrityTests(unittest.TestCase):
         self.assertFalse(may_merge(original, partial))
         self.assertFalse(keeps_everything([original.text], partial.text))
 
-    def test_a_later_invalid_repeat_never_confirms_an_original_already_found_wrong(self):
+    def corrected_later_review(self, target, *, later_reason="repeat", reconcile_repeat=False):
         t = self.learning()
         builder = t.sample_log()
         for _ in range(8):
             builder.assistant(fixtures.text("Additional unrelated output. " + "x " * 800))
         builder.write(t.log_path, idle=False)
+        known = t.memory.remember(t.DNSMASQ["text"] if reconcile_repeat else "The homelab router uses dnsmasq.",
+                                  kind="lesson", subjects=["router", "dnsmasq"], source="observed").record
         wrong = {**t.DNSMASQ, "text": "On the homelab router, dnsmasq never needs a restart after editing /etc/config/dhcp."}
-        t.learn(fixtures.FakeEngine([[wrong]]), quick=True)
-        [record] = t.provisional()
+        t.learn(fixtures.FakeEngine([[wrong, t.ROUTER] if target == "sibling" else [wrong]]), quick=True)
+        record = next(row for row in t.provisional() if row.text == wrong["text"])
         fixtures.quiet_longer(t.log_path)
         class Engine(fixtures.FakeEngine):
             def run(self, text, *, schema, system_prompt):
+                if "reviews" not in schema["properties"]:
+                    return super().run(text, schema=schema, system_prompt=system_prompt)
                 self.inputs.append(("final", text))
                 if "review so far: pending" in text:
                     answer = fixtures.review("p1", "correct", text=t.DNSMASQ["text"], kind="lesson", scope="global", evidence=t.DNSMASQ["evidence"])
                 elif "review so far: corrected" in text:
-                    answer = fixtures.review("p1", "retire", retire_reason="repeat", repeat_of="k-missing")
+                    answer = fixtures.review("p1", "retire", retire_reason=later_reason,
+                                             repeat_of=known.id if target == "known" else "p2" if target == "sibling" else target)
                 else:
                     return {"reviews": [], "memories": []}
-                return {"reviews": [answer], "memories": []}
-        engine = Engine()
+                return {"reviews": [answer, *([fixtures.review("p2", "confirm")] if target == "sibling" else [])], "memories": []}
+        engine = Engine(checks=[{"decisions": [{"index": 0, "action": "repeat", "known_id": known.id,
+                                                "text": "", "reason": "same"}]}] if reconcile_repeat else [])
         with mock.patch("knowitall2.learning.settle.PART_CHARACTERS", 4000):
             report = t.learn(engine)
         self.assertGreater(len(engine.inputs), 1)
-        self.assertTrue(report.failed)
-        self.assertEqual(record.id, t.provisional()[0].id)
-        self.assertEqual(0, t.state.entry(t.log_path)["settled"])
+        self.assertEqual([], report.failed)
+        self.assertNotEqual("active", t.store.get(record.id).status)
+        self.assertEqual([], t.provisional())
+        self.assertGreater(t.state.entry(t.log_path)["settled"], 0)
+        if later_reason in ("", "repeat"):
+            self.assertTrue(any(row.text == t.DNSMASQ["text"] for row in t.store.list_active(project_id=None, scope="all", limit=20)))
+        else:
+            self.assertEqual("retired", t.store.get(record.id).status)
+        if reconcile_repeat:
+            self.assertEqual(known.id, t.store.get(record.id).superseded_by)
+
+    def test_a_later_invalid_repeat_publishes_the_correction_instead_of_confirming_the_wrong_original(self):
+        for target in ("k-missing", "", "p1", "known", "sibling"):
+            with self.subTest(target=target):
+                self.corrected_later_review(target)
+
+    def test_a_later_repeat_inferred_from_its_target_keeps_the_correction(self):
+        self.corrected_later_review("known", later_reason="")
+
+    def test_a_later_safe_repeat_reconciles_the_correction(self):
+        self.corrected_later_review("known", reconcile_repeat=True)
+
+    def test_a_later_substantive_retirement_still_overturns_a_correction(self):
+        for reason in ("wrong", "overturned"):
+            for target in ("", "known", "p2"):
+                with self.subTest(reason=reason, target=target):
+                    self.corrected_later_review(target, later_reason=reason)
 
     def test_reconciliation_cannot_replace_an_observation_by_a_weaker_duplicate(self):
         t = self.learning()
@@ -620,6 +651,75 @@ class IntegrityTests(unittest.TestCase):
         with self.assertRaises(RequestError):
             handler.export(snapshot, prefix="test-")
         snapshot.assert_not_called()
+
+    def confirm_shown_engine(self):
+        class Engine(fixtures.FakeEngine):
+            def run(self, text, *, schema, system_prompt):
+                if "reviews" not in schema["properties"]:
+                    return super().run(text, schema=schema, system_prompt=system_prompt)
+                self.inputs.append(("final", text))
+                return {"reviews": [fixtures.review(key, "confirm")
+                                    for key in re.findall(r"^- \[(p[0-9]+)\]", text, re.M)], "memories": []}
+        return Engine()
+
+    def test_recovery_leaves_later_assistant_memory_untouched(self):
+        t = self.learning()
+        builder = t.sample_log()
+        builder.write(t.log_path, idle=False)
+        t.learn(fixtures.FakeEngine([[t.DNSMASQ]]), quick=True)
+        end = t.log_path.stat().st_size
+        later = "The observatory telescope uses a cobalt calibration lamp at midnight."
+        builder.assistant(fixtures.text(later)).write(t.log_path, idle=False)
+        candidate = {"text": later, "kind": "fact", "subjects": ["telescope"], "scope": "global",
+                     "project": "", "evidence": later, "relation": "new", "known_id": ""}
+        t.learn(fixtures.FakeEngine([[candidate]]), quick=True)
+        record = next(r for r in t.provisional() if r.text == later)
+        self.assertNotEqual("user_stated", record.verification)
+        before = t.store.get(record.id)
+        cursors = {key: t.state.entry(t.log_path).get(key, 0)
+                   for key in ("offset", "event_index", "settled", "settled_event_index")}
+        item = {"path": str(t.log_path.resolve()), "session": fixtures.SESSION, "start": 0,
+                "event_index": 0, "end": end, "end_event_index": 0, "scope": "historical_whole_session",
+                "sha256": recovery.prefix_hash(t.log_path, end)}
+        item["id"] = recovery.range_id(item)
+        recovery.queue({"format": 1, "ranges": [item], "unresolved": []}, t.state, allow_whole_session=True)
+        engine = self.confirm_shown_engine()
+        report = t.learn(engine)
+        self.assertEqual([], report.failed)
+        self.assertTrue(engine.inputs)
+        self.assertTrue(all(later not in text and record.id not in text for _step, text in engine.inputs))
+        self.assertEqual(before, t.store.get(record.id))
+        self.assertEqual(cursors, {key: t.state.entry(t.log_path).get(key, 0) for key in cursors})
+        self.assertIn(item["id"], t.state.entry(t.log_path)["recovery_completed"])
+
+    def test_the_final_recovery_slice_does_not_review_an_earlier_slices_memories_again(self):
+        from knowitall2.learning.dossier import build_dossiers
+        from knowitall2.learning.transcripts import read_session
+        from knowitall2.learning.settle import settle, _in_parts
+        t = self.learning()
+        builder = t.sample_log()
+        for _ in range(8):
+            builder.assistant(fixtures.text("Unrelated investigation output. " + "x " * 800))
+        later = "The observatory telescope uses a cobalt calibration lamp at midnight."
+        builder.assistant(fixtures.text(later)).write(t.log_path, idle=False)
+        candidate = {"text": later, "kind": "fact", "subjects": ["telescope"], "scope": "global",
+                     "project": "", "evidence": later, "relation": "new", "known_id": ""}
+        t.learn(fixtures.FakeEngine([[t.DNSMASQ, candidate]]), quick=True)
+        first = next(r for r in t.provisional() if r.text == t.DNSMASQ["text"])
+        session, _ = read_session(t.log_path)
+        parts = build_dossiers(session, budget=4000)
+        self.assertGreater(len(parts), 1)
+        self.assertFalse(_in_parts(t.DNSMASQ, parts[-1:]))
+        self.assertFalse(_in_parts(candidate, parts[:-1]))
+        settle(t.memory, self.confirm_shown_engine(), parts[:-1], session=session, run=None,
+               partial=True, recovery=True)
+        before = t.store.get(first.id)
+        last = self.confirm_shown_engine()
+        settle(t.memory, last, parts[-1:], session=session, run=None, recovery=True)
+        self.assertTrue(last.inputs)
+        self.assertTrue(all(first.text not in text and first.id not in text for _step, text in last.inputs))
+        self.assertEqual(before, t.store.get(first.id))
+        self.assertEqual([], t.provisional())
 
     def test_recovery_is_hash_bound_idempotent_and_does_not_rewind_progress(self):
         t = self.learning()

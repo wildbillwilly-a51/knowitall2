@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.6 (2026-10-18)
+
+- **Recovery respects its approved source boundaries.** Final recovery slices
+  review only memories whose evidence appears in that slice. Other histories of
+  the same session remain excluded from duplicate and update targets. Memories
+  with no retained evidence keep the existing inclusion policy.
+- **A correction survives a later preliminary duplicate judgment.** It proceeds
+  to the normal reconciliation and publication checks, rather than becoming
+  stuck or confirming the wrong original. Later substantive retirements still
+  apply. Invalid reconciliation references stay pending and identify their target.
+
 ## 0.11.5 (2026-10-18)
 
 - **Final reviews preserve details when a proposed duplicate is incomplete.**

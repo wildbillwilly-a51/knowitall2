@@ -1,8 +1,7 @@
 # Reliability fixes and recovery
 
-These changes are prepared in source. Publishing, server deployment, installed
-client updates, configuration changes and recovery of live data require the
-user's deployment approval.
+The user approved publication, deployment and the selected historical recovery.
+The current rollout and remaining work are recorded in `codex-handoff.md`.
 
 ## Learning integrity
 
@@ -44,8 +43,12 @@ its absolute path, session ID, complete-line boundaries and prefix SHA-256.
 Old skip events did not retain exact byte boundaries. Those entries explicitly
 propose a conservative whole-session final rereview; they do not claim to have
 reconstructed the missing range. Multiple copies of a session are listed as
-separate candidates. The operator must select one verified source per session,
-resolve missing sources, and inspect the manifest before applying it.
+separate candidates. Select one verified source per session in each manifest,
+resolve missing sources, and inspect the manifest before applying it. A resumed
+session can have complementary histories rather than equivalent copies. If both
+are needed, verify evidence coverage with the exact rendered dossier predicate
+and queue the additional history in a separate explicit manifest. Do not combine
+native transcripts into a fabricated chronology.
 
 After approval, `knowitall2 learn --recover PLAN.json --allow-whole-session`
 queues those selected rereviews. It makes no model call. Subsequent learning
@@ -58,6 +61,11 @@ Recovery revisits learned, non-authoritative source-session memories even when
 an old failed pass removed their provisional labels. Direct user statements and
 choices are excluded from that review set; ordinary publication authority and
 duplicate checks still apply. No recovery is applied automatically on update.
+Each recovery slice reviews only memories whose retained evidence it contains,
+including the final slice. All source-session records remain excluded from
+nearest-memory and merge targets, so a different history cannot be changed through
+reconciliation. Memories without retained evidence keep the existing inclusion
+policy; source coverage must be audited before claiming complete restoration.
 The plan also lists maintenance failures that match retained allowance error
 timestamps unambiguously. Approved entries reopen only the exact, unchanged
 failed review snapshots; a newer review is preserved. Resetting this bookkeeping
