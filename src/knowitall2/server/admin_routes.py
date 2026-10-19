@@ -263,19 +263,9 @@ def _backup(handler: Any, query: dict[str, list[str]], body: dict[str, Any]) -> 
         _signed_in(handler, store, change=False)
     finally:
         store.close()
-    folder = handler.server.home / "tmp"
-    folder.mkdir(parents=True, exist_ok=True)
-    handle, name = tempfile.mkstemp(prefix="backup-", suffix=".db", dir=folder)
-    os.close(handle)
-    target = Path(name)
-    try:
-        backups.copy_database(handler.server.database, target)
-        data = target.read_bytes()
-    finally:
-        target.unlink(missing_ok=True)
     stamp = parse_iso(handler.server.clock()).strftime("%Y%m%d-%H%M%S")
-    handler._send(HTTPStatus.OK, data, "application/vnd.sqlite3",
-                  {"Content-Disposition": f'attachment; filename="knowitall2-server-{stamp}.db"'})
+    handler.export(backups.copy_database, prefix="backup-",
+                   extra={"Content-Disposition": f'attachment; filename="knowitall2-server-{stamp}.db"'})
 
 
 ROUTES: dict[tuple[str, str], Callable[[Any, dict[str, list[str]], dict[str, Any]], None]] = {

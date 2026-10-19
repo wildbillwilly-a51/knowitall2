@@ -6,8 +6,8 @@ database notes each change to a shared table (``sync``), and a sync:
 
 1. fetches what changed on the server since the last fetch, leaving alone any
    row this computer changed and has not sent yet;
-2. sends this computer's changes; when the server keeps a newer version of a
-   row (or refuses a change), the computer takes the server's version;
+2. sends its changes; when the server keeps a newer version the computer takes
+   it, while refused local edits stay quarantined for explicit recovery;
 3. sends the briefings and recalls made here, for the server's use counts.
 
 A sync runs in its own detached process (``knowitall2 sync``), started by
@@ -176,6 +176,7 @@ class SyncReport:
     sent: int = 0
     received: int = 0
     refused: int = 0
+    unresolved: int = 0
     uses: int = 0
     skipped: bool = False
     resent: bool = False  # the server's memory went back, so everything here was sent again
@@ -191,6 +192,8 @@ class SyncReport:
         parts = [f"sent {self.sent} change(s)", f"received {self.received}"]
         if self.refused:
             parts.append(f"{self.refused} refused by the server")
+        if self.unresolved:
+            parts.append(f"{self.unresolved} unresolved rejection(s); use `knowitall2 sync --rejections`")
         again = (" The server's memory had gone back (a backup put back, or a new start), so this computer sent "
                  "all its memories again.") if self.resent else ""
         return "Synced with the KnowItAll2 server: " + ", ".join(parts) + "." + again
@@ -265,24 +268,33 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
         if not operations:
             continue
         answer = remote.push(operations)
-        settled, server_rows, seen = [], [], []
+        settled, server_rows, seen, rejected, accepted = [], [], [], [], []
         before = len(waiting)
         for operation, result in zip(operations, answer.get("results", [])):
             outcome = result.get("result")
+            if outcome not in {"applied", "duplicate", "kept_newer", "rejected"}:
+                raise sync.SyncError("the server returned an unknown result; local changes remain pending")
             if outcome == "rejected" and result.get("retry"):
                 # Such as a memory whose project the server does not have yet: the project, when it is here,
                 # is noted to go now (it may never have been), and the memory goes at the next sync.
                 waiting.add((operation["table"], operation["key"]))
+                if result.get("code") == "invalid_base":
+                    with store.transaction():
+                        store.connection.execute("DELETE FROM sync_seen WHERE tbl = ? AND key = ?",
+                                                 (operation["table"], operation["key"]))
                 if isinstance(operation.get("row"), dict):
                     sync.note_parents(store, SYNCED_TABLES[operation["table"]], operation["row"])
                 continue
             settled.append(operation)
             if outcome == "rejected":
                 refused += 1
+                rejected.append((operation, result.get("reason", "server refused the change")))
                 journal.problem("sync", f"the server refused a change to {operation['table']} {operation['key']}: "
                                         f"{result.get('reason')}")
+                continue  # retain local content; the server's rejected version is not an accepted replacement
             else:
                 sent += 1
+                accepted.append(operation)
             if isinstance(result.get("row"), dict):
                 server_rows.append({"table": operation["table"], "key": operation["key"], "op": "upsert",
                                     "row": result["row"], "seq": result.get("seq")})
@@ -293,6 +305,10 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
         # One transaction: a change counts as settled only together with the server's version of it, so a
         # failure between the two never leaves a version here that the server turned down.
         with store.transaction():
+            for operation, reason in rejected:
+                sync.quarantine(store, operation, reason)
+            for operation in accepted:
+                sync.clear_rejections(store, operation)
             sync.acknowledge(store, settled, seen=seen)
             if server_rows:  # a row changed here again since it was sent is left alone, as in a pull
                 sync.apply_pulled(store, server_rows)
@@ -349,6 +365,7 @@ def write_status(report: SyncReport, *, pending: bool) -> None:
     else:
         status.update(last_success=now, problem=None, problem_status=None)
     status["unsent"] = pending
+    status["unresolved_rejections"] = report.unresolved
     try:
         write_text_atomic(path, json.dumps(status, indent=2) + "\n")
     except OSError:
@@ -410,9 +427,10 @@ def sync_now(store: Store, *, agent: str | None = None, remote: RemoteClient | N
         (folder() / "sync.again").touch()
         report.skipped = True
         return report
+    report.unresolved = len(sync.rejections(store))
     write_status(report, pending=sync.has_pending(store))
     if report.sent or report.received or report.refused or report.resent:
-        journal.record(store, "sync", report.describe(), outcome="problem" if report.problem else "ok",
+        journal.record(store, "sync", report.describe(), outcome="problem" if report.problem or report.unresolved else "ok",
                        agent=remote.agent, details={"sent": report.sent, "received": report.received,
                                                     "refused": report.refused})
     return report
@@ -573,6 +591,7 @@ def connect(
     with store.transaction():
         store.connection.execute("DELETE FROM changes")
         store.connection.execute("DELETE FROM sync_seen")
+        sync.archive_rejections(store)
         # A new id for the operations sent from now on, so the answers the server keeps for an earlier
         # connection's operations are never taken for this one's.
         store.connection.execute("DELETE FROM meta WHERE key = ?", (sync.SOURCE_KEY,))
@@ -664,6 +683,9 @@ def describe_status(*, check: bool = True, timeout: float = 3.0) -> tuple[bool, 
         lines.append(f"Last synced: {status['last_success']}.")
     if status.get("unsent"):
         lines.append("Some changes made here have not reached the server yet; they are sent at the next sync.")
+    if status.get("unresolved_rejections"):
+        healthy = False
+        lines.append(f"{status['unresolved_rejections']} rejected change(s) need attention; use knowitall2 sync --rejections.")
     warning = plain_http_warning(connection.address)
     if warning:
         lines.append(f"Note: {warning}")
@@ -699,6 +721,7 @@ def disconnect(store: Store) -> None:
     with store.transaction():
         store.connection.execute("DELETE FROM changes")
         store.connection.execute("DELETE FROM sync_seen")
+        sync.archive_rejections(store)
         store.connection.execute("DELETE FROM meta WHERE key IN (?, ?)", (sync.CURSOR_KEY, USAGE_CURSOR_KEY))
     keys = folder() / "keys"
     for path in keys.glob("*.key"):
@@ -713,7 +736,8 @@ def disconnect(store: Store) -> None:
 def run_command(arguments: argparse.Namespace) -> int:
     """``knowitall2 sync``: sync with the server now."""
 
-    if not is_connected():
+    resolving = any(getattr(arguments, name, None) for name in ("rejections", "retry_rejected", "dismiss_rejected"))
+    if not is_connected() and not resolving:
         if not arguments.quiet:
             print("This computer keeps its memory here only; it is not connected to a KnowItAll2 server.")
         return 0
@@ -723,7 +747,31 @@ def run_command(arguments: argparse.Namespace) -> int:
         print(f"knowitall2: {exc}", file=sys.stderr)
         return 1
     try:
+        if resolving:
+            if getattr(arguments, "rejections", False):
+                print(json.dumps([{key: value for key, value in item.items() if key != "operation"}
+                                  for item in sync.rejections(store)], indent=2))
+                archived = json.loads(store.get_meta(sync.ARCHIVED_REJECTIONS_KEY) or "[]")
+                if archived:
+                    print("Archived refusals from earlier connections (not retried):")
+                    print(json.dumps([{key: value for key, value in item.items() if key != "operation"}
+                                      for item in archived], indent=2))
+            else:
+                identifier = arguments.retry_rejected or arguments.dismiss_rejected
+                with SyncLock():
+                    sync.resolve_rejection(store, identifier, retry=bool(arguments.retry_rejected))
+                    status = read_status()
+                    status["unresolved_rejections"] = len(sync.rejections(store))
+                    write_text_atomic(folder() / "status.json", json.dumps(status, indent=2) + "\n")
+                print("Rejection resolved locally; the next sync will send the correction or fetch the server version.")
+            return 0
         report = sync_now(store, agent=arguments.agent)
+    except sync.SyncError as exc:
+        print(f"knowitall2: {exc}", file=sys.stderr)
+        return 1
+    except LockBusy:
+        print("A sync is running; no rejection was changed. Retry when it finishes.")
+        return 1
     finally:
         store.close()
     print(report.describe())

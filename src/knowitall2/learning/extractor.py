@@ -15,6 +15,7 @@ from typing import Any, Callable, Protocol
 from .dossier import Dossier
 from .prompts import QUICK_CANDIDATES as MAX_CANDIDATES, QUICK_PROMPT as SYSTEM_PROMPT, QUICK_SCHEMA as OUTPUT_SCHEMA
 from .runner import engine_command, is_command_script, run_bounded, through_cmd
+from .availability import guarded, reset_time
 
 
 class ExtractionError(RuntimeError):
@@ -25,9 +26,14 @@ class ExtractionError(RuntimeError):
     errors count against the session, which is retried and eventually skipped.
     """
 
-    def __init__(self, message: str, *, blocking: bool = False) -> None:
+    def __init__(self, message: str, *, blocking: bool = False, category: str = "content",
+                 retry_at: str | None = None, reset_source: str | None = None, attempted: bool = True,
+                 counted: bool = False) -> None:
         super().__init__(message)
         self.blocking = blocking
+        self.category = category if not blocking or category != "content" else "availability"
+        self.retry_at, self.reset_source, self.attempted = retry_at, reset_source, attempted
+        self.counted = counted
 
 
 # Variables that tie a process to the Claude Code session that launched it (seen
@@ -62,7 +68,7 @@ def engine_environment(base: dict[str, str] | None = None) -> dict[str, str]:
 
 _BLOCKING_MARKERS = (
     "not logged in", "/login", "api key", "authentication", "unauthorized", "forbidden",
-    "credit balance", "usage limit", "rate limit", "overloaded",
+    "credit balance", "usage limit", "rate limit", "overloaded", "session limit", "weekly limit",
 )
 
 
@@ -170,13 +176,14 @@ class ClaudeCliExtractor:
             command = self.explore_command(schema=schema, system_prompt=system_prompt, scratch=Path(scratch))
             return self._call(command, text, cwd=str(folder), timeout=timeout)
 
+    @guarded
     def _call(self, command: list[str], text: str, *, cwd: str, timeout: float) -> dict[str, Any]:
         self.last_usage = None
         try:
             completed = self._runner(command, input=text.encode("utf-8"), timeout=timeout, cwd=cwd,
                                      env=engine_environment())
         except subprocess.TimeoutExpired as exc:
-            raise ExtractionError(f"the Claude CLI timed out after {timeout:.0f} seconds") from exc
+            raise ExtractionError(f"the Claude CLI timed out after {timeout:.0f} seconds", blocking=True, category="timeout") from exc
         except OSError as exc:
             raise ExtractionError(f"the Claude CLI could not start: {exc}", blocking=True) from exc
         self.last_usage = claude_usage(completed.stdout)
@@ -256,6 +263,7 @@ class CodexCliExtractor:
             return self._call(text, workspace=Path(folder), scratch=Path(scratch), schema=schema,
                               system_prompt=system_prompt, preamble=CODEX_EXPLORE_PREAMBLE, timeout=timeout)
 
+    @guarded
     def _call(self, text: str, *, workspace: Path, scratch: Path, schema: dict[str, Any], system_prompt: str,
               preamble: str, timeout: float) -> dict[str, Any]:
         schema_path = scratch / "schema.json"
@@ -268,7 +276,7 @@ class CodexCliExtractor:
             completed = self._runner(command, input=text.encode("utf-8"), timeout=timeout, cwd=str(workspace),
                                      env=codex_engine_environment())
         except subprocess.TimeoutExpired as exc:
-            raise ExtractionError(f"the Codex CLI timed out after {timeout:.0f} seconds") from exc
+            raise ExtractionError(f"the Codex CLI timed out after {timeout:.0f} seconds", blocking=True, category="timeout") from exc
         except OSError as exc:
             raise ExtractionError(f"the Codex CLI could not start: {exc}", blocking=True) from exc
         answer = answer_path.read_text(encoding="utf-8", errors="replace") if answer_path.is_file() else ""
@@ -280,7 +288,11 @@ class CodexCliExtractor:
             # no answer may have printed the model's prose, which can mention a login or a 403 it saw.
             complaint = _last_line(completed.stderr) if completed.returncode != 0 else ""
             blocking = any(marker in complaint.casefold() for marker in _CODEX_BLOCKING_MARKERS)
-            raise ExtractionError(f"the Codex CLI reported: {detail}", blocking=blocking)
+            quota = any(word in complaint.casefold() for word in ("quota", "usage limit", "rate limit"))
+            retry_at, source = reset_time({}, detail) if quota else (None, None)
+            raise ExtractionError(f"the Codex CLI reported: {detail}", blocking=blocking,
+                                  category="quota" if quota else "availability" if blocking else "content",
+                                  retry_at=retry_at, reset_source=source)
         try:
             payload = json.loads(answer)
         except ValueError as exc:
@@ -412,11 +424,23 @@ def parse_cli_payload(returncode: int, stdout: bytes, stderr: bytes) -> dict[str
         envelope = json.loads(stdout.decode("utf-8", errors="replace"))
     except ValueError:
         envelope = None
-    if returncode != 0 or (isinstance(envelope, dict) and envelope.get("is_error")):
+    if returncode != 0 or (isinstance(envelope, dict) and (envelope.get("is_error") or envelope.get("type") == "error")):
         reported = envelope.get("result") if isinstance(envelope, dict) else None
+        if not reported and isinstance(envelope, dict) and isinstance(envelope.get("error"), dict):
+            reported = envelope["error"].get("message")
         detail = str(reported or _first_line(stderr) or _first_line(stdout) or f"exit code {returncode}")[:200]
-        blocking = any(marker in detail.casefold() for marker in _BLOCKING_MARKERS)
-        raise ExtractionError(f"the Claude CLI reported: {detail}", blocking=blocking)
+        metadata = envelope if isinstance(envelope, dict) else {}
+        error = metadata.get("error")
+        code = str(error.get("type", error.get("code", "")) if isinstance(error, dict)
+                   else metadata.get("error_code", metadata.get("subtype", ""))).casefold()
+        quota = (code in {"rate_limit_error", "rate_limit", "usage_limit", "quota_exceeded", "session_limit", "weekly_limit"}
+                 or any(marker in detail.casefold() for marker in ("usage limit", "rate limit", "session limit", "weekly limit")))
+        blocking = (quota or code in {"authentication_error", "permission_error", "overloaded_error", "api_error"}
+                    or any(marker in detail.casefold() for marker in _BLOCKING_MARKERS))
+        retry_at, source = reset_time(metadata, str(reported or detail)) if quota else (None, None)
+        raise ExtractionError(f"the Claude CLI reported: {detail}", blocking=blocking,
+                              category="quota" if quota else "availability" if blocking else "content",
+                              retry_at=retry_at, reset_source=source)
     if envelope is None:
         raise ExtractionError("the Claude CLI did not return JSON")
     if not isinstance(envelope, dict):

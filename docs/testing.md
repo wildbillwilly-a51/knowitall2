@@ -48,7 +48,8 @@ in your home folder, and sets it up for the agents you choose. Afterwards:
 
 - quit and reopen Claude Code;
 - in Codex, run `/hooks` once and trust the KnowItAll2 SessionStart, Stop,
-  and UserPromptSubmit hooks.
+  UserPromptSubmit, and PostToolUse hooks. Close Codex before running an update
+  that needs to refresh its hooks; doctor verifies the after-command hook.
 
 ## What leaves your computer
 

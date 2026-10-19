@@ -366,7 +366,71 @@ def has_pending(store: Store) -> bool:
 
 
 def pending_keys(store: Store) -> set[tuple[str, str]]:
-    return {(row[0], row[1]) for row in store.connection.execute("SELECT DISTINCT tbl, key FROM changes").fetchall()}
+    return ({(row[0], row[1]) for row in store.connection.execute("SELECT DISTINCT tbl, key FROM changes").fetchall()}
+            | {(item["table"], item["key"]) for item in rejections(store)})
+
+
+REJECTIONS_KEY = "sync.rejected_operations"
+ARCHIVED_REJECTIONS_KEY = "sync.archived_rejections"
+
+
+def rejections(store: Store) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(store.get_meta(REJECTIONS_KEY) or "[]")
+        if not isinstance(value, list) or any(not isinstance(item, dict) or
+                not all(key in item for key in ("id", "table", "key")) for item in value):
+            raise ValueError("invalid rejection list")
+        return value
+    except (ValueError, TypeError) as exc:
+        raise SyncError("the local rejected-change queue needs repair; it has been preserved") from exc
+
+
+def quarantine(store: Store, operation: dict, reason: str) -> None:
+    """Retain terminal refusals locally, without publishing or repeatedly sending poison content."""
+    from .secrets import contains_secret, redact
+    items = [item for item in rejections(store)
+             if (item["table"], item["key"]) != (operation["table"], operation["key"])]
+    sensitive = contains_secret(json.dumps(operation, ensure_ascii=False))
+    items.append({"id": operation["op_id"], "table": operation["table"], "key": operation["key"],
+                  "reason": redact(str(reason))[:600], "at": journal.utc_now(), "sensitive": sensitive,
+                  "operation": None if sensitive else operation})
+    store.set_meta(REJECTIONS_KEY, json.dumps(items))
+
+
+def resolve_rejection(store: Store, identifier: str, *, retry: bool = False) -> None:
+    from .secrets import contains_secret
+    items = rejections(store)
+    item = next((item for item in items if item["id"] == identifier), None)
+    if item is None:
+        raise SyncError("no unresolved rejection has that id")
+    with store.transaction():
+        if retry:
+            table = table_for(item["table"])
+            current = read_row(store.connection, table, item["key"])
+            if current is None or contains_secret(json.dumps(current, ensure_ascii=False)):
+                raise SyncError("correct or remove the sensitive/missing local content before retrying")
+            store.connection.execute("INSERT INTO changes (tbl, key, op) VALUES (?, ?, 'upsert')",
+                                     (item["table"], item["key"]))
+        else:
+            # Dismiss means keep the server's version. Re-fetch it even if our pull cursor passed it.
+            store.set_meta(CURSOR_KEY, "0")
+        store.set_meta(REJECTIONS_KEY, json.dumps([old for old in items if old["id"] != identifier]))
+
+
+def clear_rejections(store: Store, operation: dict) -> None:
+    items = rejections(store)
+    kept = [item for item in items if (item["table"], item["key"]) != (operation["table"], operation["key"])]
+    if kept != items:
+        store.set_meta(REJECTIONS_KEY, json.dumps(kept))
+
+
+def archive_rejections(store: Store) -> None:
+    """Keep old-server evidence without protecting its rows from a new connection's pulls."""
+    items = rejections(store)
+    if items:
+        previous = json.loads(store.get_meta(ARCHIVED_REJECTIONS_KEY) or "[]")
+        store.set_meta(ARCHIVED_REJECTIONS_KEY, json.dumps([*previous, *items]))
+        store.set_meta(REJECTIONS_KEY, "[]")
 
 
 def note_all(store: Store, name: str) -> None:

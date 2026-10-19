@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -788,14 +789,14 @@ class LearnerTests(LearningTestCase):
         names = sorted(Path(key).name for key in LearnerState(self.state.path).logs)
         self.assertEqual(["gone-recently.jsonl", "kept.jsonl"], names)
 
-    def test_calls_the_user_started_all_count_and_the_file_stays_small(self) -> None:
+    def test_calls_the_user_started_all_count_inside_the_active_window(self) -> None:
         # Review 2026-10-04, U-L8: two finishing together could lose one.
         from knowitall2.learning.state import OTHER_CALLS_KEPT, other_calls, record_other_call
 
         for number in range(2 * OTHER_CALLS_KEPT + 1):
             record_other_call(f"find-out {number}", folder=self.root)
         calls = other_calls(self.root)
-        self.assertEqual(OTHER_CALLS_KEPT, len(calls))
+        self.assertEqual(2 * OTHER_CALLS_KEPT + 1, len(calls))
         self.assertEqual(f"find-out {2 * OTHER_CALLS_KEPT}", calls[-1]["session"])
 
     def test_upkeeps_calls_leave_background_learning_its_daily_limit(self) -> None:
@@ -893,7 +894,7 @@ class LearnerTests(LearningTestCase):
         report = self.run_learner(FakeExtractor([]))
         self.assertEqual((1, 0), (report.active, len(report.ready)))
 
-    def test_failures_retry_then_skip_without_blocking_other_sessions(self) -> None:
+    def test_final_failures_stay_pending_without_blocking_other_sessions(self) -> None:
         self.sample_log().write(self.log_path)
         other = self.logs / "C--work-homelab" / "other-session.jsonl"
         LogBuilder(self.project).user("check the NAS").assistant(text("The NAS is fine.")).write(other)
@@ -903,11 +904,12 @@ class LearnerTests(LearningTestCase):
             extractor = FakeExtractor([failing, []] if attempt == 1 else [failing])
             report = self.run_learner(extractor, logs=[self.log_path, other])
             entry = self.state.entry(self.log_path)
-            # Giving up on the failing excerpt starts the count again, for what is added to the log later.
-            self.assertEqual(attempt if attempt < 3 else 0, entry["failures"])
-        self.assertEqual("skipped", entry["status"])
+            self.assertEqual(attempt, entry["final_failures"])
+        self.assertEqual("failed", entry["status"])
+        self.assertEqual(0, entry["settled"])
+        self.assertIn("final", entry["pending_reviews"])
         self.assertEqual("done", self.state.entry(other)["status"])
-        self.assertIn(SESSION, report.skipped)
+        self.assertEqual([], report.skipped)
 
     def long_session(self, calls: int = 200) -> list[str]:
         """A session of several excerpts; returns the marker of each command, in order."""
@@ -933,7 +935,7 @@ class LearnerTests(LearningTestCase):
         self.assertEqual("done", self.state.entry(self.log_path)["status"])
         self.assertIn(markers[-1], rest.dossiers[-1].text)
 
-    def test_only_the_excerpt_that_keeps_failing_is_skipped(self) -> None:
+    def test_a_repeatedly_failing_excerpt_is_preserved_for_retry(self) -> None:
         markers = self.long_session()
         failing = ExtractionError("the answer was not valid JSON")
         first = FakeExtractor([[], failing])
@@ -941,18 +943,19 @@ class LearnerTests(LearningTestCase):
         bad = first.dossiers[1].text
         self.run_learner(FakeExtractor([failing]), quick=True)
         report = self.run_learner(FakeExtractor([failing]), quick=True)
-        self.assertEqual([SESSION], report.skipped)
+        self.assertEqual([], report.skipped)
         entry = self.state.entry(self.log_path)
         self.assertNotEqual("skipped", entry["status"])
-        self.assertEqual(0, entry["failures"])
+        self.assertEqual(3, entry["failures"])
+        entry.pop("quick_retry_at")  # simulate the retry becoming due
         rest = FakeExtractor([[]] * 10)
         self.run_learner(rest, quick=True)
         self.assertEqual("done", self.state.entry(self.log_path)["status"])
         learned = "".join(item.text for item in rest.dossiers)
-        self.assertFalse(any(marker in learned for marker in markers if marker in bad))
+        self.assertTrue(any(marker in learned for marker in markers if marker in bad))
         self.assertIn(markers[-1], learned)
         next_marker = markers[max(index for index, marker in enumerate(markers) if marker in bad) + 1]
-        self.assertIn(next_marker, rest.dossiers[0].text)
+        self.assertIn(next_marker, learned)
 
     def test_a_backend_problem_stops_the_run_without_blaming_sessions(self) -> None:
         self.sample_log().write(self.log_path)
@@ -1527,7 +1530,8 @@ class FakeEngine(FakeExtractor):
         self.inputs.append((step, text))
         answers = self.finals if step == "final" else self.checks
         answer = answers.pop(0) if answers else ({"reviews": [], "memories": []} if step == "final"
-                                                  else {"decisions": []})
+            else {"decisions": [{"index": int(index), "action": "new", "known_id": "", "text": "", "reason": "test"}
+                                for index in re.findall(r"^Candidate (\d+)", text, re.M)]})
         if isinstance(answer, Exception):
             raise answer
         return answer
@@ -1650,7 +1654,7 @@ class TwoPassTests(LearningTestCase):
         [lesson] = self.provisional()
         self.assertEqual("unverified", lesson.verification)
         quiet_longer(self.log_path)
-        self.learn(FakeEngine(checks=[{"decisions": [{"index": 0, "action": "update", "known_id": known.id,
+        self.learn(FakeEngine(finals=[{"reviews": [review("p1", "confirm")], "memories": []}], checks=[{"decisions": [{"index": 0, "action": "update", "known_id": known.id,
                                                       "text": merged, "reason": ""}]}]))
         return self.store.get(known.id), self.store.get(lesson.id)
 
@@ -1691,7 +1695,7 @@ class TwoPassTests(LearningTestCase):
         self.learn(FakeEngine([[self.DNSMASQ]]), quick=True)
         quiet_longer(self.log_path)
         lossy = "On the homelab router, dnsmasq needs a restart after editing /etc/config/dhcp."
-        self.learn(FakeEngine(checks=[{"decisions": [{"index": 0, "action": "update", "known_id": known.id,
+        self.learn(FakeEngine(finals=[{"reviews": [review("p1", "confirm")], "memories": []}], checks=[{"decisions": [{"index": 0, "action": "update", "known_id": known.id,
                                                       "text": lossy, "reason": ""}]}]))
         self.assertEqual("active", self.store.get(known.id).status)
         self.assertEqual([], self.provisional())
@@ -1704,7 +1708,7 @@ class TwoPassTests(LearningTestCase):
         self.learn(FakeEngine([[self.ROUTER]]), quick=True)
         [router] = self.provisional()
         quiet_longer(self.log_path)
-        self.learn(FakeEngine(checks=[{"decisions": [{"index": 0, "action": "repeat", "known_id": known.id,
+        self.learn(FakeEngine(finals=[{"reviews": [review("p1", "confirm")], "memories": []}], checks=[{"decisions": [{"index": 0, "action": "repeat", "known_id": known.id,
                                                       "text": "", "reason": "same"}]}]))
         self.assertEqual(("superseded", known.id), (self.store.get(router.id).status,
                                                     self.store.get(router.id).superseded_by))
@@ -1799,8 +1803,7 @@ class TwoPassTests(LearningTestCase):
         self.learn(FakeEngine(finals=[{"reviews": [wrong], "memories": []}]))
         self.assertEqual("retired", self.store.get(lesson.id).status)
 
-    def test_an_identical_copy_of_a_settled_stretch_lets_its_provisional_memories_stand(self) -> None:
-        # Candidate review, C-L3: the copy's provisional memories waited a week for nothing.
+    def test_a_previously_settled_copy_still_reviews_new_provisional_memories(self) -> None:
         from knowitall2.memory import PROVISIONAL_TAG
 
         copy = self.logs / "C--work-homelab" / "copied-session.jsonl"
@@ -1809,8 +1812,8 @@ class TwoPassTests(LearningTestCase):
         self.sample_log().write(copy)
         saved = self.memory.remember("dnsmasq restarts are needed on the homelab router.", session=SESSION).record
         self.store.set_tags(saved.id, [PROVISIONAL_TAG], now=Clock()())
-        report = self.learn(FakeEngine(), logs=[copy])
-        self.assertGreater(report.outcomes["duplicate dossier"], 0)
+        report = self.learn(FakeEngine(finals=[{"reviews": [review("p1", "confirm")], "memories": []}]), logs=[copy])
+        self.assertEqual(1, report.outcomes["confirmed"])
         self.assertEqual([], self.provisional())
 
     def test_a_provisional_memory_from_outside_the_stretch_is_left_for_its_own(self) -> None:
@@ -1897,7 +1900,7 @@ class TwoPassTests(LearningTestCase):
         self.learn(FakeEngine([[self.ROUTER]]), quick=True)
         quiet_longer(self.log_path)
         merged = "The homelab router runs OpenWrt 23.05.3 and is rebooted every Sunday by cron."
-        self.learn(FakeEngine(checks=[{"decisions": [{"index": 0, "action": "update", "known_id": known.id,
+        self.learn(FakeEngine(finals=[{"reviews": [review("p1", "confirm")], "memories": []}], checks=[{"decisions": [{"index": 0, "action": "update", "known_id": known.id,
                                                       "text": merged, "reason": ""}]}]))
         self.assertEqual("active", self.store.get(known.id).status)
         self.assertNotIn(merged, [row.text for row in self.store.list_active(project_id=None, scope="global",
@@ -1982,15 +1985,15 @@ class TwoPassTests(LearningTestCase):
         report = self.learn(engine)
         self.assertEqual((0, 2), (report.deferred, len(engine.inputs)))
 
-    def test_a_final_pass_that_keeps_failing_lets_the_quick_pass_stand(self) -> None:
+    def test_a_final_pass_that_keeps_failing_never_confirms_the_quick_pass(self) -> None:
         self.sample_log().write(self.log_path, idle=False)
         self.learn(FakeEngine([[self.DNSMASQ]]), quick=True)
         quiet_longer(self.log_path)
         for attempt in range(1, 4):
             report = self.learn(FakeEngine(finals=[ExtractionError("the answer was not valid JSON")]))
-            # Nothing is changed by a failed pass, until the last.
-            self.assertEqual(0 if attempt == 3 else 1, len(self.provisional()))
-        self.assertEqual([SESSION], report.skipped)
+            self.assertEqual(1, len(self.provisional()))
+        self.assertEqual([], report.skipped)
+        self.assertEqual(0, self.state.entry(self.log_path)["settled"])
         self.assertEqual(1, len(self.store.list_active(project_id=None, scope="global", limit=5)))
 
     def test_provisional_memories_left_by_a_chat_never_settled_stand_after_a_week(self) -> None:

@@ -197,6 +197,7 @@ class KnowItAll2Server(ThreadingHTTPServer):
         self._proxies = _networks(trusted_proxy)
         self.join_guard = Throttle()
         self.signin_guard = Throttle()
+        self.export_slots = threading.BoundedSemaphore(2)
         self._proxy_noted = False
         self.housekeeping_seconds = housekeeping_seconds
         self.housekeeping_delay = housekeeping_delay
@@ -449,9 +450,14 @@ class ServerHandler(BaseHTTPRequestHandler):
                    extra)
 
     def _send(self, status: HTTPStatus, data: bytes, kind: str, extra: dict[str, str] | None = None) -> None:
+        self._headers(status, len(data), kind, extra)
+        if not self._head_only:
+            self.wfile.write(data)
+
+    def _headers(self, status: HTTPStatus, length: int, kind: str, extra: dict[str, str] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", kind)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -464,8 +470,41 @@ class ServerHandler(BaseHTTPRequestHandler):
         if self.close_connection:
             self.send_header("Connection", "close")
         self.end_headers()
-        if not self._head_only:
-            self.wfile.write(data)
+
+    def export(self, make_copy, *, prefix: str, extra: dict[str, str] | None = None) -> None:
+        """Bound snapshots and stream them, retaining the slot and file through disconnection cleanup."""
+        if not self.server.export_slots.acquire(blocking=False):
+            raise RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "two exports are already running; try again later")
+        target = None
+        headers_sent = False
+        try:
+            folder = self.server.home / "tmp"
+            folder.mkdir(parents=True, exist_ok=True)
+            handle, name = tempfile.mkstemp(prefix=prefix, suffix=".db", dir=folder)
+            os.close(handle)
+            target = Path(name)
+            latest = make_copy(self.server.database, target)
+            headers = dict(extra or {})
+            if isinstance(latest, int):
+                headers[CHANGES_HEADER] = str(latest)
+            with target.open("rb") as source:
+                self._headers(HTTPStatus.OK, target.stat().st_size, "application/vnd.sqlite3", headers)
+                headers_sent = True
+                if not self._head_only:
+                    while chunk := source.read(64 * 1024):
+                        self.wfile.write(chunk)
+        except OSError as exc:
+            if headers_sent:
+                self.close_connection = True
+                if not isinstance(exc, ConnectionError):
+                    raise ConnectionError("database stream interrupted after response headers") from exc
+            raise
+        finally:
+            try:
+                if target is not None:
+                    target.unlink(missing_ok=True)
+            finally:
+                self.server.export_slots.release()
 
 
 # --- Routes ---
@@ -583,17 +622,7 @@ def _copy(handler: ServerHandler, query: dict[str, list[str]], body: dict[str, A
         handler.authenticated(store)
     finally:
         store.close()
-    folder = handler.server.home / "tmp"
-    folder.mkdir(parents=True, exist_ok=True)
-    handle, name = tempfile.mkstemp(prefix="copy-", suffix=".db", dir=folder)
-    os.close(handle)
-    target = Path(name)
-    try:
-        latest = exchange.make_copy(handler.server.database, target)
-        data = target.read_bytes()
-    finally:
-        target.unlink(missing_ok=True)
-    handler._send(HTTPStatus.OK, data, "application/vnd.sqlite3", {CHANGES_HEADER: str(latest)})
+    handler.export(exchange.make_copy, prefix="copy-")
 
 
 ROUTES: dict[tuple[str, str], Callable[[ServerHandler, dict[str, list[str]], dict[str, Any]], None]] = {

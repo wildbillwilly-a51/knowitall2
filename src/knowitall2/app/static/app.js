@@ -366,7 +366,8 @@ function summarySentence(data) {
 function sharingLine(sharing) {
   const synced = sharing.last_success ? `last synced ${when(sharing.last_success)}` : 'not synced yet';
   const waiting = sharing.unsent ? '; some changes made here are waiting to be sent' : '';
-  return `Memory is shared through the KnowItAll2 server at ${sharing.address}: ${synced}${waiting}.`;
+  const refused = sharing.unresolved_rejections ? `; ${sharing.unresolved_rejections} refused changes need review` : '';
+  return `Memory is shared through the KnowItAll2 server at ${sharing.address}: ${synced}${waiting}${refused}.`;
 }
 
 function renderOverview(data) {

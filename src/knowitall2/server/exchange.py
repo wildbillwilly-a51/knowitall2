@@ -123,6 +123,8 @@ def _apply_one(store: Store, connection_id: str, operation: object, now: str) ->
         # Not remembered: the same operation may succeed later, such as once its project has arrived.
         refused: dict[str, Any] = {"op_id": op_id, "result": "rejected", "reason": _plain_reason(exc),
                                    "retry": isinstance(exc, sqlite3.IntegrityError) and "FOREIGN KEY" in str(exc)}
+        if isinstance(exc, InvalidBase):
+            refused.update(code="invalid_base", retry=True)
         current = _current(connection, operation)
         if current is not None:
             refused["row"], refused["seq"] = current
@@ -176,6 +178,10 @@ def _plain_reason(error: Exception) -> str:
     return str(error)
 
 
+class InvalidBase(SyncError):
+    """A client can safely forget this row's claimed revision and resend for conflict resolution."""
+
+
 def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], now: str) -> dict[str, Any]:
     connection = store.connection
     table = table_for(operation.get("table"))
@@ -184,6 +190,8 @@ def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], n
     if base is not None and (isinstance(base, bool) or not isinstance(base, int)):
         raise SyncError("base must be a change number")
     existing = read_row(connection, table, key)
+    if base is not None and (base < 0 or base > _latest_seq(connection, table.name, key)):
+        raise InvalidBase("base must be a nonnegative revision no later than this row's server revision")
     if operation.get("op") == "delete":
         if not table.deletable:
             raise SyncError(f"{table.name} are never deleted")

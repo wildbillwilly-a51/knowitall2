@@ -161,7 +161,7 @@ def learn(memory, state: LearnerState, extractor, dossiers: list[Dossier], *, ma
                 candidates = extractor.extract(dossier)
             except ExtractionError as exc:
                 report.calls += 1
-                state.record_call(at=at, session=dossier.session_id, outcome="failed")
+                state.record_call(at=datetime.now(timezone.utc), session=dossier.session_id, outcome="failed", origin="user")
                 if exc.blocking:
                     report.blocked = str(exc)
                     break
@@ -170,7 +170,7 @@ def learn(memory, state: LearnerState, extractor, dossiers: list[Dossier], *, ma
             finally:
                 report.usage.update(getattr(extractor, "last_usage", None) or {})
             report.calls += 1
-            state.record_call(at=at, session=dossier.session_id, outcome="ok")
+            state.record_call(at=datetime.now(timezone.utc), session=dossier.session_id, outcome="ok", origin="user")
             for candidate in candidates:
                 outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
                 report.outcomes[outcome] += 1

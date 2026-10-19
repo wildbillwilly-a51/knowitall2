@@ -154,6 +154,7 @@ class FakeEngineTests(unittest.TestCase):
         self.engine = write_fake_engine(root / "engine")
         self.record = root / "record.json"
         environment = mock.patch.dict(os.environ, {
+            "KNOWITALL2_HOME": str(root / "home"),
             "KNOWITALL2_FAKE_ENGINE_RECORD": str(self.record),
             # npm's script runs its program by name, as it would run node.
             "PATH": str(PYTHON.parent) + os.pathsep + os.environ.get("PATH", ""),
@@ -202,7 +203,8 @@ class FakeEngineTests(unittest.TestCase):
                 pids = json.loads(self.record.read_text(encoding="utf-8"))["pids"]
                 self.addCleanup(stop, pids)
                 self.assertIn("timed out", str(caught.exception))
-                self.assertFalse(caught.exception.blocking)
+                self.assertTrue(caught.exception.blocking)
+                self.assertEqual("timeout", caught.exception.category)
                 self.assertLess(elapsed, 5)
                 self.assertEqual([], still_running(pids))
 

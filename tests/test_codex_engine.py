@@ -79,13 +79,14 @@ class CodexEngineTests(unittest.TestCase):
                 CodexCliExtractor(Path("codex.exe"), runner=runner).run("text", schema=OUTPUT_SCHEMA, system_prompt="p")
             self.assertEqual(blocking, caught.exception.blocking)
 
-    def test_a_timeout_blames_the_session(self) -> None:
+    def test_a_timeout_pauses_the_backend_without_settling_the_session(self) -> None:
         def slow(command, **options):
             raise subprocess.TimeoutExpired(command, 1)
 
         with self.assertRaises(ExtractionError) as caught:
             CodexCliExtractor(Path("codex.exe"), runner=slow).run("text", schema=OUTPUT_SCHEMA, system_prompt="p")
-        self.assertFalse(caught.exception.blocking)
+        self.assertTrue(caught.exception.blocking)
+        self.assertEqual("timeout", caught.exception.category)
 
     def test_the_engine_does_not_inherit_a_codex_sessions_variables(self) -> None:
         environment = codex_engine_environment({

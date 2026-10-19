@@ -27,8 +27,11 @@ computer, then, inside it:
 docker compose -f deploy/compose.yaml up -d --build
 ```
 
-This builds a small image and starts the server on port 4191. To use another
-port, change the first number under `ports:` in `deploy/compose.yaml`.
+This builds a small image and starts the server on loopback port 4191.
+For access from another computer or proxy, explicitly set
+`KNOWITALL2_BIND_ADDRESS` to the trusted host interface it reaches. Use HTTPS
+or a trusted encrypted transport for remote traffic. To use another port,
+change the host port under `ports:` in `deploy/compose.yaml`.
 
 ## 2. Create the admin account
 
@@ -39,7 +42,7 @@ When it starts without an admin account, the server prints a one-time
 docker compose -f deploy/compose.yaml logs knowitall2
 ```
 
-Open `http://<that computer>:4191/` in a browser, enter the setup code, and
+Open `http://127.0.0.1:4191/` on the server (or its configured HTTPS address), enter the setup code, and
 choose a username and a password for the server's admin account. Only
 someone who can read the server's log can do this, so nobody else on your
 network gets there first. The code works once; each start without an admin

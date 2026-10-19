@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.4 (2026-10-18)
+
+- **Backend allowance failures preserve pending learning.** Structured quota
+  errors and session/weekly limit responses pause all automatic native model
+  consumers using durable reset-aware backoff. Explicit probes remain possible.
+- **Failed or incomplete final reviews never become completed progress.** Quick,
+  final and recovery failures stay separate; duplicate transcripts, bounded
+  reviews and malformed reconciliation cannot silently confirm unreviewed work.
+- **Historical recovery is explicit and resumable.** Hash-bound manifests keep
+  ordinary cursors intact, include approved failed maintenance snapshots, and
+  rereview learned records without overriding user-authoritative memories.
+- **Usage accounting keeps the entire active budget window** and timestamps
+  calls individually. Rejected native attempts have a separate durable ledger.
+- **Refused sync changes remain recoverable and visible.** Local edits are
+  quarantined instead of overwritten, with safe retry/dismiss and connection
+  lifecycle handling. Negative and future row revisions are rejected.
+- **Database downloads stream within a concurrency limit.** Compose binds to
+  loopback by default; project knowledge-file exports have per-project controls
+  and location visibility. Existing hook installation safety remains enforced.
+
 ## 0.11.3 (2026-10-17)
 
 - **Learning preserves complete statements and technical spelling.**

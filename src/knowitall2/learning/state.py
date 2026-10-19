@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,7 @@ FORMER_CLAUDE_MODELS = ("haiku",)
 MAX_FAILURES = 3
 # Not "lock", which earlier versions created and deleted: during an update, runs of the two never mix.
 LOCK_FILE = "run.lock"
-CALL_HISTORY_KEPT = 500
+CALL_HISTORY_DAYS = 7  # never discard calls inside an active 24-hour budget window by count
 FINGERPRINTS_KEPT = 5000
 # A log missing this long after its entry last changed is forgotten (its sessions were deleted).
 FORGET_MISSING_LOGS_DAYS = 90
@@ -124,6 +125,7 @@ class LearnerState:
         self.logs: dict[str, dict[str, Any]] = data.get("logs", {}) if isinstance(data, dict) else {}
         self.calls: list[dict[str, Any]] = data.get("calls", []) if isinstance(data, dict) else []
         self.fingerprints: list[str] = data.get("fingerprints", []) if isinstance(data, dict) else []
+        self.review_resets: list[dict] = data.get("review_resets", []) if isinstance(data, dict) else []
         self._seen = set(self.fingerprints)
 
     def seen(self, fingerprint: str) -> bool:
@@ -142,14 +144,23 @@ class LearnerState:
 
     def entry(self, log: Path) -> dict[str, Any]:
         key = os.path.normcase(str(log))
+        if key not in self.logs:
+            resolved = os.path.normcase(os.path.realpath(log))
+            for existing in self.logs:
+                if (Path(existing).name.casefold() == log.name.casefold()
+                        and os.path.normcase(os.path.realpath(existing)) == resolved):
+                    return self.logs[existing]
         return self.logs.setdefault(key, {"offset": 0, "status": "new", "failures": 0})
 
     def record_call(self, *, at: datetime, session: str, outcome: str, origin: str | None = None) -> None:
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
         call = {"at": at.isoformat(), "session": session, "outcome": outcome}
         if origin:
             call["origin"] = origin
         self.calls.append(call)
-        del self.calls[:-CALL_HISTORY_KEPT]
+        cutoff = at - timedelta(days=CALL_HISTORY_DAYS)
+        self.calls[:] = [item for item in self.calls if _recent_call(item, cutoff)]
 
     def calls_since(self, moment: datetime, *, origins: Collection[str] | None = None) -> int:
         """Model calls since ``moment``: the learner's, and those the user started (they count, but wait for no limit).
@@ -164,7 +175,8 @@ class LearnerState:
             if origins is not None and call_origin(call) not in origins:
                 continue
             try:
-                if datetime.fromisoformat(call["at"]) >= moment:
+                at = datetime.fromisoformat(call["at"])
+                if moment <= (at if at.tzinfo else at.replace(tzinfo=timezone.utc)):
                     count += 1
             except (KeyError, TypeError, ValueError):
                 continue
@@ -181,8 +193,17 @@ class LearnerState:
         for key in [key for key, entry in self.logs.items()
                     if str(entry.get("updated_at") or "9999") < cutoff and not os.path.exists(key)]:
             del self.logs[key]
-        document = {"schema_version": 1, "logs": self.logs, "calls": self.calls, "fingerprints": self.fingerprints}
+        document = {"schema_version": 1, "logs": self.logs, "calls": self.calls, "fingerprints": self.fingerprints,
+                    "review_resets": self.review_resets}
         write_text_atomic(self.path, json.dumps(document, indent=2) + "\n")
+
+
+def _recent_call(call: dict, cutoff: datetime) -> bool:
+    try:
+        at = datetime.fromisoformat(call["at"])
+        return (at if at.tzinfo else at.replace(tzinfo=timezone.utc)) >= cutoff
+    except (ValueError, KeyError, TypeError):
+        return False
 
 
 OTHER_CALLS_FILE = "other-calls.jsonl"
@@ -196,14 +217,13 @@ def record_other_call(what: str, *, at: datetime | None = None, folder: Path | N
     """
 
     path = (folder if folder is not None else data_home() / "learner") / OTHER_CALLS_FILE
-    moment = (at or datetime.now(timezone.utc)).isoformat()
+    now = at or datetime.now(timezone.utc)
+    moment = now.isoformat()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Appended, so two calls finishing together both count; trimmed now and then, which drops only old lines.
-    with open(path, "a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps({"at": moment, "session": what, "outcome": "ok", "origin": "user"}) + "\n")
-    calls = other_calls(path.parent)
-    if len(calls) > 2 * OTHER_CALLS_KEPT:
-        write_text_atomic(path, "\n".join(json.dumps(call) for call in calls[-OTHER_CALLS_KEPT:]) + "\n")
+    with waiting_lock(path.with_suffix(".lock")):
+        calls = [item for item in other_calls(path.parent) if _recent_call(item, now - timedelta(days=CALL_HISTORY_DAYS))]
+        calls.append({"at": moment, "session": what, "outcome": "ok", "origin": "user"})
+        write_text_atomic(path, "\n".join(json.dumps(call) for call in calls) + "\n")
 
 
 def other_calls(folder: Path) -> list[dict[str, Any]]:
@@ -267,6 +287,25 @@ class RunLock:
             return False
         finally:
             os.close(handle)
+
+
+@contextmanager
+def waiting_lock(path: Path, *, timeout: float = 5.0):
+    """Short bookkeeping lock; contention must not masquerade as another learning run."""
+    deadline = time.monotonic() + timeout
+    lock = RunLock(path)
+    while True:
+        try:
+            lock.__enter__()
+            break
+        except LockBusy:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+    try:
+        yield lock
+    finally:
+        lock.__exit__()
 
 
 def _try_lock(handle: int) -> bool:

@@ -1,8 +1,7 @@
 """Learn durable memories from finished session logs, in the background.
 
-A failure stays with its own session: it is retried on later runs, and the
-excerpt that keeps failing is skipped after repeated failures in a row, so one
-bad excerpt can never block the rest of its session, other logs, or learning.
+A failure stays with its range: retries back off while the range remains
+unreviewed. Other logs can proceed. Only a successful review advances settlement.
 """
 
 from __future__ import annotations
@@ -252,6 +251,10 @@ class ReadySession:
     dossiers: int
     characters: int
     duplicates: int = 0
+    start: int = 0
+    end: int = 0
+    event_index: int = 0
+    end_event_index: int = 0
 
 
 @dataclass
@@ -323,7 +326,7 @@ def learn(
     active, for learning at the moment something happens.
     """
 
-    from .settle import PART_CHARACTERS, confirm_session, needed_calls, settle
+    from .settle import PART_CHARACTERS, needed_calls, settle
 
     moment = now or datetime.now(timezone.utc)
     settled_since = moment - timedelta(minutes=settings.settle_minutes)
@@ -349,17 +352,29 @@ def learn(
         set_aside_before = moment - timedelta(days=SET_ASIDE_DAYS)
         for log, status in found:
             entry = state.entry(log)
+            recovery = next(iter(entry.get("recovery_ranges", [])), None) if not quick else None
             if SETTLED not in entry:
                 # Learned before 0.11: what was read then was learned for good.
                 entry[SETTLED] = int(entry.get("offset", 0))
             start = int(entry.get("offset", 0)) if quick else int(entry[SETTLED])
+            if recovery:
+                from .recovery import prefix_hash
+                if prefix_hash(log, recovery["end"]) != recovery["sha256"]:
+                    report.blocked = f"recovery transcript changed: {log}; prepare a new recovery plan"
+                    break
+                start = int(recovery["cursor"])
+            phase = "recovery" if recovery else "quick" if quick else "final"
+            retry_at = entry.get(f"{phase}_retry_at")
+            if retry_at and datetime.fromisoformat(retry_at) > moment:
+                report.deferred += 1
+                continue
             if status.st_size <= start:
                 continue
             active_at = datetime.fromtimestamp(status.st_mtime, tz=timezone.utc)
-            if not right_away and active_at > settled_since:
+            if not recovery and not right_away and active_at > settled_since:
                 report.active += 1
                 continue
-            if (not right_away and active_at < set_aside_before and not entry.get("caught_up_at")
+            if (not recovery and not right_away and active_at < set_aside_before and not entry.get("caught_up_at")
                     and _set_aside(entry, log, moment)):
                 report.set_aside += 1
                 continue
@@ -368,8 +383,8 @@ def learn(
                 report.deferred += 1
                 continue
             # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
-            session, end = read_session(log, start=start, stop=int(entry.get(LEARN_TO) or 0) or None)
-            event_index = int(entry.get("event_index" if quick else SETTLED_EVENT_INDEX, 0))
+            session, end = read_session(log, start=start, stop=recovery["end"] if recovery else int(entry.get(LEARN_TO) or 0) or None)
+            event_index = int(recovery["cursor_event_index"] if recovery else entry.get("event_index" if quick else SETTLED_EVENT_INDEX, 0))
             session.events = [event for event in session.events if event.start != start or event.index >= event_index]
             dossiers = build_dossiers(session, require_user=start == 0 and event_index == 0,
                                       **({} if quick else {"budget": PART_CHARACTERS}))
@@ -388,17 +403,22 @@ def learn(
             # What the final pass settled is told apart from what the quick pass read: the same text, read again.
             prints = [item.fingerprint if quick else SETTLED_PRINT + item.fingerprint for item in dossiers]
             duplicates = [item for item, mark in zip(dossiers, prints) if state.seen(mark) or mark in run_seen]
+            if recovery:
+                duplicates = []  # replay the approved range even when some of its content was reviewed elsewhere
+            if not quick and memory is not None and memory.store.tagged_active(PROVISIONAL_TAG, session=session.session_id):
+                duplicates = []  # newly provisional records still need decisions, even for previously reviewed text
             if not quick and len(duplicates) < len(dossiers):
                 duplicates = []   # a stretch is settled whole: only an identical copy of all of it is skipped
-            run_seen.update(prints)
             report.ready.append(ReadySession(
                 session.session_id, log, len(dossiers), sum(len(item.text) for item in dossiers), len(duplicates),
+                start, end, event_index, dossiers[-1].end_event_index if dossiers else 0,
             ))
             if dry_run:
                 continue
             if not dossiers:
-                if not quick and memory is not None:
-                    confirm_session(memory, session.session_id)
+                if recovery:
+                    _finish_recovery(entry, recovery, end, 0)
+                    continue
                 _finish(entry, session.session_id, end, moment, settled=not quick)
                 continue
             if extractor is None:
@@ -407,7 +427,6 @@ def learn(
             if not quick and duplicates:
                 # The same stretch was settled already, from another copy of the log.
                 report.outcomes["duplicate dossier"] += len(dossiers)
-                confirm_session(memory, session.session_id)
                 _finish(entry, session.session_id, end, moment, settled=True,
                         event_index=dossiers[-1].end_event_index if dossiers else 0)
                 continue
@@ -420,33 +439,31 @@ def learn(
 
                 def counted() -> None:
                     made.append(1)
-                    state.record_call(at=moment, session=session.session_id, outcome="ok", origin=origin)
+                    state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="ok", origin=origin)
 
                 try:
                     settled = settle(memory, extractor, dossiers, session=session, run=run, on_call=counted,
-                                     partial=partial)
+                                     partial=partial or bool(entry.get(LEARN_TO)), recovery=bool(recovery))
                 except ExtractionError as exc:
                     report.calls += len(made)
                     if exc.blocking:
                         # The backend itself is unusable: blame no session, stop the run.
+                        _pending_review(entry, phase, start, event_index, end, dossiers[-1].end_event_index,
+                                        session.session_id, moment, exc)
                         report.blocked = str(exc)
                         break
                     journal.problem("learning", f"a final pass failed for session {session.session_id}: {exc}")
-                    report.calls += 1
-                    state.record_call(at=moment, session=session.session_id, outcome="failed", origin=origin)
-                    entry["failures"] = int(entry.get("failures", 0)) + 1
+                    # Validation may fail after settle already counted the completed request.
+                    if not exc.counted:
+                        report.calls += 1
+                        state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="failed", origin=origin)
+                    entry[f"{phase}_failures"] = int(entry.get(f"{phase}_failures", 0)) + 1
                     entry["last_error"] = str(exc)[:300]
                     entry["updated_at"] = moment.isoformat()
-                    if entry["failures"] >= MAX_FAILURES:
-                        # Give up on this stretch: what the quick pass saved stands.
-                        confirm_session(memory, session.session_id)
-                        _finish(entry, session.session_id, end, moment, settled=True,
-                        event_index=dossiers[-1].end_event_index if dossiers else 0)
-                        entry["status"] = "skipped"
-                        report.skipped.append(session.session_id)
-                    else:
-                        entry["status"] = "failed"
-                        report.failed.append(session.session_id)
+                    _pending_review(entry, phase, start, event_index, end, dossiers[-1].end_event_index,
+                                    session.session_id, moment, exc)
+                    entry["status"] = "failed"
+                    report.failed.append(session.session_id)
                     continue
                 except (sqlite3.Error, StoreError, OSError) as exc:
                     report.calls += len(made)
@@ -459,6 +476,10 @@ def learn(
                 report.results.extend(settled.results)
                 for mark in prints:
                     state.mark_seen(mark)
+                    run_seen.add(mark)
+                if recovery:
+                    _finish_recovery(entry, recovery, end, dossiers[-1].end_event_index if dossiers else 0)
+                    continue
                 _finish(entry, session.session_id, end, moment, settled=True,
                         event_index=dossiers[-1].end_event_index if dossiers else 0)
                 continue
@@ -483,38 +504,36 @@ def learn(
                         report.usage.update(getattr(extractor, "last_usage", None) or {})
                     budget -= 1
                     report.calls += 1
-                    state.record_call(at=moment, session=session.session_id, outcome="ok", origin=origin)
+                    state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="ok", origin=origin)
                     for candidate in candidates:
                         outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run, provisional=True)
                         report.outcomes[outcome] += 1
                         report.results.append({"outcome": outcome, "ids": record_ids,
                                                "text": result_text(outcome, candidate)})
                     state.mark_seen(dossier.fingerprint)
+                    run_seen.add(dossier.fingerprint)
                     progress = _checkpoint(dossier)
             except ExtractionError as exc:
                 if progress is not None:
                     entry.update(progress)
                 if exc.blocking:
                     # The backend itself is unusable: keep progress, blame no session, stop the run.
+                    _pending_review(entry, phase, int(entry.get("offset", start)), int(entry.get("event_index", 0)),
+                                    end, dossiers[-1].end_event_index, session.session_id, moment, exc)
                     report.blocked = str(exc)
                     break
                 journal.problem("learning", f"a learning call failed for session {session.session_id}: {exc}")
                 report.calls += 1
-                state.record_call(at=moment, session=session.session_id, outcome="failed", origin=origin)
+                state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="failed", origin=origin)
                 # Only failures in a row count: a run that got further first starts the count again.
                 entry["failures"] = 1 if progress is not None else int(entry.get("failures", 0)) + 1
                 entry["last_error"] = str(exc)[:300]
                 entry["updated_at"] = moment.isoformat()
-                if entry["failures"] >= MAX_FAILURES:
-                    # Give up on the excerpt that keeps failing, not on the rest of the session.
-                    last = current is None or current is dossiers[-1]
-                    entry.update({"offset": end, "event_index": 0} if last else _checkpoint(current))
-                    entry["failures"] = 0
-                    entry["status"] = "skipped" if last else "partial"
-                    report.skipped.append(session.session_id)
-                else:
-                    entry["status"] = "failed"
-                    report.failed.append(session.session_id)
+                failed_start = int(entry.get("offset", start))
+                _pending_review(entry, phase, failed_start, int(entry.get("event_index", 0)), end,
+                                dossiers[-1].end_event_index, session.session_id, moment, exc)
+                entry["status"] = "failed"
+                report.failed.append(session.session_id)
                 continue
             except (sqlite3.Error, StoreError, OSError) as exc:
                 # The memory store failed (a write held too long by another process, say): keep what this
@@ -1307,6 +1326,35 @@ def _checkpoint(dossier: Dossier) -> dict[str, int]:
     return {"offset": dossier.end_offset, "event_index": dossier.end_event_index}
 
 
+def _finish_recovery(entry, item, end, event_index):
+    """Recovery has its own progress; it never rewinds or falsely advances ordinary cursors."""
+    item.update(cursor=end, cursor_event_index=event_index)
+    entry["recovery_failures"] = 0
+    entry.pop("recovery_retry_at", None)
+    entry.get("pending_reviews", {}).pop("recovery", None)
+    if end >= item["end"]:
+        entry.setdefault("recovery_completed", []).append(item["id"])
+        entry["recovery_ranges"].remove(item)
+
+
+def _pending_review(entry, phase, start, event_index, end, end_index, session_id, moment, error):
+    """Keep failed work reachable. A pause is never a completed review."""
+    from ..secrets import redact
+    entry["session_id"] = session_id
+    previous = entry.setdefault("pending_reviews", {}).get(phase, {})
+    attempts = int(previous.get("attempts", 0)) + int(getattr(error, "attempted", True))
+    timeouts = int(previous.get("timeouts", 0)) + int(getattr(error, "category", "") == "timeout")
+    entry["pending_reviews"][phase] = {
+        "start": start, "event_index": event_index, "end": end, "end_event_index": end_index,
+        "reason": redact(str(error))[:300], "at": moment.isoformat(), "attempts": attempts, "timeouts": timeouts,
+        "category": getattr(error, "category", "content"),
+    }
+    counter = f"{phase}_failures" if phase != "quick" else "failures"
+    failures = max(entry.get(counter, 0), timeouts)
+    if failures >= MAX_FAILURES:
+        entry[f"{phase}_retry_at"] = (moment + timedelta(hours=min(24, 2 ** min(5, failures - MAX_FAILURES)))).isoformat()
+
+
 def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime, *, settled: bool = False, event_index: int = 0) -> None:
     """Note that ``entry``'s log was read up to ``end``: by the quick pass, or (``settled``) by the final pass,
     which also leaves the quick pass nothing before it to read."""
@@ -1323,6 +1371,11 @@ def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime, 
         entry[SETTLED], entry[SETTLED_EVENT_INDEX] = end, event_index
         previous = (int(entry.get("offset", 0)), int(entry.get("event_index", 0)))
         end, event_index = max((end, event_index), previous)
+        entry["final_failures"] = 0
+        entry.pop("final_retry_at", None)
+        entry.get("pending_reviews", {}).pop("final", None)
+    entry.pop("quick_retry_at", None)
+    entry.get("pending_reviews", {}).pop("quick", None)
     entry.update(
         {"session_id": session_id, "offset": end, "event_index": event_index,
          "status": "partial" if event_index else "done", "failures": 0, "last_error": None,

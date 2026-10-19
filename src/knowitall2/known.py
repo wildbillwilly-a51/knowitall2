@@ -616,6 +616,8 @@ def held_back(root: Path, *, places: Sequence[str] | None = None, allow_synced: 
     """
 
     key = _key(root.resolve())
+    if project_policies().get(key) is False:
+        return "knowledge-file export is disabled for this project"
     if not (_synced_allowed() if allow_synced is None else allow_synced):
         for place in synced_places() if places is None else places:
             if key == place or key.startswith(place.rstrip("\\/") + os.sep):
@@ -927,7 +929,7 @@ def _held_marker() -> str:
     """What the holds depend on: the setting, and the files that decide in each folder worked in (about 10 ms for
     60 folders, measured 2026-10-13)."""
 
-    parts = [str(_synced_allowed())]
+    parts = [str(_synced_allowed()), json.dumps(project_policies(), sort_keys=True)]
     for key in sorted(_recent(_read_worked()["folders"], _now())):
         if key.startswith(("\\\\", "//")):
             continue   # a network share that is away would hold up every hook (second candidate review, D-L6)
@@ -1092,6 +1094,29 @@ def set_enabled(on: bool) -> None:
         data.pop("known_files", None)
     else:
         data["known_files"] = False
+    write_text_atomic(path, json.dumps(data, indent=2) + "\n")
+
+
+def project_policies() -> dict[str, bool]:
+    try:
+        value = json.loads(read_text(data_home() / "config.json")).get("known_files_projects", {})
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def set_project_enabled(root: Path, on: bool) -> None:
+    path = data_home() / "config.json"
+    try:
+        data = json.loads(read_text(path))
+    except FileNotFoundError:
+        data = {}
+    policies = project_policies()
+    if on:
+        policies.pop(_key(root.resolve()), None)
+    else:
+        policies[_key(root.resolve())] = False
+    data["known_files_projects"] = policies
     write_text_atomic(path, json.dumps(data, indent=2) + "\n")
 
 
@@ -1351,7 +1376,7 @@ def find_pointers(connection: sqlite3.Connection, texts: Sequence[str], folder: 
     lacks, so the next mention finds it instead of pointing nowhere.
     """
 
-    if not ours(folder):
+    if project_policies().get(_key(folder.parent.resolve())) is False or not ours(folder):
         return []
     table = name_table(connection)
     if not table:
@@ -1448,7 +1473,7 @@ def folder_line(project_path: str | os.PathLike[str] | None) -> str | None:
     from .identity import find_git_root
 
     root = find_git_root(Path(project_path))
-    if root is None or not ours(root / FOLDER):
+    if root is None or project_policies().get(_key(root.resolve())) is False or not ours(root / FOLDER):
         return None
     return (f"What KnowItAll2 knows about this project and the systems it uses is also in {FOLDER}/ in this project "
             f"({INDEX} lists the files): search it like any project file.")
@@ -1775,6 +1800,23 @@ def run_command(arguments: Any) -> int:
 
     from .store import Store, StoreError
 
+    if getattr(arguments, "list", False):
+        status = read_status()
+        print(json.dumps({"enabled": enabled(), "project_policies": project_policies(),
+                          "written_folders": list(_owned(status).values()), "held": status.get("held", [])}, indent=2))
+        return 0
+    if getattr(arguments, "project", None):
+        from .identity import find_git_root
+        root = find_git_root(Path(arguments.project))
+        if root is None or not (arguments.off or arguments.on):
+            print("Use --project with a Git project folder and --off or --on.")
+            return 1
+        set_project_enabled(root, arguments.on)
+        if arguments.off:
+            print("\n".join([*remove_folder(root), f"Knowledge-file export is disabled in {root}."]))
+        else:
+            print(f"Knowledge-file export is allowed in {root}; the next refresh will write it if globally enabled.")
+        return 0
     try:
         store = Store.open(database_path())
     except StoreError as exc:

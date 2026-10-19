@@ -41,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     syncing = commands.add_parser("sync", help="send and fetch shared memories now (when connected to a server)")
     syncing.add_argument("--agent", help="the agent whose key to use (default: any connected agent here)")
     syncing.add_argument("--quiet", action="store_true", help="say nothing unless something went wrong")
+    resolving = syncing.add_mutually_exclusive_group()
+    resolving.add_argument("--rejections", action="store_true", help="list unresolved rejected changes, without syncing")
+    resolving.add_argument("--retry-rejected", metavar="ID", help="retry corrected local content for this rejection")
+    resolving.add_argument("--dismiss-rejected", metavar="ID", help="dismiss this rejection and re-fetch the server version")
 
     remember = commands.add_parser("remember", help="save a memory")
     remember.add_argument("text")
@@ -135,6 +139,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--enable", action="store_true", help="turn learning on (the user's consent)")
     mode.add_argument("--disable", action="store_true", help="turn learning off")
     mode.add_argument("--status", action="store_true", help="show learning settings and progress")
+    mode.add_argument("--recovery-plan", type=Path, metavar="FILE", help="write a read-only historical recovery manifest")
+    mode.add_argument("--recover", type=Path, metavar="FILE", help="queue ranges from a reviewed recovery manifest")
+    learn.add_argument("--allow-whole-session", action="store_true",
+                       help="with --recover: explicitly approve conservative whole-session rereviews")
     mode.add_argument("--requests", action="store_true",
                       help="learn only the sessions agents asked to learn now (the agent hooks use this)")
     mode.add_argument(
@@ -149,6 +157,8 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("--since", metavar="YYYY-MM-DD", help="with --catch-up: only sessions active since this date")
     learn.add_argument("--ignore-daily-limit", action="store_true",
                        help="for this one run, learn waiting sessions without the daily limit (the user's choice)")
+    learn.add_argument("--retry-backend", action="store_true",
+                       help="explicitly probe a paused backend once; a new rejection reinstates its pause")
     learn.add_argument("--estimate", action="store_true",
                        help="with --catch-up FOLDER or --documents: only show how many model calls it would take")
     learn.add_argument("--max-calls", type=int, metavar="N",
@@ -210,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     switch.add_argument("--off", action="store_true", help="take the files out of every project and keep them out")
     switch.add_argument("--on", action="store_true", help="write the files again after --off")
     known.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
+    known.add_argument("--project", type=Path, metavar="FOLDER", help="apply --off/--on only to this project")
+    known.add_argument("--list", action="store_true", help="list exported folders and project export controls")
 
     commands.add_parser("version", help="print the version")
     return parser

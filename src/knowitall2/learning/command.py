@@ -52,6 +52,9 @@ _ENGINE_NAMES = {"claude-cli": "Claude Code", "codex-cli": "Codex"}
 
 
 def run_learn(arguments: argparse.Namespace) -> int:
+    if getattr(arguments, "recovery_plan", None) or getattr(arguments, "recover", None):
+        from .recovery import run
+        return run(arguments)
     settings = load_settings()
     if arguments.enable or arguments.disable:
         return _set_learning(settings, arguments)
@@ -69,7 +72,8 @@ def run_learn(arguments: argparse.Namespace) -> int:
     state = LearnerState()
     if arguments.dry_run:
         report = learn(
-            logs=session_logs(), state=state, settings=settings,
+            logs=list(dict.fromkeys([*session_logs(), *(Path(path) for path, entry in state.logs.items()
+                                                       if entry.get("recovery_ranges"))])), state=state, settings=settings,
             memory_factory=None, extractor=None, dry_run=True,
         )
         print(report.describe(dry_run=True))
@@ -88,6 +92,7 @@ def run_learn(arguments: argparse.Namespace) -> int:
         _tell_waiting_requests(settings, f"no {_engine_name(settings.backend)} engine was found on this computer")
         print(f"knowitall2: {message}", file=sys.stderr)
         return 1
+    extractor.retry_backend_once = bool(getattr(arguments, "retry_backend", False))
     if getattr(arguments, "ignore_daily_limit", False):
         # The user chose to learn what is waiting now: one run without the daily limit.
         settings = work_limits(settings)
@@ -127,6 +132,9 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
     state = LearnerState()
     store = Store.open(database_path())
     try:
+        if state.review_resets:
+            from .recovery import reset_reviews
+            reset_reviews(store, state)
         # When connected to a server: learn knowing what other computers already learned.
         share_quietly(store)
         requested = learn_requests(store, state, settings, extractor)
@@ -150,7 +158,8 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         moments.set_now({"since": moments.now_iso(), "doing": "learning from sessions that ended without being learned",
                          "reason": "catch-up"})
         report = learn(
-            logs=session_logs(), state=state, settings=settings,
+            logs=list(dict.fromkeys([*session_logs(), *(Path(path) for path, entry in state.logs.items()
+                                                       if entry.get("recovery_ranges"))])), state=state, settings=settings,
             memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
             extractor=extractor, dry_run=False, run=run,
         )
@@ -158,7 +167,10 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         if report.calls or report.blocked:
             moments.add_news(news_entry(report, settings, reason="catch-up", run=run, requests=[]))
         # What the quick pass saved from a chat that will not be settled (learning was off, the log is gone).
-        confirm_stale(Memory(store, agent=LEARNER_AGENT, record_events=False), now=datetime.now(timezone.utc))
+        pending_sessions = {entry.get("session_id") for entry in state.logs.values()
+                            if entry.get("pending_reviews") or int(entry.get("offset", 0)) > int(entry.get("settled", 0))}
+        confirm_stale(Memory(store, agent=LEARNER_AGENT, record_events=False), now=datetime.now(timezone.utc),
+                      exclude_sessions=pending_sessions)
         retire_old_status(Memory(store, agent=MAINTENANCE_AGENT))
         upkeep = filing = None
         if not report.blocked:
@@ -439,7 +451,9 @@ def record_learning_run(store, run: str, report: LearnReport, upkeep: Maintenanc
                     "(`knowitall2 learn --catch-up` lists them)")
     details = {
         "logs": report.logs, "active": report.active, "calls": report.calls, "deferred": report.deferred,
-        "sessions": [{"session": item.session_id, "dossiers": item.dossiers, "characters": item.characters}
+        "sessions": [{"session": item.session_id, "path": str(item.log), "dossiers": item.dossiers,
+                      "characters": item.characters, "start": item.start, "end": item.end,
+                      "event_index": item.event_index, "end_event_index": item.end_event_index}
                      for item in report.ready],
         "outcomes": dict(report.outcomes), "failed": report.failed, "skipped": report.skipped,
         "blocked": report.blocked, "engine": engine.name, "model": getattr(engine, "model", None) or "",
@@ -930,6 +944,7 @@ def _show(prefix: str) -> int:
 
 
 def _status(settings) -> str:
+    from .availability import active
     state = LearnerState()
     counts: dict[str, int] = {}
     for entry in state.logs.values():
@@ -937,6 +952,7 @@ def _status(settings) -> str:
     progress = ", ".join(f"{name} {count}" for name, count in sorted(counts.items())) or "none yet"
     since = day_ago(datetime.now(timezone.utc))
     recent, limited = state.calls_since(since), state.limited_calls_since(since)
+    paused = active(settings.backend)
     return "\n".join([
         f"Learning: {'on' if settings.enabled else 'off'} "
         f"(backend {settings.backend}, model {settings.model or 'the engine default'})",
@@ -946,4 +962,5 @@ def _status(settings) -> str:
         f"Upkeep's own calls a day: maintenance {settings.maintenance_calls_per_day}, catalog "
         f"{settings.catalog_calls_per_day}, noting commands {settings.command_calls_per_day}",
         f"Sessions: {progress}",
+        *([f"Backend paused until {paused['retry_at']}: {paused['reason']}"] if paused else []),
     ])

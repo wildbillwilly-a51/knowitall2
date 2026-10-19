@@ -767,7 +767,8 @@ def _sharing() -> dict[str, Any] | None:
     status = connected.read_status()
     return {"address": connection.address, "agents": sorted(connection.keys),
             "last_success": status.get("last_success"), "problem": status.get("problem"),
-            "problem_status": status.get("problem_status"), "unsent": bool(status.get("unsent"))}
+            "problem_status": status.get("problem_status"), "unsent": bool(status.get("unsent")),
+            "unresolved_rejections": status.get("unresolved_rejections", 0)}
 
 
 def _add_sharing_health(health: dict[str, Any], sharing: dict[str, Any] | None) -> None:
@@ -778,6 +779,10 @@ def _add_sharing_health(health: dict[str, Any], sharing: dict[str, Any] | None) 
             "Make a new join code on the server's page (Add an agent), then run: knowitall2 server connect "
             "<agent> --join-code <code>")},
             "text": "The KnowItAll2 server no longer accepts this computer, so memories are not shared."}
+    elif sharing.get("unresolved_rejections"):
+        item = {"level": "attention", "action": {"label": "Review refused changes",
+                "hint": "Run knowitall2 sync --rejections to inspect, correct, retry or dismiss them."},
+                "text": f"{sharing['unresolved_rejections']} local change(s) were refused by the server and need review."}
     elif sharing["problem"]:
         item = {"level": "attention", "action": None,
                 "text": f"The KnowItAll2 server at {sharing['address']} could not be reached at the last try. "

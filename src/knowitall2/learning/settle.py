@@ -30,6 +30,7 @@ from ..quotes import nearly_quoted_in, quoted_in, short_quote_in
 from ..store import RecordRow
 from .dossier import Dossier, _render
 from .extractor import render_input
+from .extractor import ExtractionError
 from .prompts import FINAL_CANDIDATES, FINAL_PROMPT, FINAL_SCHEMA, RECONCILE_PROMPT, RECONCILE_SCHEMA
 from .transcripts import Session
 
@@ -87,7 +88,7 @@ def ending_of(session: Session) -> str:
 
 
 def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Session, run: str | None,
-           on_call: Any = None, partial: bool = False) -> Settled:
+           on_call: Any = None, partial: bool = False, recovery: bool = False) -> Settled:
     """The final pass over ``parts``, the settled stretch of ``session``; see the module's description.
 
     ``on_call`` is told of each model call as it is made, for the budget. An ``ExtractionError`` stops the pass
@@ -101,6 +102,11 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
     report = Settled()
     session_id = parts[0].session_id if parts else session.session_id
     provisional = memory.store.tagged_active(PROVISIONAL_TAG, session=session_id) if session_id else []
+    if recovery and session_id:
+        # Failed old passes could already have removed the provisional tag. Revisit only learned,
+        # non-authoritative records, leaving the user's choices and direct statements untouched.
+        provisional = [record for record in memory.store.from_session(session_id, limit=100_000)
+                       if record.source_agent == "learner" and record.verification != "user_stated"]
     candidates = [(record, _as_candidate(memory, record)) for record in provisional]
     if partial:
         # A slice reviews only what it shows; the rest waits for the slice that reads its stretch (C-L11).
@@ -115,8 +121,16 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
             payload = _call(extractor, report, _final_input(memory, items, part, number, len(parts), ending, mine,
                                                             partial=partial),
                             FINAL_SCHEMA, FINAL_PROMPT, on_call)
-            reviews = payload.get("reviews") if isinstance(payload.get("reviews"), list) else []
-            memories = payload.get("memories") if isinstance(payload.get("memories"), list) else []
+            if not isinstance(payload.get("reviews"), list) or not isinstance(payload.get("memories"), list):
+                raise ExtractionError("the final pass did not return reviews and memories lists", counted=True)
+            reviews, memories = payload["reviews"], payload["memories"]
+            if any(not isinstance(item, dict) or item.get("action") not in
+                   {"confirm", "correct", "retire", "not_here"} for item in reviews):
+                raise ExtractionError("the final pass returned an invalid review decision", counted=True)
+            ids = [str(item.get("id", "")).strip().strip("[]") for item in reviews]
+            allowed = {item.key for item in items if item.record is not None and item.status != "retired"}
+            if len(ids) != len(set(ids)) or any(key not in allowed for key in ids):
+                raise ExtractionError("the final pass returned an unknown or repeated review id", counted=True)
         else:
             # An engine without a final pass (a stand-in): what it learns, with nothing to review.
             memories = _extract(extractor, report, part, on_call)
@@ -125,8 +139,9 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         for candidate in [item for item in memories if isinstance(item, dict)][:FINAL_CANDIDATES]:
             items.append(_Item(f"n{len(items) + 1}", candidate, status="added", part=number))
     for item in items:
-        if item.status in ("pending", "deferred") and not partial:
-            item.status = "confirmed"   # no part bore on it: the quick pass's word stands
+        if reviewing and (item.status == "pending" or
+                (item.status == "deferred" and _in_parts(item.candidate, parts))):
+            raise ExtractionError("the final pass left a memory unreviewed; its range remains pending", counted=True)
     kept = [item for item in items if item.status in ("confirmed", "corrected", "added")]
     decisions: dict[int, dict[str, Any]] = {}
     shown: dict[int, list[RecordRow]] = {}
@@ -262,9 +277,22 @@ def _reconcile(memory: Memory, extractor: Any, report: Settled, kept: list[_Item
         lines.append("")
     payload = _call(extractor, report, "\n".join(lines), RECONCILE_SCHEMA, RECONCILE_PROMPT, on_call)
     decisions = {}
-    for decision in payload.get("decisions") or []:
-        if isinstance(decision, dict) and isinstance(decision.get("index"), int):
-            decisions[decision["index"]] = decision
+    raw = payload.get("decisions")
+    if not isinstance(raw, list):
+        raise ExtractionError("the reconciliation did not return decisions", counted=True)
+    for decision in raw:
+        if (not isinstance(decision, dict) or type(decision.get("index")) is not int
+                or decision["index"] not in range(len(kept)) or decision["index"] in decisions
+                or decision.get("action") not in {"new", "update", "repeat", "drop"}):
+            raise ExtractionError("the reconciliation returned an invalid decision", counted=True)
+        decisions[decision["index"]] = decision
+        if decision["action"] in {"repeat", "update"}:
+            earlier = _earlier_candidate(decision, decision["index"])
+            if _shown(shown, decision["index"], decision) is None and not (
+                    decision["action"] == "repeat" and earlier is not None):
+                raise ExtractionError("the reconciliation referenced a memory it was not shown", counted=True)
+    if set(decisions) != set(range(len(kept))):
+        raise ExtractionError("the reconciliation left a memory unchecked", counted=True)
     return decisions, shown
 
 
@@ -520,7 +548,8 @@ def confirm_session(memory: Memory, session_id: str | None) -> int:
     return len(records)
 
 
-def confirm_stale(memory: Memory, *, now: datetime, mine_only: bool = False) -> int:
+def confirm_stale(memory: Memory, *, now: datetime, mine_only: bool = False,
+                  exclude_sessions: set[str] | None = None) -> int:
     """Let provisional memories older than ``PROVISIONAL_DAYS`` stand: their chat will not be settled. With
     ``mine_only``, only those this computer learned."""
 
@@ -529,6 +558,7 @@ def confirm_stale(memory: Memory, *, now: datetime, mine_only: bool = False) -> 
     cutoff = (now - timedelta(days=PROVISIONAL_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     here = computer_name()
     stale = [record for record in memory.store.tagged_active(PROVISIONAL_TAG) if record.created_at < cutoff
+             and record.source_session not in (exclude_sessions or set())
              and (not mine_only or record.source_computer in (None, "", here))]
     for record in stale:
         _confirm(memory, record)
