@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.8 (2026-10-18)
+
+- **Only the source review decides whether knowledge is lasting.** Reconciliation
+  now chooses new, update or repeat; it cannot discard source-approved details
+  as low value or partially covered. Legacy drop decisions fail closed. Every
+  duplicate still passes the detail and authority checks. This preserves source
+  review decisions at the cost of potentially retaining more low-value additions;
+  publication and evidence gates still apply.
+
 ## 0.11.7 (2026-10-18)
 
 - **Reconciliation references match the shared input context.** An existing

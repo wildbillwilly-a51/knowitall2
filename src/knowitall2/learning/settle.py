@@ -8,7 +8,7 @@ one, in parts of at most ``PART_CHARACTERS``, each told how the stretch
 ended. For each provisional memory it decides: confirm, correct, or retire;
 and it adds what the quick pass missed. Then one call checks each memory
 kept against the memories most like it: new, an update of one (merged),
-a repeat, or not lasting after all.
+or a repeat. Only the source-aware review decides lastingness and retirement.
 
 Replayed on ten real chats (2026-10-13): 65% of the memories kept passed
 every check, against 37% for learning at commits alone; the bad provisional
@@ -306,7 +306,7 @@ def _reconcile(memory: Memory, extractor: Any, report: Settled, kept: list[_Item
     for decision in raw:
         if (not isinstance(decision, dict) or type(decision.get("index")) is not int
                 or decision["index"] not in range(len(kept)) or decision["index"] in decisions
-                or decision.get("action") not in {"new", "update", "repeat", "drop"}):
+                or decision.get("action") not in {"new", "update", "repeat"}):
             raise ExtractionError("the reconciliation returned an invalid decision", counted=True)
         decisions[decision["index"]] = decision
         if decision["action"] in {"repeat", "update"}:
@@ -356,6 +356,8 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
     for index, item in enumerate(kept):
         decision = decisions.get(index) or {"action": "new"}
         action = decision.get("action")
+        if action not in {"new", "update", "repeat"}:
+            raise ExtractionError("the reconciliation returned an invalid relationship decision", counted=True)
         denied_repeat = False
         earlier = _earlier_candidate(decision, index)
         if action == "repeat" and earlier is not None:
@@ -379,23 +381,23 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
             # What it repeats did not stand: it is decided on its own (second candidate review, D-M5).
             decision, action = {"action": "new"}, "new"
             denied_repeat = True
-        if action in ("repeat", "drop"):
-            known = _shown(shown, decision, memory=memory, resolve=action == "repeat")
-            if action == "repeat" and not _repeat_preserves(item.candidate, known, _dedup_record(item)):
+        if action == "repeat":
+            known = _shown(shown, decision, memory=memory, resolve=True)
+            if not _repeat_preserves(item.candidate, known, _dedup_record(item)):
                 # An incomplete duplicate is ordinary knowledge, not permission to discard its details.
                 decision, action = {"action": "new"}, "new"
                 denied_repeat = True
             else:
                 if item.record is not None:
-                    item.reason = "repeat" if action == "repeat" else "not lasting"
+                    item.reason = "repeat"
                     item.repeat_of = known.id if known is not None else ""
                     if known is not None:
                         item.shown.add(known.id)
                     changed = retire(item)
                     standing[index] = (known.id if known is not None else None) if changed else item.record.id
                 else:
-                    note(f"rejected ({'repeat' if action == 'repeat' else 'not lasting'})", item, [])
-                    standing[index] = known.id if action == "repeat" and known is not None else None
+                    note("rejected (repeat)", item, [])
+                    standing[index] = known.id if known is not None else None
                 continue
         candidate = dict(item.candidate)
         if denied_repeat or (item.record is None and index in decisions):

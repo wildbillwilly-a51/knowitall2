@@ -130,6 +130,49 @@ class IntegrityTests(unittest.TestCase):
         self.assertIn(known.id, check.split("Candidate 1")[0])
         self.assertNotIn(known.id, check.split("Candidate 1")[1])
 
+    def test_relationship_drop_cannot_discard_source_approved_memories(self):
+        for original, corrected in (("fact", False), ("lesson", False), ("lesson", True)):
+            with self.subTest(kind=original, corrected=corrected):
+                t = self.learning()
+                t.sample_log().write(t.log_path, idle=False)
+                candidate = t.ROUTER if original == "fact" else t.DNSMASQ
+                if corrected:
+                    candidate = {**candidate, "text": "On the homelab router, dnsmasq never needs a restart after editing /etc/config/dhcp."}
+                t.learn(fixtures.FakeEngine([[candidate]]), quick=True)
+                [record] = t.provisional()
+                before = t.store.get(record.id)
+                fixtures.quiet_longer(t.log_path)
+                decision = fixtures.review("p1", "correct", **{key: t.DNSMASQ[key] for key in
+                    ("text", "kind", "subjects", "scope", "project", "evidence")}) if corrected else fixtures.review("p1", "confirm")
+                report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [decision], "memories": []}], checks=[{"decisions": [
+                    {"index": 0, "action": "drop", "known_id": "", "text": "", "reason": "largely covered and low value"}]}]))
+                self.assertEqual([fixtures.SESSION], report.failed)
+                self.assertEqual(before, t.store.get(record.id))
+                self.assertEqual(0, t.state.entry(t.log_path)["settled"])
+
+    def test_relationship_drop_cannot_discard_a_source_addition(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path)
+        report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [], "memories": [t.ROUTER]}], checks=[{"decisions": [
+            {"index": 0, "action": "drop", "known_id": "", "text": "", "reason": "low value"}]}]))
+        self.assertEqual([fixtures.SESSION], report.failed)
+        self.assertEqual(0, t.store.count_active(project_id=None, scope="all"))
+        self.assertEqual(0, t.state.entry(t.log_path)["settled"])
+
+    def test_final_source_review_still_owns_substantive_retirement(self):
+        for reason in ("status", "work record", "overturned"):
+            with self.subTest(reason=reason):
+                t = self.learning()
+                t.sample_log().write(t.log_path, idle=False)
+                t.learn(fixtures.FakeEngine([[t.ROUTER]]), quick=True)
+                [record] = t.provisional()
+                fixtures.quiet_longer(t.log_path)
+                report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [
+                    fixtures.review("p1", "retire", retire_reason=reason)], "memories": []}]))
+                self.assertEqual([], report.failed)
+                self.assertEqual("retired", t.store.get(record.id).status)
+                self.assertGreater(t.state.entry(t.log_path)["settled"], 0)
+
     def test_an_update_can_use_a_target_shown_only_under_another_candidate(self):
         t = self.learning()
         t.sample_log().write(t.log_path)
