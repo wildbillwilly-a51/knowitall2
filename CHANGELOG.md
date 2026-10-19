@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.7 (2026-10-18)
+
+- **Reconciliation references match the shared input context.** An existing
+  memory shown under one candidate can also be chosen for another candidate in
+  that same call. References to memories shown nowhere still fail closed.
+  Application refreshes shared targets: repeats check the current replacement,
+  and updates cannot merge into an already superseded row. Evidence, authority,
+  source boundaries and detail-preservation checks still apply.
+
 ## 0.11.6 (2026-10-18)
 
 - **Recovery respects its approved source boundaries.** Final recovery slices

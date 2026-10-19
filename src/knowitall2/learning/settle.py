@@ -311,7 +311,7 @@ def _reconcile(memory: Memory, extractor: Any, report: Settled, kept: list[_Item
         decisions[decision["index"]] = decision
         if decision["action"] in {"repeat", "update"}:
             earlier = _earlier_candidate(decision, decision["index"])
-            if _shown(shown, decision["index"], decision) is None and not (
+            if _shown(shown, decision) is None and not (
                     decision["action"] == "repeat" and earlier is not None):
                 raise ExtractionError(f"the reconciliation referenced a memory it was not shown: candidate "
                                       f"{decision['index']}, action {decision['action']}, "
@@ -380,7 +380,7 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
             decision, action = {"action": "new"}, "new"
             denied_repeat = True
         if action in ("repeat", "drop"):
-            known = _shown(shown, index, decision)
+            known = _shown(shown, decision, memory=memory, resolve=action == "repeat")
             if action == "repeat" and not _repeat_preserves(item.candidate, known, _dedup_record(item)):
                 # An incomplete duplicate is ordinary knowledge, not permission to discard its details.
                 decision, action = {"action": "new"}, "new"
@@ -405,7 +405,7 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
         if action == "update":
             from .maintenance import keeps_everything
 
-            known = _shown(shown, index, decision)
+            known = _shown(shown, decision, memory=memory)
             merged_text = str(decision.get("text") or "").strip() or candidate.get("text")
             # A tool rule is rewritten only from its lessons (``tool_rules``), never replaced by one more of them.
             if (known is not None and RULE_TAG not in known.tags and
@@ -504,11 +504,23 @@ def _standing(memory: Memory, record_id: str | None) -> str | None:
     return record.id if record is not None and record.status == "active" else None
 
 
-def _shown(shown: dict[int, list[RecordRow]], index: int, decision: dict[str, Any]) -> RecordRow | None:
+def _shown(shown: dict[int, list[RecordRow]], decision: dict[str, Any], *,
+           memory: Memory | None = None, resolve: bool = False) -> RecordRow | None:
+    """Only existing memories actually rendered in this reconciliation call are referenceable.
+
+    Candidate blocks share one input context. During application, refresh the row: an earlier
+    candidate may already have changed it. Repeats may follow a replacement; updates require the
+    named row itself to remain active. Neither lookup imports prior final-pass context.
+    """
     known_id = str(decision.get("known_id") or "").strip().strip("[]")
-    for row in shown.get(index, []):
-        if row.id == known_id and row.status == "active":
-            return row
+    for rows in shown.values():
+        for row in rows:
+            if row.id == known_id and row.status == "active":
+                if memory is None:
+                    return row
+                current_id = _standing(memory, row.id) if resolve else row.id
+                current = memory.store.get(current_id) if current_id else None
+                return current if current is not None and current.status == "active" else None
     return None
 
 

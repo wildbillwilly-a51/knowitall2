@@ -115,6 +115,112 @@ class IntegrityTests(unittest.TestCase):
         self.assertEqual("retired", t.store.get(first.id).status)
         self.assertEqual("active", t.store.get(second.id).status)
 
+    def test_a_reconciliation_target_shown_under_another_candidate_is_valid(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path)
+        known = t.memory.remember(t.DNSMASQ["text"], kind="lesson", subjects=["router", "dnsmasq"], source="observed").record
+        engine = fixtures.FakeEngine(finals=[{"reviews": [], "memories": [t.ROUTER, t.DNSMASQ]}], checks=[{"decisions": [
+            {"index": 0, "action": "new", "known_id": "", "text": "", "reason": ""},
+            {"index": 1, "action": "repeat", "known_id": known.id, "text": "", "reason": "same fact shown under candidate 0"}]}])
+        with mock.patch.object(t.memory, "nearest", side_effect=lambda query, **kwargs: [(1.0, known)] if "OpenWrt" in query else []):
+            report = t.learn(engine)
+        self.assertEqual([], report.failed)
+        self.assertEqual(2, t.store.count_active(project_id=None, scope="all"))
+        check = next(text for phase, text in engine.inputs if phase == "check")
+        self.assertIn(known.id, check.split("Candidate 1")[0])
+        self.assertNotIn(known.id, check.split("Candidate 1")[1])
+
+    def test_an_update_can_use_a_target_shown_only_under_another_candidate(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path)
+        known = t.memory.remember(t.DNSMASQ["text"], kind="fact", subjects=["router", "dnsmasq"], source="observed").record
+        merged = t.DNSMASQ["text"] + " " + t.ROUTER["text"]
+        engine = fixtures.FakeEngine(finals=[{"reviews": [], "memories": [t.DNSMASQ, t.ROUTER]}], checks=[{"decisions": [
+            {"index": 0, "action": "repeat", "known_id": known.id, "text": "", "reason": "already known"},
+            {"index": 1, "action": "update", "known_id": known.id, "text": merged, "reason": "adds version"}]}])
+        with mock.patch.object(t.memory, "nearest", side_effect=lambda query, **kwargs: [(1.0, known)] if "dnsmasq" in query else []):
+            report = t.learn(engine)
+        self.assertEqual([], report.failed)
+        check = next(text for phase, text in engine.inputs if phase == "check")
+        self.assertIn(known.id, check.split("Candidate 1")[0])
+        self.assertNotIn(known.id, check.split("Candidate 1")[1])
+        self.assertEqual("superseded", t.store.get(known.id).status)
+        [standing] = t.store.list_active(project_id=None, scope="all", limit=20)
+        self.assertEqual(merged, standing.text)
+        self.assertEqual("observed", standing.verification)
+        self.assertEqual(standing.id, t.store.get(known.id).superseded_by)
+
+    def test_cross_candidate_updates_preserve_both_sources_and_reject_unrelated_overwrites(self):
+        original = "The homelab router uses dnsmasq and keeps encrypted backups in /srv/backups."
+        for unrelated in (False, True):
+            t = self.learning()
+            t.sample_log().write(t.log_path)
+            known = t.memory.remember("The telescope uses a cobalt calibration lamp." if unrelated else original,
+                                      subjects=["telescope"] if unrelated else ["router", "dnsmasq"], source="observed").record
+            engine = fixtures.FakeEngine(finals=[{"reviews": [], "memories": [t.ROUTER, t.DNSMASQ]}], checks=[{"decisions": [
+                {"index": 0, "action": "new", "known_id": "", "text": "", "reason": ""},
+                {"index": 1, "action": "update", "known_id": known.id, "text": t.DNSMASQ["text"], "reason": "merge"}]}])
+            with mock.patch.object(t.memory, "nearest", side_effect=lambda query, **kwargs: [(1.0, known)] if "OpenWrt" in query else []):
+                report = t.learn(engine)
+            self.assertEqual([], report.failed)
+            self.assertEqual("active", t.store.get(known.id).status)
+            self.assertEqual(known.text, t.store.get(known.id).text)
+            self.assertTrue(any(r.text == t.DNSMASQ["text"] for r in t.store.list_active(project_id=None, scope="all", limit=20)))
+
+    def test_a_later_cross_candidate_repeat_uses_an_earlier_merges_replacement(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path)
+        known = t.memory.remember(t.DNSMASQ["text"], kind="fact", subjects=["router", "dnsmasq"], source="observed").record
+        merged = t.ROUTER["text"] + " " + t.DNSMASQ["text"]
+        engine = fixtures.FakeEngine(finals=[{"reviews": [], "memories": [t.ROUTER, t.DNSMASQ]}], checks=[{"decisions": [
+            {"index": 0, "action": "update", "known_id": known.id, "text": merged, "reason": "adds router version"},
+            {"index": 1, "action": "repeat", "known_id": known.id, "text": "", "reason": "same fact"}]}])
+        with mock.patch.object(t.memory, "nearest", side_effect=lambda query, **kwargs: [(1.0, known)] if "OpenWrt" in query else []):
+            report = t.learn(engine)
+        self.assertEqual([], report.failed)
+        self.assertEqual("superseded", t.store.get(known.id).status)
+        [standing] = t.store.list_active(project_id=None, scope="all", limit=20)
+        self.assertEqual(merged, standing.text)
+        self.assertEqual(standing.id, t.store.get(known.id).superseded_by)
+        self.assertEqual(1, report.outcomes["rejected (repeat)"])
+
+    def test_shared_target_repeats_refresh_the_current_replacement(self):
+        from knowitall2.learning.settle import _Item, _apply, Settled
+        from knowitall2.learning.dossier import build_dossiers
+        from knowitall2.learning.transcripts import read_session
+        t = self.learning()
+        t.sample_log().write(t.log_path)
+        known = t.memory.remember(t.DNSMASQ["text"], kind="lesson", source="observed").record
+        session, _ = read_session(t.log_path)
+        parts = build_dossiers(session)
+        items = [_Item("n1", t.DNSMASQ, status="added", part=0), _Item("n2", t.DNSMASQ, status="added", part=0)]
+        replacement = t.memory.remember("The router uses dnsmasq.", source="observed").record
+        # Model input saw X, but another application decision replaced it with Y lacking its detail.
+        t.store.supersede(known.id, replacement.id, now=t.memory.now(), reason="explicit correction")
+        report = Settled()
+        _apply(t.memory, items, items, {0: {"action": "repeat", "known_id": known.id},
+               1: {"action": "repeat", "known_id": known.id}}, {0: [known], 1: []}, parts, report, None)
+        self.assertEqual(0, report.outcomes["rejected (repeat)"])
+        self.assertTrue(any(r.text == t.DNSMASQ["text"] for r in t.store.list_active(project_id=None, scope="all", limit=20)))
+
+    def test_reconciliation_pool_never_imports_excluded_source_session_memories(self):
+        t = self.learning()
+        t.sample_log().write(t.log_path, idle=False)
+        t.learn(fixtures.FakeEngine([[t.DNSMASQ]]), quick=True)
+        [record] = t.provisional()
+        fixtures.quiet_longer(t.log_path)
+        engine = fixtures.FakeEngine(finals=[{"reviews": [fixtures.review("p1", "confirm")], "memories": [t.ROUTER]}], checks=[{"decisions": [
+            {"index": 0, "action": "new", "known_id": "", "text": "", "reason": ""},
+            {"index": 1, "action": "repeat", "known_id": record.id, "text": "", "reason": "own session"}]}])
+        report = t.learn(engine)
+        self.assertEqual([fixtures.SESSION], report.failed)
+        check = next(text for phase, text in engine.inputs if phase == "check")
+        self.assertNotIn(record.id, check)
+        final = next(text for phase, text in engine.inputs if phase == "final")
+        self.assertIn(record.text, final)
+        self.assertEqual(record.id, t.provisional()[0].id)
+        self.assertEqual(0, t.state.entry(t.log_path)["settled"])
+
     def test_a_new_candidate_cannot_be_dropped_as_a_partial_earlier_repeat(self):
         t = self.learning()
         t.sample_log().write(t.log_path, idle=False)
