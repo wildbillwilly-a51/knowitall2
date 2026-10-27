@@ -17,7 +17,7 @@ from unittest import mock
 
 from _support import Clock, make_repository
 
-from knowitall2 import cli, known, sync
+from knowitall2 import cli, doctor, journal, known, sync
 from knowitall2.memory import Memory
 from knowitall2.store import Store
 
@@ -553,6 +553,33 @@ class RefreshTests(KnownTestCase):
         known.set_enabled(True)
         self.assertTrue(known.nudge(launcher=launcher))
         self.assertEqual(2, len(started))
+
+    def test_a_failed_refresh_is_recorded_and_waits_for_the_next_change(self) -> None:
+        # Review 2026-10-24, F-24: an exception escaping refresh left no status, so every hook, tool call and
+        # command started the 3.7 s refresh again, with nothing in the problems or the doctor.
+        self.remember("Alpha deploys with make deploy.", scope="project")
+        known.refresh(self.connection)
+        owned = known.read_status()["owned"]
+        self.remember("Alpha's staging host is stage-1.", scope="project")
+        started = []
+        launcher = lambda command, **options: started.append(command)
+        with mock.patch.object(known, "refresh", side_effect=RuntimeError("render broke")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(1, known.run_command(types.SimpleNamespace(off=False, on=False, quiet=True,
+                                                                        list=False, project=None)))
+        self.assertIn("render broke", errors.getvalue())
+        status = known.read_status()
+        self.assertEqual("RuntimeError: render broke", status["failed"])
+        self.assertEqual(owned, status["owned"])  # what KnowItAll2 owns is kept
+        self.assertTrue(any("render broke" in problem["message"] for problem in journal.read_problems()))
+        self.assertFalse(known.due(self.connection))
+        self.assertFalse(known.nudge(launcher=launcher))  # not again after every hook
+        check = doctor._known_files_check()
+        self.assertIn("the last refresh failed", check.detail)
+        self.remember("Alpha's test host is test-1.", scope="project")  # the next change tries again
+        self.assertTrue(known.nudge(launcher=launcher))
+        known.refresh(self.connection)
+        self.assertNotIn("failed", known.read_status())
 
     def test_a_running_refresh_is_not_started_twice(self) -> None:
         self.remember("Alpha deploys with make deploy.", scope="project")

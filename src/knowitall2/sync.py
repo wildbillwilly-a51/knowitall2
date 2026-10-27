@@ -25,7 +25,8 @@ from typing import Any, Iterable, Sequence
 
 from . import journal
 from .question_schema import check_question
-from .store import APPLYING_KEY, SYNCED_TABLES, TRACK_KEY, Store, SyncedTable
+from .secrets import contains_secret
+from .store import APPLYING_KEY, SYNCED_TABLES, TRACK_KEY, Store, SyncedTable, scrub
 
 MAX_TEXT = 20_000
 CURSOR_KEY = "sync.cursor"
@@ -163,6 +164,59 @@ def check_row(table: SyncedTable, key: str, row: object, *, existing: dict[str, 
     return cleaned
 
 
+def screen_row(table: SyncedTable, row: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
+    """Screen a checked row's new or changed free text for secrets, as the store screens what is written here.
+
+    Memory content (``table.content``) holding one is refused; a secret in what was said about a memory
+    (``table.prose``) is redacted. Text kept unchanged passes, so retiring a memory saved before the screening
+    knew a shape is never refused (review 2026-10-24, R4). JSON columns are read string by string.
+    """
+
+    content = []
+    for column in table.content:
+        if not isinstance(row.get(column), str) or (existing is not None and row[column] == existing.get(column)):
+            continue
+        if column in table.json_columns:
+            # Element by element: a list that keeps an old tag while losing another (closing a question takes off
+            # "disputed") is a cleanup, and the tag it keeps was there before (Codex's review of step A).
+            before = _decoded_list(existing.get(column)) if existing is not None else []
+            content.extend(item for item in _decoded_list(row[column]) if item not in before)
+        else:
+            content.append(row[column])
+    if contains_secret("\n".join(str(text) for text in content)):
+        raise SyncError("the memory looks like it holds a secret; save where the secret is kept instead")
+    redact_prose(table, row, existing)
+    return row
+
+
+def redact_prose(table: SyncedTable, row: dict[str, Any], existing: dict[str, Any] | None = None) -> bool:
+    """Redact any secret in the row's prose columns that are new or changed against ``existing``; whether any was."""
+
+    redacted = False
+    for column in table.prose:
+        value = row.get(column)
+        if not isinstance(value, str) or (existing is not None and value == existing.get(column)):
+            continue
+        if column in table.json_columns:
+            decoded = json.loads(value)
+            cleaned = scrub(decoded)
+            if cleaned != decoded:
+                row[column], redacted = json.dumps(cleaned), True
+        else:
+            cleaned = scrub(value)
+            if cleaned != value:
+                row[column], redacted = cleaned, True
+    return redacted
+
+
+def _decoded_list(value: object) -> list[Any]:
+    try:
+        decoded = json.loads(value) if isinstance(value, str) else []
+    except ValueError:
+        return []
+    return decoded if isinstance(decoded, list) else [decoded]
+
+
 def _check_question_row(row: dict[str, Any]) -> None:
     if "kind" not in row:
         return  # a partial update is checked against the stored kind by write_row
@@ -227,7 +281,8 @@ def changes_since(store: Store, since: int, *, limit: int = 500) -> dict[str, An
 _USE_COUNTS = frozenset({"recall_count", "last_used_at"})
 
 
-def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int | None = None) -> int:
+def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int | None = None,
+                 hold: list[int] | None = None, set_aside: Sequence[dict[str, Any]] | None = None) -> int:
     """Apply changes that came from the server to this computer's copy, without noting them as its own.
 
     Returns how many rows here changed (use counts aside). A row with a
@@ -240,14 +295,25 @@ def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int
     number is kept (``sync_seen``), so a later change sent from here says
     what it was based on. ``cursor``, when given, is where the next fetch
     starts.
+
+    The cursor stays behind a row left alone for an unsent change here
+    (review 2026-10-24, F-11b): the server may answer that change from its
+    record of an earlier send, without the newer version another computer
+    made meanwhile, so the next fetch must bring that version again.
+    ``hold`` collects where it stays, across the pages of one fetch.
+    ``set_aside``, when given, replaces the rows set aside
+    (:func:`keep_set_aside`) in the same transaction as the cursor.
     """
 
     connection = store.connection
     changed = 0
+    hold = [] if hold is None else hold
+    redacted: list[tuple[str, str]] = []
     with store.transaction():
         connection.execute("PRAGMA defer_foreign_keys = ON")
         # Read inside the transaction, so a change saved here a moment ago is never overwritten.
         mine = pending_keys(store)
+        unsent = unsent_keys(store)
         store.set_meta(APPLYING_KEY, "1")
         for item in changes:
             name = item.get("table")
@@ -256,6 +322,9 @@ def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int
                 continue  # shared by a newer server; this version has nowhere to keep it
             key = check_key(item.get("key"))
             if (table.name, key) in mine:
+                seq = item.get("seq")
+                if (table.name, key) in unsent and isinstance(seq, int) and not isinstance(seq, bool):
+                    hold.append(seq - 1)
                 continue
             current = read_row(connection, table, key)
             if item.get("op") == "delete":
@@ -271,6 +340,11 @@ def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int
                 if isinstance(row, dict):
                     row = {name: value for name, value in row.items() if name in table.columns}
                 row = check_row(table, key, row, existing=current)
+                # A secret in a reason or finding that reached the server before it screened them (an older
+                # version) is redacted here too, and the cleaned row sent back, so every copy loses it (Codex's
+                # review of step A). Memory text is left as it came: the store refuses new secrets, not old ones.
+                if redact_prose(table, row, current) and store.get_meta(TRACK_KEY) is not None:
+                    redacted.append((table.name, key))
                 write_row(connection, table, row)
                 if current is None or any(current.get(column) != value for column, value in row.items()
                                           if column not in _USE_COUNTS):
@@ -283,20 +357,100 @@ def apply_pulled(store: Store, changes: Sequence[dict[str, Any]], *, cursor: int
                     (table.name, key, seq),
                 )
         if cursor is not None:
-            store.set_meta(CURSOR_KEY, str(int(cursor)))
+            store.set_meta(CURSOR_KEY, str(int(min([cursor, *hold]))))
+        if set_aside is not None:
+            keep_set_aside(store, set_aside)
         connection.execute("DELETE FROM meta WHERE key = ?", (APPLYING_KEY,))
+        for name, key in redacted:  # sent back without the secret, based on the version fetched
+            connection.execute("INSERT INTO changes (tbl, key, op) VALUES (?, ?, 'upsert')", (name, key))
     return changed
 
 
-def parent_links(connection: sqlite3.Connection, table: SyncedTable) -> list[tuple[str, SyncedTable, str]]:
-    """The links from a shared table's rows to the shared rows they belong to: (column, parent table, its column)."""
+def parent_links(table: SyncedTable) -> list[tuple[str, SyncedTable]]:
+    """The links from a shared table's rows to the shared rows they belong to: (column, parent table).
 
-    links = []
-    for row in connection.execute(f"PRAGMA foreign_key_list({table.name})").fetchall():
-        parent = SYNCED_TABLES.get(row[2])
-        if parent is not None:
-            links.append((row[3], parent, row[4] or parent.key))
-    return links
+    Declared with the table (``SyncedTable.parents``), not read from SQLite's foreign keys, which name only a
+    memory's project (review 2026-10-24, F-14).
+    """
+
+    return [(column, SYNCED_TABLES[parent]) for column, parent in table.parents]
+
+
+def parents_of(table: SyncedTable, row: dict[str, Any]) -> list[tuple[str, str]]:
+    """The (table, key) of each row this row belongs to."""
+
+    return [(parent.name, row[column]) for column, parent in parent_links(table)
+            if isinstance(row.get(column), str) and row[column]]
+
+
+def usable(store: Store, changes: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[tuple[dict, str]]]:
+    """Split fetched changes into those this version can save and those it cannot, each with the reason.
+
+    One row a newer server shares in a form this version does not accept (such as a new kind of question) is
+    set aside on its own, instead of failing the page and every sync after it (review 2026-10-24, F-12).
+    """
+
+    good: list[dict[str, Any]] = []
+    bad: list[tuple[dict, str]] = []
+    for item in changes:
+        if not isinstance(item, dict):
+            raise SyncError("each fetched change must be an object")
+        table = SYNCED_TABLES.get(item.get("table")) if isinstance(item.get("table"), str) else None
+        if table is None:
+            good.append(item)  # skipped when applied: this version has nowhere to keep it
+            continue
+        try:
+            key = check_key(item.get("key"))
+            if item.get("op") != "delete":
+                row = item.get("row")
+                if isinstance(row, dict):
+                    row = {column: value for column, value in row.items() if column in table.columns}
+                check_row(table, key, row, existing=read_row(store.connection, table, key))
+        except SyncError as exc:
+            bad.append((item, str(exc)))
+            continue
+        good.append(item)
+    return good, bad
+
+
+# Rows fetched from the server that this computer could not save yet, each with what it needs: a newer version of
+# KnowItAll2, or a row it belongs to that has not arrived. Kept whole, so nothing is lost when the fetch moves on,
+# and tried again at every fetch (review 2026-10-24, F-12).
+SET_ASIDE_KEY = "sync.set_aside"
+
+
+def set_aside(store: Store) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(store.get_meta(SET_ASIDE_KEY) or "[]")
+    except ValueError:
+        return []
+    return [item for item in value if isinstance(item, dict) and isinstance(item.get("change"), dict)] \
+        if isinstance(value, list) else []
+
+
+def keep_set_aside(store: Store, entries: Sequence[dict[str, Any]]) -> None:
+    """Replace the rows set aside, journaling each one newly set aside once."""
+
+    before = {(item["change"].get("table"), item["change"].get("key"), item["change"].get("seq"))
+              for item in set_aside(store)}
+    with store.transaction():
+        store.set_meta(SET_ASIDE_KEY, json.dumps(list(entries), ensure_ascii=False))
+    for entry in entries:
+        change = entry["change"]
+        if (change.get("table"), change.get("key"), change.get("seq")) not in before:
+            journal.problem("sync", f"a row from the server was set aside, to be tried again at each sync: "
+                                    f"{change.get('table')} {change.get('key')}: {entry.get('reason')}")
+
+
+def still_wanted(store: Store, change: dict[str, Any]) -> bool:
+    """Whether a row set aside earlier may still be saved: nothing newer of it is here or on its way here."""
+
+    table = SYNCED_TABLES.get(change.get("table")) if isinstance(change.get("table"), str) else None
+    key, seq = change.get("key"), change.get("seq")
+    if table is None or not isinstance(key, str) or (table.name, key) in pending_keys(store):
+        return False
+    seen = store.connection.execute("SELECT seq FROM sync_seen WHERE tbl = ? AND key = ?", (table.name, key)).fetchone()
+    return not (seen is not None and isinstance(seq, int) and seen[0] >= seq)
 
 
 def without_parents(store: Store, changes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -324,7 +478,6 @@ def without_parents(store: Store, changes: Sequence[dict[str, Any]]) -> list[dic
         recognized.append(item)
     changes = recognized
     connection = store.connection
-    links: dict[str, list[tuple[str, SyncedTable, str]]] = {}
     held: list[dict[str, Any]] = []
     while True:
         waiting = {id(item) for item in held}
@@ -336,13 +489,12 @@ def without_parents(store: Store, changes: Sequence[dict[str, Any]]) -> list[dic
             row = item.get("row")
             if table is None or item.get("op") == "delete" or not isinstance(row, dict):
                 continue
-            if table.name not in links:
-                links[table.name] = parent_links(connection, table)
-            for column, parent, target in links[table.name]:
+            for column, parent in parent_links(table):
                 value = row.get(column)
-                if value is None or (target == parent.key and (parent.name, value) in arriving):
+                if value is None or (parent.name, value) in arriving:
                     continue
-                if connection.execute(f"SELECT 1 FROM {parent.name} WHERE {target} = ?", (value,)).fetchone() is None:
+                if connection.execute(f"SELECT 1 FROM {parent.name} WHERE {parent.key} = ?",
+                                      (value,)).fetchone() is None:
                     found.append(item)
                     break
         if len(found) == len(held):  # a parent that waits holds back its own rows too, until nothing changes
@@ -365,9 +517,16 @@ def has_pending(store: Store) -> bool:
     return store.connection.execute("SELECT 1 FROM changes LIMIT 1").fetchone() is not None
 
 
+def unsent_keys(store: Store) -> set[tuple[str, str]]:
+    """The rows (table, key) with a change made here that the server has not settled yet."""
+
+    return {(row[0], row[1]) for row in store.connection.execute("SELECT DISTINCT tbl, key FROM changes").fetchall()}
+
+
 def pending_keys(store: Store) -> set[tuple[str, str]]:
-    return ({(row[0], row[1]) for row in store.connection.execute("SELECT DISTINCT tbl, key FROM changes").fetchall()}
-            | {(item["table"], item["key"]) for item in rejections(store)})
+    """The rows a fetch leaves alone: unsent ones, and those the server refused, kept here until resolved."""
+
+    return unsent_keys(store) | {(item["table"], item["key"]) for item in rejections(store)}
 
 
 REJECTIONS_KEY = "sync.rejected_operations"
@@ -385,16 +544,34 @@ def rejections(store: Store) -> list[dict[str, Any]]:
         raise SyncError("the local rejected-change queue needs repair; it has been preserved") from exc
 
 
-def quarantine(store: Store, operation: dict, reason: str) -> None:
-    """Retain terminal refusals locally, without publishing or repeatedly sending poison content."""
-    from .secrets import contains_secret, redact
+def quarantine(store: Store, operation: dict, reason: str, *, waits_for: tuple[str, str] | None = None) -> None:
+    """Retain terminal refusals locally, without publishing or repeatedly sending poison content.
+
+    ``waits_for`` names the refused row (table, key) this one belongs to: sending it again is retried with it.
+    """
+    from .secrets import redact
     items = [item for item in rejections(store)
              if (item["table"], item["key"]) != (operation["table"], operation["key"])]
     sensitive = contains_secret(json.dumps(operation, ensure_ascii=False))
-    items.append({"id": operation["op_id"], "table": operation["table"], "key": operation["key"],
-                  "reason": redact(str(reason))[:600], "at": journal.utc_now(), "sensitive": sensitive,
-                  "operation": None if sensitive else operation})
+    entry = {"id": operation["op_id"], "table": operation["table"], "key": operation["key"],
+             "reason": redact(str(reason))[:600], "at": journal.utc_now(), "sensitive": sensitive,
+             "operation": None if sensitive else operation}
+    if waits_for is not None:
+        entry["waits_for"] = list(waits_for)
+    items.append(entry)
     store.set_meta(REJECTIONS_KEY, json.dumps(items))
+
+
+def refused_parent(store: Store, table: SyncedTable, row: dict[str, Any], *,
+                   also: Iterable[tuple[str, str]] = ()) -> tuple[str, str] | None:
+    """The row this one belongs to that the server refused and that is kept here unresolved, if any.
+
+    Sending the row would only be refused again, every sync, until that row is resolved (review 2026-10-24, F-13).
+    ``also``: rows refused in the batch being settled, not yet among the refusals kept here.
+    """
+
+    refused = {(item["table"], item["key"]) for item in rejections(store)} | set(also)
+    return next((parent for parent in parents_of(table, row) if parent in refused), None)
 
 
 def resolve_rejection(store: Store, identifier: str, *, retry: bool = False) -> None:
@@ -411,6 +588,12 @@ def resolve_rejection(store: Store, identifier: str, *, retry: bool = False) -> 
                 raise SyncError("correct or remove the sensitive/missing local content before retrying")
             store.connection.execute("INSERT INTO changes (tbl, key, op) VALUES (?, ?, 'upsert')",
                                      (item["table"], item["key"]))
+            # The rows set aside because the server refused this one go again with it.
+            children = [old for old in items if old.get("waits_for") == [item["table"], item["key"]]]
+            for child in children:
+                store.connection.execute("INSERT INTO changes (tbl, key, op) VALUES (?, ?, 'upsert')",
+                                         (child["table"], child["key"]))
+            items = [old for old in items if old not in children]
         else:
             # Dismiss means keep the server's version. Re-fetch it even if our pull cursor passed it.
             store.set_meta(CURSOR_KEY, "0")
@@ -477,19 +660,23 @@ def send_everything_again(store: Store) -> None:
     with store.transaction():
         store.connection.execute("DELETE FROM sync_seen")
         store.set_meta(CURSOR_KEY, "0")
+        store.set_meta(SET_ASIDE_KEY, "[]")  # fetched again from the start
         for name in SYNCED_TABLES:  # parents first
             note_all(store, name)
 
 
 def note_parents(store: Store, table: SyncedTable, row: dict[str, Any]) -> None:
     """Note the rows a row belongs to (such as a memory's project) as changed here, when they are here and
-    not noted already, so a sync sends them and the row waiting for them on the server can follow."""
+    not noted already, so a sync sends them and the row waiting for them on the server can follow.
+
+    A row the server refused is not noted again: it stays with the refusals until it is resolved."""
 
     connection = store.connection
+    refused = {(item["table"], item["key"]) for item in rejections(store)}
     with store.transaction():
-        for column, parent, target in parent_links(connection, table):
+        for column, parent in parent_links(table):
             value = row.get(column)
-            if value is None or target != parent.key:
+            if value is None or (parent.name, value) in refused:
                 continue
             connection.execute(
                 f"INSERT INTO changes (tbl, key, op) SELECT ?, {parent.key}, 'upsert' FROM {parent.name} "

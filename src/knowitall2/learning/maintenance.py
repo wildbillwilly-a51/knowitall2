@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from .. import journal, review
+from ..secrets import redact
 from ..commands import RULE_TAG
 from ..memory import (
     DISPUTED_TAG, PROVISIONAL_TAG, VERIFICATION_STRENGTH, Memory, MemoryInputError, _stem, in_users_words,
@@ -436,7 +437,8 @@ def apply_finding(
         return ["skipped (already changed)"]
     if busy.intersection(involved):
         return ["skipped (open question)"]
-    reason = " ".join(str(finding.get("reason") or "").split())[:REASON_CHARACTERS]
+    # Redacted before it is cut short, so the cut never hides a secret (review 2026-10-24, F-16).
+    reason = " ".join(redact(str(finding.get("reason") or "")).split())[:REASON_CHARACTERS]
     detail = f": {reason}" if reason else ""
     now = memory.now()
     outcomes: list[str] = []

@@ -1,6 +1,8 @@
 import json
 import os
+import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -8,7 +10,7 @@ from unittest import mock
 from _support import make_repository
 from test_learning import SESSION, LogBuilder, text
 
-from knowitall2 import chats, hooks
+from knowitall2 import chats, connected, hooks, journal
 from knowitall2.mcp_server import LATEST_PROTOCOL_VERSION, McpServer
 from knowitall2.memory import Memory
 from knowitall2.paths import database_path
@@ -61,6 +63,29 @@ class ChatTestCase(unittest.TestCase):
 
 
 class NewSinceTests(ChatTestCase):
+    def test_a_busy_store_never_holds_up_the_users_message(self) -> None:
+        # Review 2026-10-24, F-25: the message hook opened the store to write, so while another process held the
+        # write lock (an import, a large sync, maintenance) each message waited up to 5 seconds.
+        self.remember("Alpha builds with make.", self.alpha)
+        self.start()
+        self.remember("Alpha deploys from the release branch with make ship.", self.alpha, kind="procedure")
+        holder = sqlite3.connect(str(database_path()), isolation_level=None, timeout=1)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            context = self.prompt()
+            elapsed = time.monotonic() - started
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertIn("make ship", context)  # what is new still arrives...
+        self.assertLess(elapsed, 2.5)  # ...without waiting out the 5-second busy timeout
+        self.assertIn("was not kept", journal.problems_path().read_text(encoding="utf-8"))
+        # Nothing is offered again because a record was dropped: the chat's own state was kept.
+        self.assertEqual("", self.prompt())
+        with mock.patch.object(Store, "open", side_effect=AssertionError("waited on the write lock")):
+            self.assertFalse(connected._has_changes(None))  # nor does the sync check after every hook
+
     def test_a_memory_added_after_the_briefing_is_told_once_at_the_next_message(self) -> None:
         known = self.remember("Alpha builds with make.", self.alpha)
         self.assertIn(known, self.start())

@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from . import journal
+from .secrets import redact
 from .memory import (
     DISPUTED_TAG, QUESTION_CHECK_DAYS, QUESTION_REVIEW_DAYS, VERIFICATION_STRENGTH, Memory, MemoryInputError,
     is_users_choice,
@@ -404,7 +405,7 @@ def settle(memory: Memory, question: dict[str, Any], choice: str, *, by: str, ev
     if question["kind"] != "conflict" or choice not in ("use_new", "keep_mine", "keep_both"):
         return None
     now = memory.now()
-    note = " ".join(f"settled by {by}: {evidence}".split())[:200]
+    note = " ".join(f"settled by {by}: {redact(evidence)}".split())[:200]
     checked = by != "KnowItAll2" and bool(evidence.strip())
     with memory.store.transaction():
         current = memory.store.question(question["id"])
@@ -461,7 +462,7 @@ def _settle_possible_rule(memory: Memory, question: dict[str, Any], choice: str,
     """Keep a guessed rule as a note, or forget it, without asking the user (never a rule, never their words)."""
 
     now = memory.now()
-    note = " ".join(f"settled by {by}: {evidence}".split())[:200]
+    note = " ".join(f"settled by {by}: {redact(evidence)}".split())[:200]
     with memory.store.transaction():
         current = memory.store.question(question["id"])
         if current is None or current["status"] != "open":
@@ -566,9 +567,12 @@ def settle_task(memory: Memory, task_id: str, *, choice: str, found: str, certai
     if task is None or task["status"] != "open":
         raise MemoryInputError(f"There is no open KnowItAll2 task [{task_id}].")
     who = memory.agent or "an agent"
-    found = " ".join(str(found or "").split())[:600]
+    found = " ".join(str(found or "").split())
     if task["kind"] == "find_out":
-        return _found_out(memory, task, found, certain)
+        return _found_out(memory, task, found[:600], certain)  # saved through remember, which refuses a secret
+    # What an agent reports is kept as a finding, which every computer and the Questions screen show: any secret
+    # in it is redacted before it is cut short (review 2026-10-24, F-16).
+    found = redact(found)[:600]
     question = memory.store.question(task["question_id"] or "")
     if question is None or question["status"] != "open":
         memory.store.update_task(task["id"], status="done", now=memory.now())

@@ -373,9 +373,9 @@ def learning_settings(query, body, match) -> dict[str, Any]:
         if backend and backend != settings.backend:
             settings.backend = backend
             if not model:
-                settings.model = _default_model(backend, _engine_path(backend))
+                settings.model, settings.model_chosen = _default_model(backend, _engine_path(backend)), False
         if model:
-            settings.model = model
+            settings.model, settings.model_chosen = model, True
         save_settings(settings)
     changed = [name.replace("_", " ") for name in ("max_calls_per_run", "max_calls_per_day", "settle_minutes")
                if before[name] != getattr(settings, name)]
@@ -767,8 +767,9 @@ def _sharing() -> dict[str, Any] | None:
     status = connected.read_status()
     return {"address": connection.address, "agents": sorted(connection.keys),
             "last_success": status.get("last_success"), "problem": status.get("problem"),
-            "problem_status": status.get("problem_status"), "unsent": bool(status.get("unsent")),
-            "unresolved_rejections": status.get("unresolved_rejections", 0)}
+            "problem_status": status.get("problem_status"), "problem_kind": status.get("problem_kind"),
+            "stuck": connected.sync_stuck(status), "unsent": bool(status.get("unsent")),
+            "unresolved_rejections": status.get("unresolved_rejections", 0), "set_aside": status.get("set_aside", 0)}
 
 
 def _add_sharing_health(health: dict[str, Any], sharing: dict[str, Any] | None) -> None:
@@ -784,9 +785,24 @@ def _add_sharing_health(health: dict[str, Any], sharing: dict[str, Any] | None) 
                 "hint": "Run knowitall2 sync --rejections to inspect, correct, retry or dismiss them."},
                 "text": f"{sharing['unresolved_rejections']} local change(s) were refused by the server and need review."}
     elif sharing["problem"]:
-        item = {"level": "attention", "action": None,
-                "text": f"The KnowItAll2 server at {sharing['address']} could not be reached at the last try. "
-                        "Memories saved here wait and are sent when it is back."}
+        # Said as it is: only a sync that got no answer was "not reached" (review 2026-10-24, R3 group fix 4).
+        stuck = bool(sharing.get("stuck"))
+        if sharing.get("problem_kind") == "unreachable":
+            text = (f"The KnowItAll2 server at {sharing['address']} could not be reached at the last try. "
+                    "Memories saved here wait and are sent when it is back.")
+        else:
+            text = f"The last sync with the KnowItAll2 server at {sharing['address']} did not work: {sharing['problem']}"
+        if stuck:
+            text += (f" No sync has worked since {sharing['last_success']}." if sharing.get("last_success")
+                     else " No sync has worked for over an hour.")
+        item = {"level": "problem" if stuck else "attention", "text": text, "action": {
+            "label": "How to check", "hint": "Run knowitall2 sync to see the error, and knowitall2 doctor."}
+            if stuck else None}
+    elif sharing.get("set_aside"):
+        item = {"level": "attention", "action": {"label": "What to do", "hint": (
+            "Update KnowItAll2 on this computer; the rows are tried again at every sync.")},
+                "text": f"{sharing['set_aside']} row(s) from the KnowItAll2 server are set aside until this computer "
+                        "can use them."}
     else:
         return
     health["items"].append(item)

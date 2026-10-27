@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .. import catalog, review
+from ..secrets import redact
 from ..memory import VERIFICATION_STRENGTH, Memory, is_users_choice, keywords
 from .extractor import ExtractionError, payload_items
 
@@ -664,5 +665,8 @@ def _related(memory: Memory, records: list[Any], *, limit: int = 5) -> list[Any]
 
 
 def _clean(value: object, limit: int) -> str:
-    text = " ".join(str(value or "").split())
+    """Model output or memory text on one line, any secret redacted before it is cut short (review
+    2026-10-24, F-16), within ``limit`` characters."""
+
+    text = " ".join(redact(str(value or "")).split())
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."

@@ -327,21 +327,32 @@ def _pointers(payload: dict[str, Any], store: Any, said: Sequence[str], state: d
 
 
 def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None) -> str:
-    """What is new to this chat since its briefing: memories added since, and projects it moved to."""
+    """What is new to this chat since its briefing: memories added since, and projects it moved to.
+
+    Read on the store opened only to read, as the session start's briefing is (``_briefing``): another process
+    holding the write lock (an import, a large sync, maintenance) never holds up the user's message. What it
+    records (uses of memories, the project's last use, what it offered) is written after, waiting at most
+    ``WRITE_TIMEOUT_SECONDS``, and dropped when the store stays busy (review 2026-10-24, F-25).
+    """
 
     from . import chats
     from .identity import identify
     from .memory import Memory
-    from .store import Store
+    from .store import Store, StoreError
 
     chat = chats.chat_key(_text(payload, "session_id"), transcript)
     if chat is None:
         return ""
     state = chats.load(chat)
     parts: list[str] = []
-    store = Store.open(database_path())
+    try:
+        store, reading = Store.open_read_only(database_path()), True
+    except StoreError:
+        store, reading = Store.open(database_path()), False  # not created yet, or to be upgraded
     try:
         memory = Memory(store, agent=agent)
+        if reading:
+            memory.put_off_writes()
         if state is None:
             # A chat that began before KnowItAll2 kept chat state: its briefing had no table of
             # contents, so give it its project's once, then carry on from now.
@@ -406,6 +417,16 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
             state["told"] += [record_id for record_id, _ in new]  # all of them: the rest is not advertised
     finally:
         store.close()
+    if reading:
+        try:
+            writer = Store.open(database_path(), timeout=WRITE_TIMEOUT_SECONDS)
+            try:
+                memory.make_writes(writer)
+            finally:
+                writer.close()
+        except Exception as exc:
+            journal.problem(f"message hook ({agent})", "what it records (uses of memories, the project's last use) "
+                                                       f"was not kept: {type(exc).__name__}: {exc}")
     chats.save(chat, state)
     return "\n\n".join(parts)
 

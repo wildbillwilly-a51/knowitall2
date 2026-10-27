@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from .identity import ProjectIdentity
+from .secrets import find_secrets, redact
 
 SCHEMA_VERSION = 3
 # The tag of a memory a question is checking (``memory.DISPUTED_TAG``); closing the question takes it off.
@@ -218,6 +219,15 @@ class SyncedTable:
     ``columns`` is what travels (the table's own ``seq`` never does); a change
     to any of ``tracked`` counts as a change worth sharing. ``stamp`` names the
     columns that say which of two versions is newer (the first one set counts).
+
+    Free text is screened for secrets wherever it is written (review
+    2026-10-24, R4): ``content`` is what a memory says, refused when it holds
+    one; ``prose`` is what was said about it (reasons, findings, summaries),
+    kept with the secret redacted, so that retiring a memory saved before the
+    screening knew a shape is never blocked. ``parents`` names the shared rows
+    a row belongs to, (column, parent table), whether or not SQLite enforces
+    the link (review 2026-10-24, F-14): a row waits for its parents on both
+    sides of a sync.
     """
 
     name: str
@@ -227,16 +237,23 @@ class SyncedTable:
     stamp: tuple[str, ...]
     json_columns: tuple[str, ...] = ()
     deletable: bool = False
+    content: tuple[str, ...] = ()
+    prose: tuple[str, ...] = ()
+    parents: tuple[tuple[str, str], ...] = ()
+
+
+def _names(text: str) -> tuple[str, ...]:
+    return tuple(column.strip() for column in text.split(",") if column.strip())
 
 
 def _synced(name: str, key: str, columns: str, *, quiet: str = "", stamp: str, json_columns: str = "",
-            deletable: bool = False) -> SyncedTable:
-    names = tuple(column.strip() for column in columns.split(","))
-    silent = {column.strip() for column in quiet.split(",") if column.strip()}
+            deletable: bool = False, content: str = "", prose: str = "", parents: str = "") -> SyncedTable:
+    names = _names(columns)
+    silent = set(_names(quiet))
     return SyncedTable(
         name, key, names, tuple(column for column in names if column not in silent and column != key),
-        tuple(column.strip() for column in stamp.split(",")),
-        tuple(column.strip() for column in json_columns.split(",") if column.strip()), deletable,
+        _names(stamp), _names(json_columns), deletable, _names(content), _names(prose),
+        tuple(tuple(link.split(">")) for link in _names(parents)),  # type: ignore[misc]
     )
 
 
@@ -245,23 +262,52 @@ SYNCED_TABLES: dict[str, SyncedTable] = {table.name: table for table in (
     _synced("projects", "id", "id, name, remote, created_at, last_seen_at", quiet="created_at, last_seen_at",
             stamp="last_seen_at"),
     _synced("systems", "id", "id, name, area, kind, aliases, summary, gaps, profiled, created_at, updated_at",
-            stamp="updated_at", json_columns="aliases, gaps"),
+            stamp="updated_at", json_columns="aliases, gaps", prose="name, aliases, summary, gaps"),
     _synced("records", "id", "id, kind, text, subjects, tags, scope, project_id, status, verification, "
             "source_kind, source_agent, source_session, content_hash, created_at, updated_at, confirmed_at, "
             "superseded_by, retired_reason, recall_count, last_used_at, source_computer",
             quiet="recall_count, last_used_at",
-            stamp="updated_at", json_columns="subjects, tags"),
+            stamp="updated_at", json_columns="subjects, tags", content="text, subjects, tags",
+            prose="retired_reason", parents="project_id>projects"),
     _synced("record_notes", "record_id", "record_id, headline, system_id, facet, written_by, written_at",
-            stamp="written_at"),
+            stamp="written_at", prose="headline", parents="record_id>records, system_id>systems"),
     _synced("questions", "id", "id, kind, prompt, record_ids, options, status, created_at, answered_at, answer",
-            stamp="answered_at, created_at", json_columns="record_ids, options"),
+            stamp="answered_at, created_at", json_columns="record_ids, options", prose="prompt, options, answer"),
     _synced("question_stages", "question_id", "question_id, stage, plain, labels, reason, findings, updated_at",
-            stamp="updated_at", json_columns="labels, findings"),
+            stamp="updated_at", json_columns="labels, findings", prose="plain, labels, reason, findings",
+            parents="question_id>questions"),
     _synced("agent_tasks", "id", "id, kind, question_id, system_id, project_id, facet, prompt, status, offered, "
-            "result, created_at, updated_at", stamp="updated_at"),
+            "result, created_at, updated_at", stamp="updated_at", prose="prompt, result",
+            parents="question_id>questions, system_id>systems, project_id>projects"),
     _synced("reviews", "fingerprint", "fingerprint, scope_key, reviewed_at, outcome, failures",
             stamp="reviewed_at", deletable=True),
 )}
+
+
+class SecretRefused(ValueError):
+    """Memory content that holds a secret: refused where it is written, as ``remember`` refuses it."""
+
+
+def refuse_secrets(*texts: str | None) -> None:
+    """Raise :class:`SecretRefused` when any of these, read together, holds a secret."""
+
+    findings = find_secrets("\n".join(text for text in texts if text))
+    if findings:
+        kinds = ", ".join(sorted({finding.kind for finding in findings}))
+        raise SecretRefused(f"Not saved: this looks like it contains a secret ({kinds}). KnowItAll2 never stores "
+                            "secrets; save where the credential is kept instead.")
+
+
+def scrub(value: Any) -> Any:
+    """Diagnostic prose with every secret in it redacted: text, or lists and dicts of it, string by string."""
+
+    if isinstance(value, str):
+        return redact(value) if find_secrets(value) else value
+    if isinstance(value, (list, tuple)):
+        return [scrub(item) for item in value]
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items()}
+    return value
 
 # Change tracking is off unless the database says so: a server always tracks,
 # a computer connected to one tracks its own changes to send. While a
@@ -756,6 +802,7 @@ class Store:
         source_session: str | None = None,
         source_computer: str | None = None,
     ) -> None:
+        refuse_secrets(text, *subjects, *tags)
         self._connection.execute(
             "INSERT INTO records (id, kind, text, subjects, tags, scope, project_id, status, verification, "
             "source_kind, source_agent, source_session, content_hash, created_at, updated_at, confirmed_at, "
@@ -826,7 +873,7 @@ class Store:
         self._connection.execute(
             "UPDATE records SET status = 'superseded', superseded_by = ?, retired_reason = ?, updated_at = ? "
             "WHERE id = ? AND status = 'active'",
-            (new_id, reason, now, old_id),
+            (new_id, scrub(reason), now, old_id),
         )
 
     def restore(self, record_id: str, *, verification: str, now: str) -> bool:
@@ -861,7 +908,7 @@ class Store:
         cursor = self._connection.execute(
             "UPDATE records SET status = 'retired', retired_reason = ?, updated_at = ? "
             "WHERE id = ? AND status = 'active'",
-            (reason, now, record_id),
+            (scrub(reason), now, record_id),
         )
         return cursor.rowcount == 1
 
@@ -1009,7 +1056,8 @@ class Store:
             self._connection.execute(
                 "INSERT INTO questions (id, kind, prompt, record_ids, options, status, created_at) "
                 "VALUES (?, ?, ?, ?, ?, 'open', ?)",
-                (question_id, kind, prompt, json.dumps(list(record_ids)), json.dumps(list(options)), now),
+                (question_id, kind, scrub(prompt), json.dumps(list(record_ids)), json.dumps(scrub(list(options))),
+                 now),
             )
         return True
 
@@ -1040,7 +1088,7 @@ class Store:
 
         cursor = self._connection.execute(
             "UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'",
-            (answer, now, question_id),
+            (scrub(answer), now, question_id),
         )
         if cursor.rowcount != 1:
             return False
@@ -1081,7 +1129,8 @@ class Store:
         """Add a system, or update its name, area, and kind and add to its aliases."""
 
         existing = self.system(system_id)
-        merged = list(dict.fromkeys([*(existing["aliases"] if existing else []), *aliases]))
+        merged = list(dict.fromkeys([*(existing["aliases"] if existing else []), *scrub(list(aliases))]))
+        name = scrub(name)
         self._connection.execute(
             "INSERT INTO systems (id, name, area, kind, aliases, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET name = excluded.name, area = excluded.area, kind = excluded.kind, "
@@ -1094,13 +1143,13 @@ class Store:
 
         self._connection.execute(
             "UPDATE systems SET aliases = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(list(dict.fromkeys(aliases))), now, system_id),
+            (json.dumps(list(dict.fromkeys(scrub(list(aliases))))), now, system_id),
         )
 
     def set_system_profile(self, system_id: str, *, summary: str, gaps: Sequence[str], profiled: str, now: str) -> None:
         self._connection.execute(
             "UPDATE systems SET summary = ?, gaps = ?, profiled = ?, updated_at = ? WHERE id = ?",
-            (summary, json.dumps(list(gaps)), profiled, now, system_id),
+            (scrub(summary), json.dumps(scrub(list(gaps))), profiled, now, system_id),
         )
 
     def set_system_profiled(self, system_id: str, *, profiled: str, now: str) -> None:
@@ -1114,7 +1163,8 @@ class Store:
         """Replace only what a system's profile says is missing, such as after a gap was filled."""
 
         self._connection.execute(
-            "UPDATE systems SET gaps = ?, updated_at = ? WHERE id = ?", (json.dumps(list(gaps)), now, system_id),
+            "UPDATE systems SET gaps = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(scrub(list(gaps))), now, system_id),
         )
 
     def set_note(
@@ -1125,7 +1175,7 @@ class Store:
             "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET headline = excluded.headline, "
             "system_id = excluded.system_id, facet = excluded.facet, written_by = excluded.written_by, "
             "written_at = excluded.written_at",
-            (record_id, headline, system_id, facet, written_by, now),
+            (record_id, scrub(headline), system_id, facet, written_by, now),
         )
 
     def add_note(
@@ -1141,7 +1191,7 @@ class Store:
             "INSERT INTO record_notes (record_id, headline, system_id, facet, written_by, written_at) "
             "SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM records WHERE id = ? AND status = 'active') "
             "ON CONFLICT (record_id) DO NOTHING",
-            (record_id, headline, system_id, facet, written_by, now, record_id),
+            (record_id, scrub(headline), system_id, facet, written_by, now, record_id),
         )
         return cursor.rowcount == 1
 
@@ -1253,6 +1303,11 @@ class Store:
         ]
 
     def set_tags(self, record_id: str, tags: Sequence[str], *, now: str) -> None:
+        """Replace a memory's tags. A new tag holding a secret is refused; one it already had is kept, so taking
+        a tag off a memory saved before the screening knew a shape is never blocked."""
+
+        current = self.get(record_id)
+        refuse_secrets(*(tag for tag in tags if current is None or tag not in current.tags))
         self._connection.execute(
             "UPDATE records SET tags = ?, updated_at = ? WHERE id = ?",
             (json.dumps(list(tags)), now, record_id),
@@ -1397,7 +1452,8 @@ class Store:
         """Move a question to a stage, keeping earlier plain wording and findings unless new ones are given."""
 
         current = self.question_stage(question_id) or {"plain": None, "labels": {}, "reason": None, "findings": []}
-        findings = current["findings"] + ([finding] if finding else [])
+        findings = current["findings"] + ([scrub(finding)] if finding else [])
+        plain, labels, reason = scrub(plain), scrub(labels), scrub(reason)
         self._connection.execute(
             "INSERT INTO question_stages (question_id, stage, plain, labels, reason, findings, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (question_id) DO UPDATE SET stage = excluded.stage, "
@@ -1415,7 +1471,7 @@ class Store:
         self._connection.execute(
             "INSERT INTO agent_tasks (id, kind, question_id, system_id, project_id, facet, prompt, status, created_at, "
             "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
-            (task_id, kind, question_id, system_id, project_id, facet, prompt, now, now),
+            (task_id, kind, question_id, system_id, project_id, facet, scrub(prompt), now, now),
         )
 
     def task(self, task_id: str) -> dict[str, Any] | None:
@@ -1440,7 +1496,7 @@ class Store:
         self._connection.execute(
             "UPDATE agent_tasks SET status = COALESCE(?, status), offered = offered + ?, "
             "result = COALESCE(?, result), updated_at = ? WHERE id = ?",
-            (status, 1 if offered else 0, result, now, task_id),
+            (status, 1 if offered else 0, scrub(result), now, task_id),
         )
 
     def open_question_record_ids(self) -> set[str]:

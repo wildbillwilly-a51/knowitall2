@@ -74,6 +74,8 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("KnowItAll2 key", re.compile(r"(?<![\w\-])kia_[A-Za-z0-9_\-]{40,}")),
     ("connection-string password", re.compile(
         r"\b(?:password|pwd)\s*=\s*[^;\s'\"]{3,%d}+\s*;" % _REACH, re.IGNORECASE)),
+    # A bot's number, a colon, and 35 characters.
+    ("Telegram bot token", re.compile(r"(?<![\w\-:])\d{8,10}:[A-Za-z0-9_\-]{35}(?![\w\-])")),
 )
 
 
@@ -109,9 +111,35 @@ def _bearer_value(match: str) -> bool:
     return bool(re.search(r"[0-9._~+/=]", value) or (re.search(r"[a-z]", value) and re.search(r"[A-Z]", value)))
 
 
+def _random_base64(value: str) -> bool:
+    """Whether 40 base64 characters look drawn at random, as an AWS secret key is, rather than a path or a word.
+
+    A random one has upper and lower case letters and digits, two of each at least, rarely more than three
+    slashes, no run of ten letters in one case, and twenty different characters at least; a path starts with a
+    slash or has one between short words, words run together ("healthyunchangedSundayStartedAt10") have long
+    runs, and a placeholder repeats a few characters ("AB12cd34" five times).
+    """
+
+    if (value.startswith("/") or "//" in value or value.count("/") > 3 or re.search(r"[a-z]{10}|[A-Z]{10}", value)
+            or len(set(value)) < 20):
+        return False
+    return (sum(character.isupper() for character in value) >= 2 and sum(character.islower() for character in value) >= 2
+            and sum(character.isdigit() for character in value) >= 2)
+
+
+def _webhook_secret(url: str) -> bool:
+    """Whether a Slack webhook's last part is a real secret, not a placeholder such as "XXXXXXXX"."""
+
+    return len(set(url.rstrip("/").rpartition("/")[2])) >= 8
+
+
 # Shapes matched first and judged afterwards; the secret is the "value" group, or the whole match.
 _CHECKED_TOKENS: tuple[tuple[str, re.Pattern[str], Callable[[str], bool]], ...] = (
     ("bearer token", re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=\-]{16,}", re.IGNORECASE), _bearer_value),
+    ("Slack webhook", re.compile(r"\bhooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9_/\-]{20,%d}"
+                                 % _REACH), _webhook_secret),
+    # An AWS secret access key given without its name: exactly 40 base64 characters standing alone.
+    ("secret", re.compile(r"(?<![A-Za-z0-9+/=_\-.:])[A-Za-z0-9+/]{40}(?![A-Za-z0-9+/=_\-])"), _random_base64),
     # The KnowItAll2 server's recovery and setup codes: five groups of four from the code alphabet, which has no
     # 0, 1, I or O. A real one holds about 15 different characters; one with fewer than 8 ("XXXX-XXXX-...",
     # "ABCD-ABCD-...") is a placeholder.
@@ -123,6 +151,14 @@ _CHECKED_TOKENS: tuple[tuple[str, re.Pattern[str], Callable[[str], bool]], ...] 
     ("registry credentials", re.compile(
         r"[\"']auth[\"'][ \t]*:[ \t]*[\"'](?P<value>[A-Za-z0-9+/]{4,%d}={0,2})[\"']" % _REACH), _basic_credentials),
 )
+# 32 random bytes in hex, as `openssl rand -hex 32` makes a signing key, named as a key without "=" or ":"
+# ("the signing key <hex>"). The same shape is far more often a SHA-256 digest, an image id or a file's checksum,
+# so hex with no secret's word just before it, or with a hash's word, is not taken for one.
+_BARE_HEX = re.compile(r"(?<![A-Za-z0-9_\-+/=.:$])[0-9A-Fa-f]{64}(?![A-Za-z0-9_\-+/=])")
+_HEX_KEY_WORDS = re.compile(r"\b(?:key|secret|token|password|passphrase|credential|hmac|seed)s?\b", re.IGNORECASE)
+_HASH_WORDS = re.compile(r"hash|digest|sha|checksum|\bsum\b|fingerprint|integrity|\bcommit|\bimage|\bid\b|\bpublic\b"
+                         r"|\bmac\b|\bprimary\b|\bforeign\b|\bobject\b|\bcache\b|\brow\b|\bpartition\b",
+                         re.IGNORECASE)
 # A PuTTY key file's private lines: as many lines as the header says.
 _PUTTY_PRIVATE = re.compile(r"(?<![\w\-])Private-Lines:[ \t]*(?P<lines>\d{1,2})[ \t]*\r?\n(?=[A-Za-z0-9+/=]{16})")
 
@@ -165,6 +201,7 @@ _UPPER_KEY = re.compile(r"^[A-Z][A-Z0-9]*(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY)
 _PROSE_KEY = re.compile(r"pass(?:word|wd|phrase)$", re.IGNORECASE)
 # A psk names a WPA key, which has 8 characters at least; "PSK=0x20" is a mode's number in a table.
 _PSK_KEY = re.compile(r"(?:^|[_\-.])psk$", re.IGNORECASE)
+_BARE_PASS_KEY = re.compile(r"(?:^|[_\-.])pass$", re.IGNORECASE)
 _HEX_NUMBER = re.compile(r"0x[0-9a-f]+", re.IGNORECASE)
 
 # "the root password for nas01 is X", when X has a digit or a symbol: "the
@@ -175,6 +212,26 @@ _PROSE_FOR = re.compile(
     re.IGNORECASE,
 )
 _PASSWORD_SHAPED = re.compile(r"[0-9]|[^A-Za-z0-9\s]")
+# "the API token is X", "the access key was X": a value after "is" or "was" counts when it is token-shaped.
+_PROSE_TOKEN = re.compile(
+    r"\b(?:(?:api|access|secret|private|auth|bearer|session|refresh|bot)[ \t_\-]?(?:token|key)|token)"
+    r"[ \t]+(?:is|was)\s+" + _VALUE_GROUP,
+    re.IGNORECASE,
+)
+# One word ending a sentence after a password's "is" or "was" names the password itself, unless it describes
+# one: these words, and words with the endings of adjectives and participles.
+_DESCRIBING_WORDS = frozenset({
+    "strong", "stronger", "strongest", "weaker", "weakest", "longer", "shorter", "secure", "insecure", "simple",
+    "complex", "unique", "random", "enough", "broken", "public", "private", "plain", "plaintext", "cleartext",
+    "obsolete", "stale", "unsafe", "standard", "obvious", "trivial", "guessable", "visible", "elsewhere",
+    "inside", "within", "attached", "below", "above", "overdue", "useless", "special", "temporary", "current",
+    "personal", "separate", "different", "identical", "mandatory", "sensitive", "unchanged", "working",
+    "outdated", "complete", "incomplete", "accepted", "rejected", "pending", "unknown", "secret", "same",
+    "lost", "gone", "known", "elsewhere", "somewhere", "nowhere",
+})
+# "forgotten", "written", "stolen" and "chosen" describe one too.
+_DESCRIBING_ENDINGS = ("ed", "ing", "ive", "ible", "able", "ful", "less", "ous", "ent", "ant", "al", "ic", "ary",
+                       "ory", "ly", "ure", "est", "en")
 # Factory and habitual passwords, which are passwords even as plain words, such as a device's default.
 _WELL_KNOWN_PASSWORDS = frozenset({"password", "admin", "changeme", "letmein", "welcome", "qwerty", "toor", "root",
                                    "ubnt", "raspberry", "guest", "abc123", "passw0rd"})
@@ -229,6 +286,12 @@ _COMMAND_FORMS: tuple[_Form, ...] = (
     (("username",), re.compile(r"\busername\s+\S{1,64}(?:\s+privilege\s+\d{1,2})?\s+(?:password|secret)\s+[07]\s+"
                                r"(?P<value>\S{1,%d})" % _REACH)),
     (("wpa-psk",), re.compile(r"\bwpa-psk\s+(?:ascii|hex)\s+[07]\s+(?P<value>\S{1,%d})" % _REACH)),
+    # Sysinternals PsExec's -p, and a scheduled task's run-as password
+    (("psexec",), re.compile(r"\b(?i:psexec)(?:64)?(?:\.exe)?\b" + _OPTIONS + r"\s-p[ \t]+" + _ARGUMENT)),
+    (("schtasks",), re.compile(r"\b(?i:schtasks)(?:\.exe)?\b" + _OPTIONS + r"\s/(?i:rp)[ \t]+" + _ARGUMENT)),
+    # A .pgpass line: host:port:database:user:password, where the port is a number or "*"
+    ((":",), re.compile(r"(?m:^)[ \t]*[^\s:#][^\s:]{0,252}:(?:\d{1,5}|\*):[^\s:]{1,64}:[^\s:]{1,64}:"
+                        r"(?P<value>[^\s:]\S{0,%d})[ \t\r]*(?m:$)" % _REACH)),
 )
 # Forms prose can take too ("net user alice to list her groups"): the value must also look like a password
 # (quoted, holding a digit or symbol, or a well-known one), as for prose.
@@ -259,6 +322,11 @@ _PASSPHRASE_FORMS: tuple[_Form, ...] = (
     (("option",), re.compile(r"(?m:^)[ \t]*option[ \t]+key[ \t]+(?P<value>[^\s\"'\-]\S{0,%d})[ \t\r]*(?m:$)"
                              % _REACH)),
     (("uci",), re.compile(r"\buci\s+set\s+[\w.\-@\[\]]{1,128}\.key=" + _ARGUMENT)),
+    # Windows: the keyMaterial setting of netsh's hosted network and of a WLAN profile's XML, and the Key Content
+    # line that netsh wlan show profile prints with key=clear.
+    (("keymaterial",), re.compile(r"(?<![\w\-])(?i:keymaterial)[ \t]*[=>][ \t]*"
+                                  r"(?P<value>\"[^\"\n]*\"|'[^'\n]*'|[^\s\"'<\-][^\s,;<]{0,%d})" % _REACH)),
+    (("key content",), re.compile(r"\b(?i:key content)[ \t]*:[ \t]*(?P<value>[^\s\"'\-]\S{0,%d})" % _REACH)),
 )
 # OpenWrt's other secret options ("option password", "option sae_password", "option auth_secret").
 _UCI_OPTION = re.compile(r"(?<![\w\-])option\s+(?P<key>[A-Za-z_]\w{0,63})\s+" + _ARGUMENT)
@@ -347,9 +415,17 @@ def find_secrets(text: str) -> list[SecretFinding]:
             continue
         if not _fits_key(key, value.group()):
             continue
-        if match.group("prose") and not _prose_password(value.group()):
+        if match.group("prose") and not (_prose_password(value.group()) or _named_password(text, value)):
             continue  # "the password is weak", "the password was shared": prose, as with "for nas01 is weak"
         findings.append(SecretFinding(kind, value.start(), ends.end(*value.span())))
+    for match in _PROSE_TOKEN.finditer(text):
+        if not _is_reference(match.group("value"), loose=True):
+            kind = "token" if "token" in match.group().lower() else "API key"
+            findings.append(SecretFinding(kind, match.start("value"), ends.end(*match.span("value"))))
+    for match in _BARE_HEX.finditer(text):
+        before = text[max(0, match.start() - 32):match.start()]
+        if _HEX_KEY_WORDS.search(before) and not _HASH_WORDS.search(before) and "$ANSIBLE_VAULT" not in text:
+            findings.append(SecretFinding("secret", match.start(), match.end()))
     for match in _PROSE_FOR.finditer(text):
         value = match.group("value")
         if _PASSWORD_SHAPED.search(value.strip(_QUOTES).rstrip(_TRAILING)) and not _is_reference(value):
@@ -406,7 +482,9 @@ def find_secrets(text: str) -> list[SecretFinding]:
                 continue
             group = match.lastgroup   # "value", or "word" for an unquoted argument
             for cookie in _COOKIE.finditer(match.group(group)):
-                if not _is_reference(cookie.group("value"), loose=True):
+                # A session id may be all lowercase letters: one long run of them is a value, not words.
+                if re.fullmatch(r"[a-z]{16,}", cookie.group("value")) or not _is_reference(cookie.group("value"),
+                                                                                           loose=True):
                     start = match.start(group) + cookie.start("value")
                     findings.append(SecretFinding("session cookie", start, start + len(cookie.group("value"))))
     # Two forms may find the same value, as "option key" on a config line of its own.
@@ -464,10 +542,30 @@ def _prose_password(value: str) -> bool:
     raw = value.strip().rstrip(".,:;!?)]}")
     if raw[:1] in _QUOTES and raw[-1:] == raw[:1] and len(raw) > 2:
         return True
-    bare = raw.strip(_QUOTES)
+    # A quotation that ends with the sentence ('he wrote "the password is weak."') leaves its full stop inside.
+    bare = raw.strip(_QUOTES).rstrip(".,:;!?)]}")
     if bare.lower() in _WELL_KNOWN_PASSWORDS:
         return True
     return bool(_PASSWORD_SHAPED.search(bare)) and not re.fullmatch(r"[A-Za-z]+(?:-[A-Za-z]+)+", bare)
+
+
+def _named_password(text: str, value: re.Match[str]) -> bool:
+    """Whether prose names a password as one word that ends its sentence, after "the admin password is".
+
+    A word that describes a password ("is temporary", "was rotated") does not, nor one that more words follow
+    ("is twelve characters long"), which is how a description goes on.
+    """
+
+    raw = value.group()
+    word = raw.rstrip(".!?;,)" + _QUOTES).rstrip(".!?;,)")
+    if not re.fullmatch(r"[A-Za-z]{6,}", word):
+        return False
+    rest = text[value.end():value.end() + 2]
+    if word == raw and rest[:1] not in ("", "\n", "\r", ",", ";"):
+        return False
+    lowered = word.lower()
+    return (lowered not in _REFERENCE_WORDS and lowered not in _DESCRIBING_WORDS
+            and not lowered.endswith(_DESCRIBING_ENDINGS))
 
 
 # How documentation writes a user name and password ("user%pass", "user:password"), not one.
@@ -519,11 +617,18 @@ def _curl_option(text: str, start: int) -> bool:
 
 
 def _fits_key(key: str, value: str) -> bool:
-    """Whether a value can be what its key names: a psk's must be long enough for a WPA key, and not a 0x number."""
+    """Whether a value can be what its key names.
 
+    A psk's must be long enough for a WPA key, and not a 0x number. A bare "pass" is also a test count
+    ("pass=1078 fail=0"), so its value needs a digit or symbol and must not be a number.
+    """
+
+    bare = value.strip().strip(_QUOTES)
+    if _BARE_PASS_KEY.search(key):
+        word = bare.rstrip(_TRAILING)
+        return bool(_PASSWORD_SHAPED.search(word)) and not re.fullmatch(r"[\d.,:/%]+", word)
     if not _PSK_KEY.search(key):
         return True
-    bare = value.strip().strip(_QUOTES)
     return len(bare) >= 8 and not _HEX_NUMBER.fullmatch(bare.rstrip(_TRAILING))
 
 

@@ -587,7 +587,9 @@ def _push(handler: ServerHandler, query: dict[str, list[str]], body: dict[str, A
 
     def work(store: Store) -> dict[str, Any]:
         connection = handler.authenticated(store)
-        answers = exchange.apply_operations(store, connection["id"], operations, now=handler.server.clock())
+        # A computer newer than 0.12.0 asks for each row's parents to be checked (``exchange.apply_operations``).
+        answers = exchange.apply_operations(store, connection["id"], operations, now=handler.server.clock(),
+                                            parents=body.get("parents") is True)
         return {"results": answers, "latest": exchange.summary(store)["latest"]}
 
     _with_store(handler, work)

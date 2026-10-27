@@ -50,6 +50,10 @@ PUTTY = ("PuTTY-User-" + "Key-File-3: ssh-ed25519\nEncryption: none\nComment: bu
          + "\nPrivate-MAC: " + fake(64, "0123456789abcdef"))
 BEGIN_RSA = "-----BEGIN " + "RSA PRIVATE " + "KEY-----"
 MIXED_CASE = fake(10, string.ascii_lowercase) + fake(10, string.ascii_uppercase)
+# An AWS secret's shape: two of each kind of character at least, placed at random.
+BARE_AWS = "".join(_RANDOM.sample("Ab3+Zx9/" + fake(32), 40))
+HEX64 = fake(64, "0123456789abcdef")
+TELEGRAM = fake(10, string.digits) + ":AA" + fake(33, _URLSAFE)
 
 # label: (text, the fake secret in it, which must not survive redaction)
 SECRETS = {
@@ -224,6 +228,24 @@ SECRETS = {
     "OpenWrt option key quoted in a sentence": (f"The guest network has option key '{LETTERS}' in /etc/config/wireless.",
                                                 LETTERS),
     "OpenWrt option key shaped in a sentence": (f"Set option key {SHAPED} for the guest network.", SHAPED),
+    # Review 2026-10-24, F-18: shapes the 81-case probe missed.
+    "an unlabeled AWS secret": (f"the second value it printed was {BARE_AWS}", BARE_AWS),
+    "64 hex characters alone": (f"signing key {HEX64} goes in the env file", HEX64),
+    "Slack webhook": ("post to https://hooks.slack" + f".com/services/T{fake(8, string.ascii_uppercase)}/"
+                      f"B{fake(10, string.ascii_uppercase)}/{TOKEN[:24]}", TOKEN[:24]),
+    "Telegram bot token": (f"bot token {TELEGRAM}", TELEGRAM[-35:]),
+    ".pgpass line": (f"db01.lan:5432:*:postgres:{PASSWORD}\n", PASSWORD),
+    "psexec -p": (f"psexec \\\\srv01 -u admin -p {SHAPED} cmd", SHAPED),
+    "schtasks /rp": (f'schtasks /create /tn backup /ru svc_backup /rp {SHAPED} /sc daily', SHAPED),
+    "netsh keyMaterial": (f"netsh wlan set hostednetwork mode=allow ssid=Lab keyMaterial={LETTERS}", LETTERS),
+    "WLAN profile keyMaterial": (f"<keyMaterial>{LETTERS}</keyMaterial>", LETTERS),
+    "netsh Key Content": (f"    Key Content            : {LETTERS}", LETTERS),
+    "a lowercase cookie value": (f"Cookie: sessionid={LETTERS}{LETTERS[:4]}", LETTERS),
+    "a one-word prose password": ("the admin password is swordfish", "swordfish"),
+    "a one-word prose password ending a quotation": ('He wrote "the NAS password is Kingfisher."', "Kingfisher"),
+    "a one-word prose password in a sentence": ("The NAS password is Kingfisher. Change it soon.", "Kingfisher"),
+    "prose API token": (f"the API token is {SHAPED}", SHAPED),
+    "prose access key": (f"The access key was {TOKEN} until it was rotated.", TOKEN),
 }
 
 REFERENCES = [
@@ -449,6 +471,40 @@ REFERENCES = [
     # "option key" in prose, not on an OpenWrt config line.
     "use the option key shortcuts",
     "option key shortcuts are listed in the editor's help",
+    # Review 2026-10-24, F-18: a test count under a bare "pass", and the new shapes' look-alikes.
+    "pass=1078 fail=0 skipped=9",
+    "unit tests: pass: 1078, fail: 0",
+    "sha256:" + HEX64,
+    "The table hash on all four stores is " + HEX64 + ".",
+    "SHA-256 of the release tar: " + HEX64,
+    "Image " + HEX64 + " is healthy after the deploy.",
+    "the cli config has client_id " + HEX64 + "; this app reads it",
+    '{"files": {"docs/local-saving.md": "' + HEX64 + '"}}',
+    "ap3g3-k9w8-tar.17_15_4_160.tar (" + HEX64.upper() + ")",
+    "the host's public key " + HEX64,
+    "Frigate healthy: FrigatehealthyunchangedSundayStartedAt10:44:41Z",
+    # Codex's review of step A: a repeated placeholder, a row's primary key, a password said to be forgotten.
+    "a placeholder such as " + "AB12cd34" * 5 + " goes here",
+    "the row's primary key is " + HEX64,
+    "the object key " + HEX64 + " names the upload",
+    "The admin password is forgotten.",
+    'Codex wrote that "The admin password is forgotten." read as a password.',
+    'The note says "the password is weak."',
+    "The old password was stolen, so it was changed.",
+    "C:/Projects/knowitall2/src/knowitall2/Server/Exchange",
+    "https://hooks.slack" + ".com/services/T00000000/B00000000/" + "X" * 24,
+    "localhost:5432:*:postgres:*",
+    "psexec \\\\srv01 -u admin -p $env:ADMIN_PASSWORD cmd",
+    "schtasks /create /tn backup /ru SYSTEM /sc daily",
+    "schtasks /create /tn backup /ru svc /rp * /sc daily",
+    "<keyMaterial>${WIFI_KEY}</keyMaterial>",
+    "the admin password is temporary",
+    "The password is complicated.",
+    "the password is swordfish-like in length",
+    "The password is stored elsewhere.",
+    "the API token is required for every call",
+    "the access key is rotated monthly",
+    "the token is valid for 1 hour",
 ]
 
 

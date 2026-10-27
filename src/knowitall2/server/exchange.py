@@ -3,7 +3,7 @@
 The server has the final word on what it accepts:
 
 - It checks every row like a computer would (``sync.check_row``) and screens
-  new or changed memory text for secrets again.
+  new or changed free text for secrets again (``sync.screen_row``).
 - A new memory that another computer already saved is kept as replaced by
   the first one, so one memory stays one memory.
 - A row exactly as the server already has it (such as a computer sending
@@ -27,10 +27,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..secrets import contains_secret
 from ..quotes import same_statement_text
 from ..store import BY_KEY, SYNCED_TABLES, Store, SyncedTable
-from ..sync import SyncError, check_key, check_row, delete_row, read_row, stamp, table_for, write_row
+from ..sync import (SyncError, check_key, check_row, delete_row, parent_links, read_row, screen_row, stamp,
+                    table_for, write_row)
 from . import later
 
 MAX_OPERATIONS = 500
@@ -83,11 +83,15 @@ def begin_run(store: Store, home: Path) -> str:
 
 
 def apply_operations(
-    store: Store, connection_id: str, operations: Sequence[object], *, now: str,
+    store: Store, connection_id: str, operations: Sequence[object], *, now: str, parents: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply one batch from one connection, in order; one answer per operation.
 
-    A rejected operation changes nothing and does not stop the rest.
+    A rejected operation changes nothing and does not stop the rest. ``parents``: a new row, or a row moved to
+    another parent, whose parent (``SyncedTable.parents``) the server does not have is refused, to be sent again
+    (``code`` "missing_parent"), as SQLite's own link refuses a memory without its project. Only computers that
+    ask get it (review 2026-10-24, F-14): an older one would send such a row again at every sync, since it does
+    not know to send the parent first or to set the row aside when the parent was refused.
     """
 
     if len(operations) > MAX_OPERATIONS:
@@ -98,14 +102,15 @@ def apply_operations(
         store.set_meta(BY_KEY, connection_id)
         before = connection.execute("SELECT COALESCE(MAX(seq), 0) FROM changes").fetchone()[0]
         for operation in operations:
-            answers.append(_apply_one(store, connection_id, operation, now))
+            answers.append(_apply_one(store, connection_id, operation, now, parents=parents))
         # When the server got each version, by its own clock, for weighing that version's time later.
         connection.execute("UPDATE changes SET at = ? WHERE seq > ?", (now, before))
         connection.execute("DELETE FROM meta WHERE key = ?", (BY_KEY,))
     return answers
 
 
-def _apply_one(store: Store, connection_id: str, operation: object, now: str) -> dict[str, Any]:
+def _apply_one(store: Store, connection_id: str, operation: object, now: str, *,
+               parents: bool = False) -> dict[str, Any]:
     connection = store.connection
     op_id = operation.get("op_id") if isinstance(operation, dict) else None
     if not isinstance(op_id, str) or not op_id or len(op_id) > 200:
@@ -116,7 +121,7 @@ def _apply_one(store: Store, connection_id: str, operation: object, now: str) ->
         return {"op_id": op_id, **json.loads(earlier[0])}
     connection.execute("SAVEPOINT operation")
     try:
-        answer = _apply_change(store, connection_id, operation, now)
+        answer = _apply_change(store, connection_id, operation, now, parents=parents)
     except (SyncError, sqlite3.IntegrityError) as exc:
         connection.execute("ROLLBACK TO operation")
         connection.execute("RELEASE operation")
@@ -125,6 +130,8 @@ def _apply_one(store: Store, connection_id: str, operation: object, now: str) ->
                                    "retry": isinstance(exc, sqlite3.IntegrityError) and "FOREIGN KEY" in str(exc)}
         if isinstance(exc, InvalidBase):
             refused.update(code="invalid_base", retry=True)
+        elif isinstance(exc, MissingParent):
+            refused.update(code="missing_parent", retry=True)
         current = _current(connection, operation)
         if current is not None:
             refused["row"], refused["seq"] = current
@@ -182,7 +189,12 @@ class InvalidBase(SyncError):
     """A client can safely forget this row's claimed revision and resend for conflict resolution."""
 
 
-def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], now: str) -> dict[str, Any]:
+class MissingParent(SyncError):
+    """The row belongs to a row the server does not have yet: send that one, then this again."""
+
+
+def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], now: str, *,
+                  parents: bool = False) -> dict[str, Any]:
     connection = store.connection
     table = table_for(operation.get("table"))
     key = check_key(operation.get("key"))
@@ -214,11 +226,16 @@ def _apply_change(store: Store, connection_id: str, operation: dict[str, Any], n
                     and target.get("superseded_by") == key and _same_memory(existing, target)):
                 row.update(status=existing["status"], superseded_by=existing["superseded_by"],
                            retired_reason=existing["retired_reason"])
-        changed_text = [row[column] for column in ("text", "subjects", "tags")
-                        if isinstance(row.get(column), str)
-                        and (existing is None or row[column] != existing.get(column))]
-        if contains_secret("\n".join(changed_text)):
-            raise SyncError("the memory looks like it holds a secret; save where the secret is kept instead")
+    # Every shared table's free text, as a computer's store screens it (review 2026-10-24, F-16): new or changed
+    # memory content with a secret is refused, and a secret in a reason or finding is redacted. The sender gets
+    # the redacted row back with the answer.
+    row = screen_row(table, row, existing)
+    if parents:
+        for column, parent in parent_links(table):
+            value = row.get(column)
+            if (isinstance(value, str) and (existing is None or existing.get(column) != value)
+                    and read_row(connection, parent, value) is None):
+                raise MissingParent(f"it belongs to {parent.name} {value}, which the server does not have yet")
     if existing is None:
         if table.name == "records" and row.get("status") == "active" and row.get("content_hash"):
             candidates = connection.execute(

@@ -76,7 +76,8 @@ class DownloadTests(unittest.TestCase):
             code, output = self.run_update(git)
         self.assertEqual(1, code)
         self.assertIn("went back to the version you had", output)
-        self.assertIn(["reset", "--hard", "aaa"], [command[3:] for command, _ in git.commands if command[0] == "git"])
+        self.assertIn(["reset", "--hard", "--quiet", "aaa"],
+                      [command[3:] for command, _ in git.commands if command[0] == "git"])
         self.assertFalse(any("--finish" in command for command, _ in git.commands))
 
     def test_one_update_at_a_time(self) -> None:
@@ -93,6 +94,115 @@ class DownloadTests(unittest.TestCase):
         with redirect_stdout(output), mock.patch.object(update, "checkout_root", return_value=None):
             self.assertEqual(1, update.run(runner=FakeGit()))
         self.assertIn("install-for-agents.md", output.getvalue())
+
+
+class InterruptedUpdateTests(unittest.TestCase):
+    """Review 2026-10-24, F-32: ``git pull`` killed mid-checkout left a half-written folder that every later update
+    refused ("has local changes"), with no way out given. Real Git, in a clone of a local repository."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        self.origin, self.clone = root / "origin", root / "clone"
+        self.git(root, "init", "--quiet", "-b", "main", str(self.origin))
+        (self.origin / "app.py").write_text("VERSION = 1\n", encoding="utf-8")
+        self.commit(self.origin, "one")
+        self.git(root, "clone", "--quiet", str(self.origin), str(self.clone))
+        (self.origin / "app.py").write_text("VERSION = 2\n", encoding="utf-8")
+        (self.origin / "new.py").write_text("NEW = True\n", encoding="utf-8")
+        self.newer = self.commit(self.origin, "two")
+        self.home = mock.patch.dict(os.environ, {"KNOWITALL2_HOME": str(root / "home")})
+        self.home.start()
+        self.addCleanup(self.home.stop)
+
+    def git(self, folder: Path, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(folder), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                               *arguments], capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(self, folder: Path, message: str) -> str:
+        self.git(folder, "add", "-A")
+        self.git(folder, "commit", "--quiet", "-m", message)
+        return self.git(folder, "rev-parse", "HEAD")
+
+    def update(self, *, cut_short: str | None = None, broken: bool = False) -> tuple[int, str]:
+        """Run the update; ``cut_short`` names the Git verb killed partway (a reset first writes one file);
+        ``broken``: the new version does not start, and going back is cut short too."""
+
+        def runner(command, **options):
+            if command[0] != "git":
+                if broken and "--version" in command:
+                    cut.append("reset")  # the next reset, going back, is the one cut short
+                    return subprocess.CompletedProcess(command, 1, "", "SyntaxError: invalid syntax")
+                return subprocess.CompletedProcess(command, 0, "", "")  # the new code starts, and finishes
+            if cut and command[3] == "reset":
+                raise subprocess.TimeoutExpired(command, 180)
+            if command[3] == cut_short:
+                if cut_short == "reset":
+                    (self.clone / "app.py").write_text("VERSION = 2\n", encoding="utf-8")
+                raise subprocess.TimeoutExpired(command, 180)
+            return subprocess.run(command, **options)
+
+        cut: list[str] = []
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.object(update, "checkout_root", return_value=self.clone):
+            code = update.run(runner=runner)
+        return code, output.getvalue()
+
+    def test_going_back_cut_short_still_says_how_to_finish(self) -> None:
+        # Codex's review of step A: the mark was gone before the new version was tried, and a failed way back
+        # was reported as done.
+        before = self.git(self.clone, "rev-parse", "HEAD")
+        code, output = self.update(broken=True)
+        self.assertEqual(1, code)
+        self.assertNotIn("went back to the version you had", output)
+        self.assertIn(f'git -C "{self.clone}" reset --hard {before}', output)
+        self.assertIn(before, (Path(os.environ["KNOWITALL2_HOME"]) / update.UPDATE_MARK).read_text(encoding="utf-8"))
+
+    def test_a_download_cut_short_leaves_the_folder_as_it_was(self) -> None:
+        before = self.git(self.clone, "rev-parse", "HEAD")
+        self.assertEqual(1, self.update(cut_short="fetch")[0])
+        self.assertEqual(before, self.git(self.clone, "rev-parse", "HEAD"))
+        self.assertEqual("", self.git(self.clone, "status", "--porcelain"))
+        self.assertEqual((0, self.newer), (self.update()[0], self.git(self.clone, "rev-parse", "HEAD")))
+        self.assertTrue((self.clone / "new.py").is_file())
+
+    def test_files_replaced_partway_say_how_to_finish_and_that_works(self) -> None:
+        code, output = self.update(cut_short="reset")
+        self.assertEqual(1, code)
+        finish = f'git -C "{self.clone}" reset --hard {self.newer}'
+        self.assertIn(finish, output)
+        self.assertNotEqual("", self.git(self.clone, "status", "--porcelain"))  # half of each version
+        code, output = self.update()  # the next update says the same, not just "local changes"
+        self.assertEqual(1, code)
+        self.assertIn("cut short", output)
+        self.assertIn(finish, output)
+        self.git(self.clone, "reset", "--hard", self.newer)  # the command it gave
+        self.assertEqual(0, self.update()[0])
+        self.assertEqual("VERSION = 2\n", (self.clone / "app.py").read_text(encoding="utf-8"))
+        self.assertFalse((Path(os.environ["KNOWITALL2_HOME"]) / update.UPDATE_MARK).exists())
+
+    def test_the_users_own_changes_are_named_with_the_way_back(self) -> None:
+        (self.clone / "app.py").write_text("VERSION = 'mine'\n", encoding="utf-8")
+        code, output = self.update()
+        self.assertEqual(1, code)
+        self.assertIn("has local changes (app.py)", output)
+        self.assertIn(f'git -C "{self.clone}" reset --hard HEAD', output)
+        self.assertEqual("VERSION = 'mine'\n", (self.clone / "app.py").read_text(encoding="utf-8"))
+
+    def test_a_version_that_does_not_follow_this_one_is_not_put_in(self) -> None:
+        self.git(self.origin, "reset", "--quiet", "--hard", "HEAD~1")
+        (self.origin / "app.py").write_text("VERSION = 'other'\n", encoding="utf-8")
+        self.commit(self.origin, "rewritten")
+        self.git(self.clone, "pull", "--quiet", "--ff-only")  # as if the rewrite came after this clone
+        self.git(self.origin, "reset", "--quiet", "--hard", "HEAD~1")
+        (self.origin / "app.py").write_text("VERSION = 'third'\n", encoding="utf-8")
+        self.commit(self.origin, "another")
+        before = self.git(self.clone, "rev-parse", "HEAD")
+        code, output = self.update()
+        self.assertEqual(1, code)
+        self.assertIn("does not follow", output)
+        self.assertEqual(before, self.git(self.clone, "rev-parse", "HEAD"))
 
 
 class FinishTests(unittest.TestCase):

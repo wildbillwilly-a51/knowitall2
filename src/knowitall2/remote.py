@@ -121,7 +121,9 @@ class RemoteClient:
 
     def push(self, operations: Sequence[dict[str, Any]]) -> dict[str, Any]:
         sent = [{name: value for name, value in operation.items() if name != "through"} for operation in operations]
-        return self._json("POST", "/api/v1/push", {"operations": sent})
+        # "parents": check that each row's parents are on the server (``exchange.apply_operations``); an older
+        # server ignores it.
+        return self._json("POST", "/api/v1/push", {"operations": sent, "parents": True})
 
     def usage(self, uses: Sequence[dict[str, Any]]) -> dict[str, Any]:
         return self._json("POST", "/api/v1/usage", {"uses": list(uses)})

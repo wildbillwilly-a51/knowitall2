@@ -117,11 +117,15 @@ def _sharing_check() -> Check:
     detail = " ".join(lines)
     if healthy:
         return Check("shared memory", True, detail)
-    fix = ("Make a new join code on the server's page (Add an agent) and run: "
-           + cli_command("server", "connect", "<agent>", "--join-code", "<code>")
-           if "no longer accepts" in detail or "No agent here" in detail
-           else "Check that the KnowItAll2 server is running and reachable; memories saved here are sent when it "
-                "is back.")
+    if "no longer accepts" in detail or "No agent here" in detail:
+        fix = ("Make a new join code on the server's page (Add an agent) and run: "
+               + cli_command("server", "connect", "<agent>", "--join-code", "<code>"))
+    elif "rejected change" in detail:
+        fix = "Review them with: " + cli_command("sync", "--rejections")
+    elif "cannot be reached" in detail:
+        fix = "Check that the KnowItAll2 server is running and reachable; memories saved here are sent when it is back."
+    else:
+        fix = "Run " + cli_command("sync") + " to see the error the last sync met."
     return Check("shared memory", False, detail, fix)
 
 
@@ -134,6 +138,10 @@ def _known_files_check() -> Check:
     if not known.enabled():
         return Check(name, True, "off; `knowitall2 known --on` writes them into each project again")
     status = known.read_status()
+    if status.get("failed"):
+        return Check(name, True, f"the last refresh failed ({status.get('failed_at')}): {status['failed']}; the "
+                                 "files are written again after the next change to memories",
+                     f"Run: {cli_command('known')} to try now and see the error")
     if not status.get("at"):
         return Check(name, True, "not written yet; they are written after the next change to memories",
                      f"Run: {cli_command('known')} to write them now")

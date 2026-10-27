@@ -18,6 +18,7 @@ script that setup writes into the data home (``update.py``), which runs this.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -32,6 +33,9 @@ from .paths import HOME_ENVIRONMENT_VARIABLE, data_home
 LAUNCHER = "update.py"
 VERSION_FILE = "installed-version"
 UPDATE_LOCK = "update-run.lock"
+# Written just before the new version's files replace the old ones, and removed once they have: found with a
+# folder that has changes, it says an update was cut short there, and which version it was putting in.
+UPDATE_MARK = "update-in-progress.json"
 _VERSION = re.compile(r'__version__ = "([^"]+)"')
 # Set while the update script runs itself again with the Python KnowItAll2 was set up with.
 _RELAUNCHED = "KNOWITALL2_UPDATE_RELAUNCHED"
@@ -135,27 +139,55 @@ def _run(runner) -> int:
         return runner(["git", "-C", str(root), *arguments], capture_output=True, text=True, timeout=180,
                       env=environment)
 
+    # Download first, check, then put the new files in (review 2026-10-24, F-32): a download cut short leaves
+    # the folder as it was, and the files are replaced in one step that can be finished by running it again.
+    # ``git pull`` did both at once, so a pull killed mid-checkout left a half-written folder that every later
+    # update refused, with no way out given.
+    mark = data_home() / UPDATE_MARK
     try:
         dirty = git("status", "--porcelain", "--untracked-files=no")
         if dirty.returncode != 0:
             print(f"KnowItAll2 could not check its folder {root}: {_last(dirty.stderr)}")
             return 1
         if dirty.stdout.strip():
-            print(f"KnowItAll2 was not updated: its folder {root} has local changes. Nothing was changed.")
+            print(_dirty_message(root, dirty.stdout, mark))
             return 1
+        mark.unlink(missing_ok=True)  # a folder with no changes holds one version whole, whatever came before
         before = git("rev-parse", "HEAD").stdout.strip()
-        pulled = git("pull", "--ff-only")
+        failed = fetched = git("fetch", "--quiet")
+        if fetched.returncode == 0:
+            target = git("rev-parse", "--verify", "--quiet", "@{upstream}^{commit}")
+            failed = target if target.returncode != 0 or not target.stdout.strip() else None
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"KnowItAll2 could not run Git to download the update: {exc}")
         return 1
-    if pulled.returncode != 0:
-        detail = _last(pulled.stderr) or _last(pulled.stdout)
+    if failed is not None:
+        detail = _last(failed.stderr) or _last(failed.stdout) or "Git found no version to update to"
         if "authentication" in detail.casefold() or "could not read username" in detail.casefold():
             detail += " (Git could not sign in to the repository; sign in with your usual Git tool, then try again.)"
         print(f"KnowItAll2 could not download the update: {detail}\nNothing was changed.")
-        journal.problem("update", f"git pull failed: {detail}")
+        journal.problem("update", f"git fetch failed: {detail}")
         return 1
-    after = git("rev-parse", "HEAD").stdout.strip()
+    after = target.stdout.strip()
+    if after != before:
+        try:
+            # Only forward: a version that does not follow this one (a rewritten history) is not put in.
+            ahead = git("merge-base", "--is-ancestor", before, after)
+            if ahead.returncode != 0:
+                print(f"KnowItAll2 was not updated: the version offered ({after[:12]}) does not follow the one "
+                      f"here ({before[:12]}). Nothing was changed.")
+                journal.problem("update", f"the upstream version {after} does not follow {before}")
+                return 1
+            write_text_atomic(mark, json.dumps({"from": before, "to": after}) + "\n")
+            replaced = git("reset", "--hard", "--quiet", after)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"KnowItAll2 could not put the new version in: {exc}\n" + _finish_hint(root, after))
+            return 1
+        if replaced.returncode != 0:
+            print(f"KnowItAll2 could not put the new version in: {_last(replaced.stderr)}\n" + _finish_hint(root, after))
+            journal.problem("update", f"git reset to {after} failed: {_last(replaced.stderr)}")
+            return 1
+        # The mark stays until the new version has started, or the folder is back on the old one.
     # Finish with the new code, not the code of this already-running process.
     finish = [sys.executable, "-B", "-P", "-m", "knowitall2", "update", "--finish", "--previous", __version__]
     if before == after:
@@ -173,11 +205,24 @@ def _run(runner) -> int:
         except (OSError, subprocess.SubprocessError) as exc:
             failed, detail = True, str(exc)
         if failed:
-            git("reset", "--hard", before)
+            # Going back is putting a version in too: the mark names it until the folder holds it whole.
+            try:
+                write_text_atomic(mark, json.dumps({"from": after, "to": before}) + "\n")
+                undone = git("reset", "--hard", "--quiet", before).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                undone = False
+            if not undone:
+                print(f"KnowItAll2 downloaded a new version that does not start ({detail}), and could not go back "
+                      "to the version you had.\n" + _finish_hint(root, before))
+                journal.problem("update", f"the new version did not start, and going back to {before} failed: "
+                                          f"{detail}")
+                return 1
+            mark.unlink(missing_ok=True)
             print(f"KnowItAll2 downloaded a new version that does not start ({detail}), so it went back to the "
                   "version you had. Nothing else was changed.")
             journal.problem("update", f"the new version did not start, so the update was undone: {detail}")
             return 1
+        mark.unlink(missing_ok=True)
     environment.pop("GIT_TERMINAL_PROMPT", None)
     code = runner(finish, env=environment).returncode
     if code != 0 and before != after:
@@ -379,6 +424,29 @@ def open_chats_advice(previous: str | None) -> str:
 
 def _version_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) if part.isdigit() else 0 for part in version.split("."))
+
+
+def _finish_hint(root: Path, target: str) -> str:
+    return f"To finish putting it in, run: git -C \"{root}\" reset --hard {target}\nThen run the update again."
+
+
+def _dirty_message(root: Path, porcelain: str, mark: Path) -> str:
+    """Why the update stops at a folder with changes, and the exact command that gets it going again."""
+
+    try:
+        cut_short = json.loads(mark.read_text(encoding="utf-8"))
+        target = str(cut_short["to"])
+    except (OSError, ValueError, TypeError, KeyError):
+        target = None
+    if target:
+        return (f"KnowItAll2 was not updated: an earlier update was cut short while it put version {target[:12]} "
+                f"into {root}, so some files there are from each version. Nothing was changed.\n"
+                + _finish_hint(root, target))
+    files = [line[3:].strip() for line in porcelain.splitlines() if line.strip()]
+    shown = ", ".join(files[:5]) + (f" and {len(files) - 5} more" if len(files) > 5 else "")
+    return (f"KnowItAll2 was not updated: its folder {root} has local changes ({shown}). Nothing was changed.\n"
+            f"If you did not change these files yourself, put them back with: git -C \"{root}\" reset --hard HEAD\n"
+            "Then run the update again.")
 
 
 def _last(text: str) -> str:

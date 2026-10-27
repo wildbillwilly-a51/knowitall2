@@ -607,9 +607,14 @@ def build_engine(backend: str, model: str | None) -> ClaudeCliExtractor | CodexC
 
 
 def adopt_current_model() -> str | None:
-    """Move learning off a former default model, once, after an update; returns the new model, if moved."""
+    """Move learning off a former default model, once, after an update; returns the new model, if moved.
+
+    A model the user chose stays (review 2026-10-24, F-33): only a default that went out of date moves.
+    """
 
     settings = load_settings()
+    if settings.model_chosen is True:
+        return None
     if settings.backend == "claude-cli" and settings.model in FORMER_CLAUDE_MODELS:
         before, settings.model = settings.model, CLAUDE_MODEL
     elif settings.backend == "codex-cli" and settings.model:
@@ -696,9 +701,9 @@ def configure_learning(
         chosen = next((name for name in BACKENDS if _engine_path(name) is not None), chosen)
     executable = _engine_path(chosen)
     if model:
-        settings.model = model
+        settings.model, settings.model_chosen = model, True
     elif chosen != settings.backend or not settings.model:
-        settings.model = _default_model(chosen, executable)
+        settings.model, settings.model_chosen = _default_model(chosen, executable), False
     settings.backend = chosen
     settings.enabled = True
     save_settings(settings)

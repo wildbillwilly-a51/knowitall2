@@ -58,6 +58,8 @@ PULL_EVERY_SECONDS = 60
 BATCH = 500
 MAX_PAGES = 100
 ROUNDS = 3
+# A sync that keeps trying and has not worked for this long is not working, whatever the server's hello says.
+STUCK_SECONDS = 60 * 60
 USAGE_CURSOR_KEY = "sync.usage_cursor"
 LEASE_NAME = "maintenance"
 LEASE_SECONDS = 3 * 60 * 60
@@ -181,6 +183,10 @@ class SyncReport:
     skipped: bool = False
     resent: bool = False  # the server's memory went back, so everything here was sent again
     problem: str | None = None
+    # What kind of problem: "unreachable" (no answer), "refused" (the server answered with an error), "data" (the
+    # server sent something this computer could not use) or "store" (this computer's memory store failed).
+    problem_kind: str | None = None
+    set_aside: int = 0  # rows from the server this computer could not use yet (``sync.set_aside``)
     status: int | None = None
     details: list[str] = field(default_factory=list)
 
@@ -216,23 +222,50 @@ def pull(store: Store, remote: RemoteClient) -> int:
     change, so a memory can come a page before its project: it waits for the
     page its project is on, and the saved cursor stays behind it until then,
     so a sync cut short fetches it again.
+
+    A row this version cannot save (one a newer server shares), and a row
+    still waiting for a row it belongs to when the last page is in, are set
+    aside whole (``sync.set_aside``) and tried again at every fetch, so the
+    cursor moves on past them and nothing is lost (review 2026-10-24, F-12).
     """
 
     received = 0
     since = sync.cursor(store)
     held: list[dict[str, Any]] = []
+    hold: list[int] = []  # behind rows left alone for an unsent change here (F-11b)
+    retry = [entry["change"] for entry in sync.set_aside(store) if sync.still_wanted(store, entry["change"])]
+    again = {id(change) for change in retry}  # set aside before: their old numbers never hold the cursor back
+    aside: dict[tuple[Any, Any], dict[str, Any]] = {}  # what stays set aside, by (table, key)
+
+    def name(item: dict[str, Any]) -> tuple[Any, Any]:
+        return item.get("table"), item.get("key")
+
     for _ in range(MAX_PAGES):
         page = remote.changes(since, limit=BATCH)
         fetched = list(page.get("changes", []))
-        newer = {(item.get("table"), item.get("key")) for item in fetched}
-        items = [item for item in held if (item.get("table"), item.get("key")) not in newer] + fetched
+        newer = {name(item) for item in fetched}
+        items, unusable = sync.usable(store, [item for item in [*retry, *held] if name(item) not in newer] + fetched)
+        retry = []
         held = sync.without_parents(store, items)
         waiting = {id(item) for item in held}
         since = int(page.get("next", since))
-        behind = [item["seq"] - 1 for item in held if isinstance(item.get("seq"), int)]
+        last = not page.get("more")
+        for item in items:
+            aside.pop(name(item), None)  # saved now, or a newer version came
+        for item, reason in unusable:
+            aside[name(item)] = {"change": item, "reason": reason, "at": journal.utc_now()}
+        for item in held:
+            # Every page is in: a row still waiting belongs to one the server has not shared, or one set aside.
+            if last or id(item) in again:
+                parents = sync.parents_of(sync.table_for(item.get("table")), item.get("row") or {})
+                aside[name(item)] = {"change": item, "at": journal.utc_now(), "reason": "waits for " + ", ".join(
+                    f"{table} {key}" for table, key in parents) + ", which has not arrived"}
+        behind = [item["seq"] - 1 for item in held
+                  if isinstance(item.get("seq"), int) and not (last or id(item) in again)]
+        # What is set aside is saved with the cursor that moves past it.
         received += sync.apply_pulled(store, [item for item in items if id(item) not in waiting],
-                                      cursor=min([since, *behind]))
-        if not page.get("more"):
+                                      cursor=min([since, *behind]), hold=hold, set_aside=list(aside.values()))
+        if last:
             break
     return received
 
@@ -264,16 +297,37 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
             break
         if columns:  # a table an older server does not share stays noted for a newer one
             waiting.update((item["table"], item["key"]) for item in pending if item["table"] not in columns)
+        # A row whose parent the server refused would be refused too, every sync, and keep a sync starting after
+        # every tool call (review 2026-10-24, F-13): it is kept with the refusals, and goes again with its parent.
+        orphans = [(operation, parent) for operation in pending if isinstance(operation.get("row"), dict)
+                   and (parent := sync.refused_parent(store, SYNCED_TABLES[operation["table"]], operation["row"]))]
+        if orphans:
+            with store.transaction():
+                for operation, parent in orphans:
+                    sync.quarantine(store, operation, f"the server refused the {parent[0]} row it belongs to "
+                                                      f"({parent[1]})", waits_for=parent)
+                sync.acknowledge(store, [operation for operation, _ in orphans])
+            set_aside = {id(operation) for operation, _ in orphans}
+            pending = [operation for operation in pending if id(operation) not in set_aside]
         operations = _fit(pending, columns)
         if not operations:
             continue
         answer = remote.push(operations)
         settled, server_rows, seen, rejected, accepted = [], [], [], [], []
+        refused_now: set[tuple[str, str]] = set()  # refused in this batch, so a later row of it can follow suit
         before = len(waiting)
         for operation, result in zip(operations, answer.get("results", [])):
             outcome = result.get("result")
             if outcome not in {"applied", "duplicate", "kept_newer", "rejected"}:
                 raise sync.SyncError("the server returned an unknown result; local changes remain pending")
+            if outcome == "rejected" and result.get("retry") and isinstance(operation.get("row"), dict) and (
+                    parent := sync.refused_parent(store, SYNCED_TABLES[operation["table"]], operation["row"],
+                                                  also=refused_now)):
+                refused_now.add((operation["table"], operation["key"]))
+                settled.append(operation)
+                rejected.append((operation, f"the server refused the {parent[0]} row it belongs to ({parent[1]})",
+                                 parent))
+                continue
             if outcome == "rejected" and result.get("retry"):
                 # Such as a memory whose project the server does not have yet: the project, when it is here,
                 # is noted to go now (it may never have been), and the memory goes at the next sync.
@@ -288,7 +342,8 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
             settled.append(operation)
             if outcome == "rejected":
                 refused += 1
-                rejected.append((operation, result.get("reason", "server refused the change")))
+                refused_now.add((operation["table"], operation["key"]))
+                rejected.append((operation, result.get("reason", "server refused the change"), None))
                 journal.problem("sync", f"the server refused a change to {operation['table']} {operation['key']}: "
                                         f"{result.get('reason')}")
                 continue  # retain local content; the server's rejected version is not an accepted replacement
@@ -305,8 +360,8 @@ def push(store: Store, remote: RemoteClient, columns: dict[str, list[str]]) -> t
         # One transaction: a change counts as settled only together with the server's version of it, so a
         # failure between the two never leaves a version here that the server turned down.
         with store.transaction():
-            for operation, reason in rejected:
-                sync.quarantine(store, operation, reason)
+            for operation, reason, parent in rejected:
+                sync.quarantine(store, operation, reason, waits_for=parent)
             for operation in accepted:
                 sync.clear_rejections(store, operation)
             sync.acknowledge(store, settled, seen=seen)
@@ -361,11 +416,14 @@ def write_status(report: SyncReport, *, pending: bool) -> None:
     now = journal.utc_now()
     status["last_attempt"] = now
     if report.problem:
-        status.update(problem=report.problem, problem_status=report.status)
+        if not status.get("problem") or not status.get("failing_since"):
+            status["failing_since"] = now  # the first try of this run of failures
+        status.update(problem=report.problem, problem_status=report.status, problem_kind=report.problem_kind)
     else:
-        status.update(last_success=now, problem=None, problem_status=None)
+        status.update(last_success=now, problem=None, problem_status=None, problem_kind=None, failing_since=None)
     status["unsent"] = pending
     status["unresolved_rejections"] = report.unresolved
+    status["set_aside"] = report.set_aside
     try:
         write_text_atomic(path, json.dumps(status, indent=2) + "\n")
     except OSError:
@@ -414,20 +472,25 @@ def sync_now(store: Store, *, agent: str | None = None, remote: RemoteClient | N
                         break
             except RemoteError as exc:
                 report.problem, report.status = str(exc), exc.status
+                # A proxy's 502, 503 or 504 says the server itself is not answering.
+                report.problem_kind = "unreachable" if exc.status in (None, 502, 503, 504) else "refused"
                 if exc.status == 401:
                     journal.problem("sync", "the server no longer accepts this computer's key: the agent may "
                                             "have been removed on the server's page")
             except sync.SyncError as exc:
                 report.problem = f"the server sent something this computer could not use: {exc}"
+                report.problem_kind = "data"
                 journal.problem("sync", report.problem)
             except sqlite3.Error as exc:
                 report.problem = f"the memory store on this computer failed during the sync: {exc}"
+                report.problem_kind = "store"
                 journal.problem("sync", report.problem)
     except LockBusy:
         (folder() / "sync.again").touch()
         report.skipped = True
         return report
     report.unresolved = len(sync.rejections(store))
+    report.set_aside = len(sync.set_aside(store))
     write_status(report, pending=sync.has_pending(store))
     if report.sent or report.received or report.refused or report.resent:
         journal.record(store, "sync", report.describe(), outcome="problem" if report.problem or report.unresolved else "ok",
@@ -479,11 +542,20 @@ def nudge(agent: str | None, *, store: Store | None = None, pull: bool = True,
 
 
 def _has_changes(store: Store | None) -> bool:
+    """Whether this computer has changes to send; read on the store opened only to read, so a hook never waits
+    on another process's write lock (review 2026-10-24, F-25). A store that cannot be read says no: the
+    minute's fetch still starts a sync."""
+
     if store is not None:
         return sync.has_pending(store)
-    opened = Store.open(database_path())
+    try:
+        opened = Store.open_read_only(database_path())
+    except StoreError:
+        return False
     try:
         return sync.has_pending(opened)
+    except sqlite3.Error:
+        return False
     finally:
         opened.close()
 
@@ -686,6 +758,18 @@ def describe_status(*, check: bool = True, timeout: float = 3.0) -> tuple[bool, 
     if status.get("unresolved_rejections"):
         healthy = False
         lines.append(f"{status['unresolved_rejections']} rejected change(s) need attention; use knowitall2 sync --rejections.")
+    if status.get("set_aside"):
+        lines.append(f"{status['set_aside']} row(s) from the server are set aside until this computer can use them "
+                     "(an update of KnowItAll2 usually lets them in); they are tried again at every sync.")
+    # The last sync's own problem is always shown, even when the server answers now: reachable is not working
+    # (review 2026-10-24, R3 group fix 4).
+    if status.get("problem"):
+        lines.append(f"The last sync did not work: {status['problem']}")
+        if sync_stuck(status):
+            healthy = False
+            since = status.get("last_success")
+            lines.append(("No sync has worked since " + since if since else "No sync has worked for over an hour")
+                         + ", though it keeps trying; run knowitall2 sync to see the error.")
     warning = plain_http_warning(connection.address)
     if warning:
         lines.append(f"Note: {warning}")
@@ -709,9 +793,30 @@ def describe_status(*, check: bool = True, timeout: float = 3.0) -> tuple[bool, 
             else:
                 lines.append(f"The server cannot be reached right now ({exc}). Memories saved here wait and are "
                              "sent when it is back.")
-    elif status.get("problem"):
-        lines.append(f"The last sync did not work: {status['problem']}")
     return healthy, lines
+
+
+def sync_stuck(status: dict[str, Any], *, now: float | None = None) -> bool:
+    """Whether syncing is not working: every try for an hour has failed, the last one included.
+
+    The hour runs from the first failed try since the last sync that worked (or, in a status file from before
+    that was kept, from the last sync that worked).
+    """
+
+    if not status.get("problem"):
+        return False
+    start = _seconds(status.get("failing_since")) or _seconds(status.get("last_success"))
+    moment = time.time() if now is None else now
+    return start is not None and moment - start >= STUCK_SECONDS
+
+
+def _seconds(stamp: object) -> float | None:
+    from datetime import datetime, timezone
+
+    try:
+        return datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def disconnect(store: Store) -> None:

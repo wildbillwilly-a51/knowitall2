@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.12.2 (2026-10-27)
+
+0.12.1 was built and pushed only to the private release repository; its public push was refused over a test fixture, so 0.12.2 is the first public release with these changes.
+
+- **Secrets are screened wherever free text is written.** Memory text, subjects
+  and tags holding a secret are refused by the store itself, not only by
+  `remember`, so `said_again` and `promote_rule` refuse them too (with the same
+  length and markup checks). A secret in a reason, a finding, a question, a
+  system's summary, a note's headline or an agent request is redacted, so
+  retiring a memory saved before the screening knew its shape is never
+  blocked; an agent's settle report, a forget reason and the cataloguer's and
+  maintenance's text are redacted before they are cut short. The server screens
+  the same columns and returns the redacted row. The detector also catches
+  unlabeled AWS secrets, 64-hex keys named as keys, Slack webhooks, Telegram bot
+  tokens, `.pgpass` lines, `psexec -p`, `schtasks /rp`, Wi-Fi key material from
+  netsh and WLAN profiles, all-lowercase session cookies, a password given in
+  prose as one plain word, and a token given after "the API token is", and no
+  longer reads `pass=1078` (a test count) as a password. Review 2026-10-24,
+  F-16 to F-18.
+- **Sync no longer gets stuck on one row.** A row from the server this version
+  cannot use (such as a newer kind of question), or one whose parent never
+  arrives, is set aside whole and tried again at every sync, instead of
+  failing every sync after it; an update usually lets it in. The fetch no
+  longer moves past another computer's newer version of a row changed here
+  and not yet sent, so a send whose answer was lost still ends with the newer
+  version. A row whose parent the server refused waits with the refusals and
+  goes again with its parent, instead of starting a sync after every tool
+  call. Every link between shared rows (a note's memory and system, a
+  question's stages, an agent request's question, system and project) is
+  declared, and a newer computer asks the server to check them; 0.12.0
+  computers and servers keep working as before. Review 2026-10-24, F-11b,
+  F-12 to F-14.
+- **Sync health is told as it is.** `doctor`, `knowitall2 server status` and
+  the app always show the last sync's own problem, call a sync that has failed
+  for an hour unhealthy even when the server answers, show rows set aside, and
+  say "could not be reached" only when the server did not answer.
+- **Background work fails once, not at every hook.** A knowledge-file refresh
+  that fails records the error (doctor shows it) and waits for the next change
+  to memories. The message hook reads the store opened only to read and waits
+  at most half a second to record its use, as session start does, so a busy
+  store never holds up a message. Review 2026-10-24, F-24, F-25.
+- **An interrupted update can be finished.** The update downloads first,
+  checks that the new version follows the installed one, and then puts the new
+  files in at once; one cut short says the exact command that finishes it, and
+  a folder with changes of the user's own names them with the way back. A
+  learning model chosen in the app or with `--model` is no longer moved by an
+  update. Review 2026-10-24, F-32, F-33.
+
 ## 0.12.0 (2026-10-27)
 
 - **A correction keeps what it does not dispute.** The final pass's "correct"

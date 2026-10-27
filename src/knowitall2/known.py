@@ -1835,10 +1835,32 @@ def run_command(arguments: Any) -> int:
         if not enabled():
             print("The knowledge files are off; `knowitall2 known --on` brings them back.")
             return 0
-        report = refresh(connection, force=not arguments.quiet)
+        try:
+            report = refresh(connection, force=not arguments.quiet)
+        except Exception as exc:
+            _record_failure(connection, exc)
+            print(f"knowitall2: the knowledge files could not be written: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return 1
         if not arguments.quiet:
             print(report.describe())
         return 0
     finally:
         store.close()
         lock.unlink(missing_ok=True)
+
+
+def _record_failure(connection: sqlite3.Connection, exc: Exception) -> None:
+    """Keep a failed refresh's error, and the memory's marker as of the try, so the next one waits for the next
+    change to the memory instead of starting again after every hook and tool call (review 2026-10-24, F-24).
+
+    The rest of the status (the folders KnowItAll2 owns) stays as the last refresh that worked left it.
+    """
+
+    failure = f"{type(exc).__name__}: {exc}"
+    journal.problem("knowledge files", f"a refresh failed and waits for the next change to memories: {failure}")
+    try:
+        marker = _marker(connection)
+    except Exception:  # the marker itself failed: nothing to wait for, so the next nudge tries again
+        return
+    _write_status({**read_status(), "marker": marker, "failed": failure, "failed_at": journal.utc_now()})

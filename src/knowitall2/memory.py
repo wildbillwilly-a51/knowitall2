@@ -348,20 +348,7 @@ class Memory:
         _require_choice(source, SOURCES, "source")
         if scope is not None:
             _require_choice(scope, SCOPES, "scope")
-        body = _clean_text(text)
-        if not body:
-            raise MemoryInputError("Nothing to remember: the text is empty.")
-        if len(body) > MAX_TEXT_CHARACTERS:
-            raise MemoryInputError(
-                f"The text is {len(body)} characters; the limit is {MAX_TEXT_CHARACTERS}. "
-                "Split it into separate memories."
-            )
-        if _TOOL_CALL_MARKUP.search(body):
-            raise MemoryInputError(
-                "Not saved: the text contains tool-call markup such as </text> or <parameter>, which usually "
-                "means the call was malformed. Send only the statement itself, with kind and other options "
-                "as separate arguments."
-            )
+        body = _checked_body(text)
         subject_list = _clean_labels(subjects, "subjects")
         # "provisional" and "disputed" are set by the learner and the questions alone, and the tool rule's tag by the
         # rule writer alone: never through remember. ``reserved_tags`` is the rule writer's way (and a correction
@@ -370,14 +357,7 @@ class Memory:
         tag_list = [*(tag for tag in _clean_labels(reserved_tags, "tags") if tag not in tag_list), *tag_list]
         if len(tag_list) > MAX_LABELS:
             raise MemoryInputError(f"Use at most {MAX_LABELS} tags.")
-        findings = find_secrets("\n".join([body, *subject_list, *tag_list]))
-        if findings:
-            kinds = ", ".join(sorted({finding.kind for finding in findings}))
-            raise MemoryInputError(
-                f"Not saved: this looks like it contains a secret ({kinds}). KnowItAll2 never stores secrets. "
-                "Save where the credential is kept instead, for example: "
-                "'The vCenter admin password is in Vaultwarden item \"vcenter-admin\".'"
-            )
+        _refuse_secrets(body, subject_list, tag_list)
         if kind == "rule" and source != "user":
             raise MemoryInputError(
                 "Not saved: rules must come from the user's own words. If these are the user's own words, "
@@ -602,7 +582,7 @@ class Memory:
         ``known`` is counted on them.
         """
 
-        body = _clean_text(text)
+        body = _checked_body(text)
         now = self._clock()
         record_id = self._new_id()
         verification = VERIFICATION_FOR_SOURCE[source]
@@ -612,6 +592,7 @@ class Memory:
             have = {label.casefold() for label in known.subjects}
             subject_list = [*known.subjects, *(label for label in subject_list if label.casefold() not in have)]
             tag_list = [*known.tags, *([] if PREFERENCE_TAG in known.tags else [PREFERENCE_TAG])]
+        _refuse_secrets(body, subject_list, tag_list)
         with self.store.transaction():
             self.store.insert_record(
                 record_id=record_id, kind="decision" if holds and known.kind == "decision" else "note", text=body,
@@ -719,7 +700,8 @@ class Memory:
         identifier = (record_id or "").strip().strip("[]")
         if not identifier:
             raise MemoryInputError("forget needs the id of a memory, such as k-1a2b3c4d5e.")
-        note = _clean_text(reason or "")[:200] or None
+        # Redacted before it is cut short, so the cut never hides a secret's shape (review 2026-10-24, F-16).
+        note = _clean_text(redact(reason or ""))[:200] or None
         stated = self.store.get(identifier)
         if not by_user and stated is not None and stated.status == "active" and in_users_words(stated):
             return self._ask_before_forgetting(stated, note)
@@ -1231,7 +1213,8 @@ class Memory:
     def promote_rule(self, note: RecordRow, text: str) -> RecordRow:
         """Make a proposed rule a real one on the user's word, superseding the note."""
 
-        body = _clean_text(text)
+        body = _checked_body(text)
+        _refuse_secrets(body, note.subjects, note.tags)
         now = self._clock()
         with self.store.transaction():
             record_id = self._new_id()
@@ -1627,6 +1610,40 @@ def _provisional(row: RecordRow) -> str:
 def _require_choice(value: object, choices: tuple[str, ...], name: str) -> None:
     if value not in choices:
         raise MemoryInputError(f"Unknown {name} {value!r}; use one of: {', '.join(choices)}.")
+
+
+def _checked_body(text: object) -> str:
+    """A memory's text, cleaned, or :class:`MemoryInputError` when it is empty, too long, or holds tool-call markup.
+
+    Every path that saves a memory's words uses it, with :func:`_refuse_secrets` (review 2026-10-24, F-17).
+    """
+
+    body = _clean_text(text)
+    if not body:
+        raise MemoryInputError("Nothing to remember: the text is empty.")
+    if len(body) > MAX_TEXT_CHARACTERS:
+        raise MemoryInputError(
+            f"The text is {len(body)} characters; the limit is {MAX_TEXT_CHARACTERS}. "
+            "Split it into separate memories."
+        )
+    if _TOOL_CALL_MARKUP.search(body):
+        raise MemoryInputError(
+            "Not saved: the text contains tool-call markup such as </text> or <parameter>, which usually "
+            "means the call was malformed. Send only the statement itself, with kind and other options "
+            "as separate arguments."
+        )
+    return body
+
+
+def _refuse_secrets(body: str, subjects: Sequence[str], tags: Sequence[str]) -> None:
+    findings = find_secrets("\n".join([body, *subjects, *tags]))
+    if findings:
+        kinds = ", ".join(sorted({finding.kind for finding in findings}))
+        raise MemoryInputError(
+            f"Not saved: this looks like it contains a secret ({kinds}). KnowItAll2 never stores secrets. "
+            "Save where the credential is kept instead, for example: "
+            "'The vCenter admin password is in Vaultwarden item \"vcenter-admin\".'"
+        )
 
 
 def _clean_text(value: object) -> str:

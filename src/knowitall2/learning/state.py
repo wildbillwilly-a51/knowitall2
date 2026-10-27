@@ -23,7 +23,8 @@ else:
 # The learning model on Claude Code: Sonnet found more, and read it more accurately, than Haiku
 # in a benchmark of six real sessions (2026-09-29), for about 1.4 times the usage per call.
 CLAUDE_MODEL = "sonnet"
-# Earlier defaults, moved to the current one by an update (a choice made on purpose looks the same).
+# Earlier defaults, moved to the current one by an update, unless the user chose the model
+# (``LearnerSettings.model_chosen``).
 FORMER_CLAUDE_MODELS = ("haiku",)
 MAX_FAILURES = 3
 # Not "lock", which earlier versions created and deleted: during an update, runs of the two never mix.
@@ -39,6 +40,9 @@ class LearnerSettings:
     enabled: bool = False
     backend: str = "claude-cli"
     model: str = CLAUDE_MODEL
+    # The user named the model (in the app, or with --model), so an update leaves it as it is (review 2026-10-24,
+    # F-33). Off for a model that came as a default; a choice made before 0.12.0 kept no such mark.
+    model_chosen: bool = False
     max_calls_per_run: int = 10
     max_calls_per_day: int = 60
     # How long a chat stays quiet before its final pass, when a stretch has settled (90 minutes lost none of the
@@ -94,6 +98,12 @@ def load_settings() -> LearnerSettings:
                 isinstance(value, bool) or not isinstance(value, int) or value < 0):
             continue
         chosen[item.name] = value
+    if "model_chosen" not in learning and isinstance(learning.get("model"), str) and learning["model"]:
+        # Saved before the mark existed (0.12.0 and earlier). Every such install already had its former default
+        # moved by an update, so a model other than today's Claude default was chosen; a Codex model, which an
+        # update moved only from Codex's fast model, counts as chosen too (Codex's review of step A).
+        chosen["model_chosen"] = learning.get("backend", defaults.backend) != "claude-cli" \
+            or learning["model"] != CLAUDE_MODEL
     old_wait = learning.get("idle_minutes")
     if "settle_minutes" not in chosen and isinstance(old_wait, int) and not isinstance(old_wait, bool):
         # Before 0.11 the wait was ``idle_minutes``: a longer wait the user chose is kept (candidate review, C-L6).

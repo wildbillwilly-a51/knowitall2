@@ -21,7 +21,7 @@ from knowitall2.learning.extractor import (
     find_codex_cli,
     strict_schema,
 )
-from knowitall2.learning.state import LearnerSettings, load_settings, save_settings
+from knowitall2.learning.state import LearnerSettings, config_path, load_settings, save_settings
 
 
 def answering(payload: object, *, returncode: int = 0, stderr: bytes = b"", stdout: bytes = b"",
@@ -289,6 +289,40 @@ class BackendChoiceTests(unittest.TestCase):
             self.assertEqual("sol", adopt_current_model())
             save_settings(LearnerSettings(enabled=True, backend="codex-cli", model="astra"))
             self.assertIsNone(adopt_current_model())
+
+    def test_a_model_the_user_chose_is_left_alone_by_an_update(self) -> None:
+        # Review 2026-10-24, F-33: Haiku, or Codex's fast model, chosen on purpose was moved by every update.
+        from knowitall2.app import api
+        from knowitall2.learning.command import adopt_current_model
+
+        self.enable("--backend", "claude-cli", "--model", "haiku", claude=Path("claude.exe"))
+        self.assertEqual(("haiku", True), (load_settings().model, load_settings().model_chosen))
+        self.assertIsNone(adopt_current_model())
+        self.assertEqual("haiku", load_settings().model)
+        listed = [{"slug": "luna", "description": "Fast and affordable model."},
+                  {"slug": "sol", "description": "Workhorse model."}]
+        with mock.patch("knowitall2.learning.command.find_codex_cli", return_value=Path("codex.exe")), \
+                mock.patch("knowitall2.learning.command.codex_default_model", return_value="sol"), \
+                mock.patch("knowitall2.learning.command.codex_listed_models", return_value=listed):
+            save_settings(LearnerSettings(enabled=False, backend="codex-cli", model="sol"))
+            api.learning_settings({}, {"model": "luna"}, None)  # chosen in the app
+            self.assertEqual(("luna", True), (load_settings().model, load_settings().model_chosen))
+            self.assertIsNone(adopt_current_model())
+            self.assertEqual("luna", load_settings().model)
+        # Saved before the mark existed: every install had its former default moved already, so a model other
+        # than today's default was chosen (Codex's review of step A).
+        config = json.loads(config_path().read_text(encoding="utf-8"))
+        config["learning"].pop("model_chosen")
+        config["learning"].update(backend="claude-cli", model="haiku")
+        config_path().write_text(json.dumps(config), encoding="utf-8")
+        self.assertTrue(load_settings().model_chosen)
+        self.assertIsNone(adopt_current_model())
+        config["learning"]["model"] = "sonnet"
+        config_path().write_text(json.dumps(config), encoding="utf-8")
+        self.assertFalse(load_settings().model_chosen)
+        # Switching engine without naming a model takes that engine's default, which updates may move again.
+        self.enable("--backend", "claude-cli", claude=Path("claude.exe"), codex=Path("codex.exe"))
+        self.assertEqual(("sonnet", False), (load_settings().model, load_settings().model_chosen))
 
 
 if __name__ == "__main__":
