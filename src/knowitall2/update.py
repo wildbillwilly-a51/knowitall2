@@ -338,6 +338,7 @@ def changelog_since(previous: str | None, *, limit: int = 12) -> list[str]:
     except OSError:
         return []
     notes: list[str] = []
+    # Only dated (released) sections; a checkout between releases has an undated "## Unreleased" section too.
     for match in re.finditer(r"^## (\S+) \(.*?\)\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL):
         if previous is None and match.group(1) != __version__:
             continue

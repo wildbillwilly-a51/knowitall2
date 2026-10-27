@@ -58,6 +58,7 @@ class _Item:
     repeat_of: str = ""
     shown: set[str] = field(default_factory=set)
     corrected: bool = False
+    disputed: str = ""                # the part of the original a correction named as wrong (its quote)
 
 
 @dataclass
@@ -254,6 +255,7 @@ def _review(items: list[_Item], reviews: list[Any], number: int) -> None:
             item.candidate = _corrected(item.candidate, review)
             item.status, item.part = "corrected", number
             item.corrected = True
+            item.disputed = str(review.get("disputed") or "").strip()
         elif action in ("confirm", "retire"):
             if item.status != "corrected":
                 item.status = "confirmed"
@@ -340,9 +342,9 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
         report.results.append({"outcome": outcome, "ids": ids, "text": result_text(outcome, item.candidate)})
 
     def retire(item: _Item) -> bool:
-        changed = _retire(memory, item, run)
-        note("retired" if changed else "kept (repeat would lose details)", item, [item.record.id])
-        return changed
+        outcome = _retire(memory, item, run)
+        note(outcome, item, [item.record.id])
+        return outcome == "retired"
 
     siblings = {item.key: item for item in items if item.record is not None}
     repeats: list[tuple[_Item, _Item]] = []   # repeats of another provisional memory, decided after it is
@@ -444,10 +446,10 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
             continue
         if (not ids or outcome.startswith("rejected")) and item.status == "corrected":
             # The final pass found something wrong with it, and its correction did not pass the checks: neither
-            # is kept, as in the tested design (the 2026-10-13 replay of the built code).
+            # is kept, as in the tested design (the 2026-10-13 replay of the built code). Unless the memory is the
+            # user's own words, which no verdict of the model's retires: it stands (review 2026-10-24, F-01).
             item.reason = "wrong"
-            retire(item)
-            standing[index] = None
+            standing[index] = None if retire(item) else item.record.id
         elif not ids or outcome.startswith("rejected") or ids[0] == item.record.id:
             # A preference checked again and turned down for a reason of the checks' own stands as it was.
             _confirm(memory, item.record)
@@ -461,8 +463,31 @@ def _apply_all(memory: Memory, items: list[_Item], kept: list[_Item], decisions:
                 note("kept (repeat would lose details)", item, [item.record.id])
                 standing[index] = item.record.id
                 continue
-            memory.store.supersede(item.record.id, ids[0], now=memory.now(),
-                                   reason=f"the final pass corrected it as [{ids[0]}]")
+            if (item.status == "corrected" and target is not None and _correction_loses(item, target) and
+                    memory.may_supersede_checked(item.record, target, actor="learner", operation="correct")[0]):
+                # A correction may change the detail it disputes, not drop the ones it does not: one that loses
+                # an undisputed name, number or "not" is a rewording, and goes as a lossy merge does: the original
+                # stands, no longer provisional, and the rewording stands beside it. No question: nothing
+                # conflicts, one just says less (review 2026-10-24, F-07b). One the gate refuses anyway (the
+                # user's words, weaker evidence) takes the gate's path below, with its question.
+                _confirm(memory, item.record)
+                note("kept (correction would lose details)", item, [item.record.id, ids[0]])
+                standing[index] = item.record.id
+                continue
+            replaced = memory.supersede_checked(item.record.id, ids[0], actor="learner", operation="correct",
+                                                reason=f"the final pass corrected it as [{ids[0]}]")
+            if replaced != memory.ALLOWED:
+                # The user's own words, or better evidence than the correction has: it stands, no longer
+                # provisional, and the correction stands beside it with a question for the user, never silently
+                # over it (review 2026-10-24, F-01).
+                from .. import review
+
+                _confirm(memory, item.record)
+                if target is not None and target.status == "active" and target.id != item.record.id:
+                    review.ask_conflict(memory, item.record, target)
+                note(f"kept ({replaced})", item, [item.record.id, ids[0]])
+                standing[index] = item.record.id
+                continue
             note("corrected" if outcome in ("saved", "saved with a question") else outcome, item, ids)
             standing[index] = ids[0]
     for item, sibling in repeats:
@@ -560,6 +585,19 @@ def _repeat_preserves(candidate: dict[str, Any], target: RecordRow | None, recor
     return keeps_everything([str(candidate.get("text") or "")], target.text, minimum_word_share=1.0)
 
 
+def _correction_loses(item: _Item, target: RecordRow | None) -> bool:
+    """Whether the memory standing for a corrected one (``target``) drops a hard detail of the original that the
+    review did not name as wrong: a name, number or polarity word of the original missing from the target and
+    not in the review's ``disputed`` quote. A correction keeps every detail it does not dispute (review
+    2026-10-24, F-07b); significant words are not counted, since a correction may reword what it keeps."""
+    from .maintenance import lost_details
+
+    if item.record is None or target is None:
+        return False
+    disputed = " ".join(item.disputed.casefold().split())
+    return any(detail not in disputed for detail in lost_details(item.record.text, target.text))
+
+
 def _dedup_record(item: _Item) -> RecordRow | None:
     """An explicit correction changes the statement being deduplicated, not its evidence strength."""
     if item.record is None or not item.corrected:
@@ -567,7 +605,11 @@ def _dedup_record(item: _Item) -> RecordRow | None:
     return dataclasses.replace(item.record, text=str(item.candidate.get("text") or ""))
 
 
-def _retire(memory: Memory, item: _Item, run: str | None) -> bool:
+def _retire(memory: Memory, item: _Item, run: str | None) -> str:
+    """Retire a provisional memory as the review decided, through the one gate every retirement passes
+    (``Memory.retire_checked``, ``Memory.supersede_checked``). Returns the outcome as the report counts it:
+    "retired", or "kept (...)" with why it stands instead, no longer provisional."""
+
     record = item.record
     assert record is not None
     if not item.reason and not item.repeat_of:
@@ -584,16 +626,30 @@ def _retire(memory: Memory, item: _Item, run: str | None) -> bool:
             raise ExtractionError(f"the corrected memory {record.id} has no safe duplicate target; its range remains pending",
                                   counted=True)
         _confirm(memory, record)
-        return False
+        return "kept (repeat would lose details)"
+    if item.reason == "repeat" and item.corrected and _correction_loses(item, target):
+        # The known memory holds the corrected text, but not every undisputed detail of the original: the
+        # correction was a rewording, and the original stands (review 2026-10-24, F-07b).
+        _confirm(memory, record)
+        return "kept (correction would lose details)"
     with memory.store.transaction():
         if item.reason == "repeat" and target is not None and target.status == "active" and target.id != record.id:
-            memory.store.supersede(record.id, target.id, now=now, reason=f"the final pass found it {why} [{target.id}]")
+            # A corrected memory's details were judged above against its corrected text (``_dedup_record``); the
+            # gate's detail check would read the wrong original, so it goes as the correction it is.
+            done = memory.supersede_checked(record.id, target.id, actor="learner",
+                                            operation="correct" if item.corrected else "repeat",
+                                            reason=f"the final pass found it {why} [{target.id}]")
         else:
-            memory.store.retire(record.id, reason=f"the final pass retired it ({why})", now=now)
+            done = memory.retire_checked(record.id, actor="learner", reason=f"the final pass retired it ({why})")
+        if done != memory.ALLOWED:
+            # The user's own words (a decision, a preference, a requirement) are never retired on the model's
+            # verdict: the memory stands, no longer provisional (review 2026-10-24, F-01).
+            _confirm(memory, record)
+            return f"kept ({done})"
     journal.record(memory.store, "candidate", record.text, outcome="retired", agent=memory.agent,
                    project_id=record.project_id, session=record.source_session, run=run, record_ids=[record.id],
                    details={"result": "retired by the final pass", "reason": why}, at=now)
-    return True
+    return "retired"
 
 
 # Two candidates of one pass this alike are shown to the check side by side.

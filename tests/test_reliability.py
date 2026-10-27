@@ -142,7 +142,7 @@ class IntegrityTests(unittest.TestCase):
                 [record] = t.provisional()
                 before = t.store.get(record.id)
                 fixtures.quiet_longer(t.log_path)
-                decision = fixtures.review("p1", "correct", **{key: t.DNSMASQ[key] for key in
+                decision = fixtures.review("p1", "correct", disputed="never needs a restart", **{key: t.DNSMASQ[key] for key in
                     ("text", "kind", "subjects", "scope", "project", "evidence")}) if corrected else fixtures.review("p1", "confirm")
                 report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [decision], "memories": []}], checks=[{"decisions": [
                     {"index": 0, "action": "drop", "known_id": "", "text": "", "reason": "largely covered and low value"}]}]))
@@ -340,7 +340,8 @@ class IntegrityTests(unittest.TestCase):
         t.learn(fixtures.FakeEngine([[wrong]]), quick=True)
         [record] = t.provisional()
         fixtures.quiet_longer(t.log_path)
-        correction = fixtures.review("p1", "correct", text=t.DNSMASQ["text"], kind="lesson", scope="global", subjects=["router", "dnsmasq"], evidence=t.DNSMASQ["evidence"])
+        # The correction names the "never" it removes (review 2026-10-24, F-07b); an unnamed loss would be a rewording.
+        correction = fixtures.review("p1", "correct", text=t.DNSMASQ["text"], kind="lesson", scope="global", subjects=["router", "dnsmasq"], evidence=t.DNSMASQ["evidence"], disputed="never needs a restart")
         report = t.learn(fixtures.FakeEngine(finals=[{"reviews": [correction], "memories": []}], checks=[{"decisions": [
             {"index": 0, "action": "repeat", "known_id": known.id, "text": "", "reason": "corrected fact"}]}]))
         self.assertEqual([], report.failed)
@@ -373,7 +374,7 @@ class IntegrityTests(unittest.TestCase):
                     return super().run(text, schema=schema, system_prompt=system_prompt)
                 self.inputs.append(("final", text))
                 if "review so far: pending" in text:
-                    answer = fixtures.review("p1", "correct", text=t.DNSMASQ["text"], kind="lesson", scope="global", evidence=t.DNSMASQ["evidence"])
+                    answer = fixtures.review("p1", "correct", text=t.DNSMASQ["text"], kind="lesson", scope="global", evidence=t.DNSMASQ["evidence"], disputed="never needs a restart")
                 elif "review so far: corrected" in text:
                     answer = fixtures.review("p1", "retire", retire_reason=later_reason,
                                              repeat_of=known.id if target == "known" else "p2" if target == "sibling" else target)

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.12.0 (2026-10-27)
+
+- **A correction keeps what it does not dispute.** The final pass's "correct"
+  action had become its rewording action: on the installed store, 85 of the 94
+  corrections made since 19 October dropped a name, number, "not" or other
+  detail of the memory they corrected. The review prompt now tells the model a
+  correction fixes the wrong detail and keeps every other name, number, path,
+  address, command and "not" of the original, quoting the wrong part in a new
+  `disputed` field; a memory that is right but could be worded better is
+  confirmed, not corrected. The final pass then holds a correction that drops
+  a name, number or polarity word the review did not name as wrong beside the
+  original, which stands, no longer provisional (outcome "kept (correction
+  would lose details)"; no question, since nothing conflicts). A correction
+  that changes exactly the disputed detail replaces the original as before,
+  and one that loses only ordinary words still passes. Review 2026-10-24,
+  F-07b; measured on a store copy in `docs/review-2026-10-24/gate-dry-run.md`.
+- **One gate for every retirement and replacement.** Every path that retires an
+  active memory or puts another in its place (the final pass, an agent's settle
+  report, maintenance, reconciliation, tool rules, restore, remember's
+  `replaces`) now goes through `Memory.supersede_checked` and
+  `Memory.retire_checked`. The user's own choice always passes; anyone else
+  needs evidence at least as strong, never retires the user's rules,
+  preferences, decisions or requirements, and a merge, duplicate or repeat must
+  keep every name, number and "not" of what it replaces. The final pass
+  therefore no longer replaces or retires a provisional memory in the user's
+  own words on the model's verdict (the correction stands beside it with a
+  question), a merge with evidence as strong as the known memory's no longer
+  drops its details, an agent's checked report settles what the user said about
+  a system but not the user's decisions, and an agent's `restore` keeps the
+  memory's verification and never brings back the user's own retired rule,
+  preference or decision (`restore --by-user`, and the app, do that as the
+  user). An agent's paraphrase of a preference no longer counts as the user
+  saying it again, and `replaces` with an already-known memory is judged by
+  that memory's evidence. A correction may change details but never on weaker
+  evidence than what it corrects; an operation the gate does not know is
+  refused. Review 2026-10-24, top action 1 (F-01 to F-05, F-07), with Codex's
+  review of the implementation. `scripts/replay_gate.py` replays a store
+  copy's past retirements and replacements through the gate, read-only, and
+  reports what it would refuse.
+
 ## 0.11.8 (2026-10-18)
 
 - **Only the source review decides whether knowledge is lasting.** Reconciliation

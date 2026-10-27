@@ -413,10 +413,13 @@ class Memory:
                 # Saying it again with new tags adds them; only the user's own words change a rule.
                 if added and (existing.kind != "rule" or source == "user"):
                     self.store.set_tags(existing.id, [*existing.tags, *added], now=now)
-                # Replacing another memory with what is already known: the known memory takes its place.
-                replaced, kept = self._to_replace(replaces, verification, keeping=existing.id)
-                if replaced is not None:
-                    self.store.supersede(replaced.id, existing.id, now=now)
+                # Replacing another memory with what is already known: the known memory takes its place, judged
+                # by the evidence it now has, not the caller's alone (review 2026-10-24, F-03).
+                replaced, kept = self._to_replace(replaces, stronger, keeping=existing.id)
+                if replaced is not None and self.supersede_checked(
+                        replaced.id, existing.id, actor="user" if source == "user" else "agent",
+                        operation="replace") != self.ALLOWED:
+                    replaced, kept = None, replaced
                 known = RememberResult("promoted" if promoted else "already_known",
                                        self.store.get(existing.id) or existing, replaced, kept)
                 # The journal notes the project the agent worked in, even for a global memory.
@@ -450,8 +453,10 @@ class Memory:
                 content_hash=content_hash,
                 now=now,
             )
-            if replaced is not None:
-                self.store.supersede(replaced.id, record_id, now=now)
+            if replaced is not None and self.supersede_checked(
+                    replaced.id, record_id, actor="user" if source == "user" else "agent",
+                    operation="replace") != self.ALLOWED:
+                replaced, kept = None, replaced   # a rule gives way only to a rule: kept, and asked
             self.record_event(
                 "remember", body, outcome="updated" if replaced else "saved", project_id=project.id if project else None,
                 session=session, record_ids=[record_id, replaced.id if replaced else ""],
@@ -615,19 +620,96 @@ class Memory:
                 source_kind="user" if source == "user" else "agent", source_agent=self.agent, source_session=session,
                 content_hash=_content_hash(body, known.scope, known.project_id), now=now,
             )
+            # The words are the user's own, or no stronger than the preference that holds them; were the gate ever
+            # to refuse, the words stand beside the preference and the event says so.
+            actor = "user" if source == "user" else "learner"
             if holds:
-                self.store.supersede(known.id, record_id, now=now, reason=f"{SAID_AGAIN} [{record_id}]")
+                done = self.supersede_checked(known.id, record_id, actor=actor, operation="said_again",
+                                              reason=f"{SAID_AGAIN} [{record_id}]")
             else:
-                self.store.supersede(record_id, known.id, now=now, reason=f"{SAID_AGAIN} [{known.id}]")
+                done = self.supersede_checked(record_id, known.id, actor=actor, operation="said_again",
+                                              reason=f"{SAID_AGAIN} [{known.id}]")
                 if PREFERENCE_TAG not in known.tags:
                     self.store.set_tags(known.id, [*known.tags, PREFERENCE_TAG], now=now)
             # The memory that holds the preference first.
-            self.record_event("remember", body, outcome="said again", project_id=known.project_id, session=session,
+            self.record_event("remember", body, outcome="said again" if done == self.ALLOWED else f"saved ({done})",
+                              project_id=known.project_id, session=session,
                               record_ids=[record_id, known.id] if holds else [known.id, record_id],
                               details={"kind": "note", "source": source})
         record = self.store.get(record_id)
         assert record is not None
         return record
+
+    # Every path that retires an active memory or puts another in its place goes through these two (review
+    # 2026-10-24, R1): the final pass, an agent's settle report, maintenance, reconciliation, tool rules, restore
+    # and remember(replaces=) once applied each its own reading of "who may change what the user said", and the
+    # final pass applied none. The two exceptions keep identical content only: ``rejoin`` folding twin rows of one
+    # project, and ``promote_rule`` turning the user's own note into their rule.
+    #
+    # ``actor``: "user" for the user's own choice (the app, an answer, the CLI run for the user), which the gates
+    # let through; "agent" for an agent's remember or settle report; "learner" for the final pass and
+    # reconciliation; "maintenance" for upkeep. ``operation``: what the newer memory is to the older one, one of
+    # two classes (Codex review of the gate, 2026-10-24): a consolidation, where the newer memory stands for the
+    # older one and so must keep every detail of it; or a correction, where the point is to change a detail (a
+    # new address, a settled conflict, a newer statement, a rewritten rule), allowed on the evidence alone. An
+    # operation of neither class is refused: a new path must say which it is.
+    MERGE_OPERATIONS = frozenset({"merge", "duplicate", "repeat", "combine"})
+    CORRECTION_OPERATIONS = frozenset({"correct", "outdated", "settle", "replace", "rule", "said_again"})
+    ALLOWED = "done"
+
+    def may_supersede_checked(self, older: RecordRow, newer: RecordRow, *, actor: str, operation: str,
+                              verification: str | None = None) -> tuple[bool, str]:
+        """Whether ``newer`` may take the place of ``older``: (allowed, why not).
+
+        The user's own choice always may. Otherwise the evidence must be at least as strong and the user's
+        words give way only as ``may_replace_unasked`` allows (a rule only to a rule); and when the newer memory
+        is to stand for the older one (``MERGE_OPERATIONS``), it must keep every name, number, and "not" the
+        older one has (``maintenance.keeps_everything``), since a replacement may reword but never lose. A
+        correction (``CORRECTION_OPERATIONS``) may change details, but never on weaker evidence: the final
+        pass's correction whose evidence came out weaker than what it corrects stands beside it, with a
+        question for the user (Codex review of the gate, 2026-10-24).
+        """
+
+        if actor == "user":
+            return True, ""
+        if operation not in self.MERGE_OPERATIONS and operation not in self.CORRECTION_OPERATIONS:
+            return False, f"unknown operation {operation!r}"
+        if not may_replace_unasked(older, kind=newer.kind, text=newer.text,
+                                   verification=verification or newer.verification):
+            return False, "the user's own words" if in_users_words(older) else "weaker evidence"
+        if operation in self.MERGE_OPERATIONS:
+            from .learning.maintenance import keeps_everything
+
+            if not keeps_everything([older.text], newer.text):
+                return False, "it would lose details"
+        return True, ""
+
+    def supersede_checked(self, older_id: str, newer_id: str, *, actor: str, operation: str,
+                          reason: str | None = None) -> str:
+        """Put ``newer`` in the place of ``older`` when the rules allow. Returns ``ALLOWED``, or why not; nothing
+        is changed when refused, and the caller decides what to do instead (keep both, ask the user)."""
+
+        older, newer = self.store.get(older_id), self.store.get(newer_id)
+        if older is None or newer is None or older.status != "active" or older.id == newer.id:
+            return "not active"
+        allowed, why = self.may_supersede_checked(older, newer, actor=actor, operation=operation)
+        if not allowed:
+            return why
+        self.store.supersede(older.id, newer.id, now=self._clock(), reason=reason)
+        return self.ALLOWED
+
+    def retire_checked(self, record_id: str, *, actor: str, reason: str | None = None) -> str:
+        """Retire ``record`` when the rules allow: the user's own choice always; anyone else never retires what
+        the user stated other than a plain fact about a system (``in_users_words``), the same line ``forget``
+        draws. Returns ``ALLOWED``, or why not; nothing is changed when refused."""
+
+        record = self.store.get(record_id)
+        if record is None or record.status != "active":
+            return "not active"
+        if actor != "user" and in_users_words(record):
+            return "the user's own words"
+        self.store.retire(record.id, reason=reason, now=self._clock())
+        return self.ALLOWED
 
     def forget(self, record_id: str, *, reason: str | None = None, by_user: bool = False) -> str:
         """Retire a memory. Only the user's own request (``by_user``, such as the app's) retires a rule,
@@ -668,11 +750,14 @@ class Memory:
             f"answer {question_id} forget"
         )
 
-    def restore(self, record_id: str) -> str:
-        """Bring back a retired or superseded memory, on the user's word.
+    def restore(self, record_id: str, *, by_user: bool = False) -> str:
+        """Bring back a retired or superseded memory.
 
-        A restored memory counts as the user's own statement, so maintenance
-        never removes it again without asking.
+        On the user's own word (``by_user``: the app, or the command line run
+        for the user) the restored memory counts as the user's statement, so
+        maintenance never removes it again without asking. Restored by an
+        agent, it keeps the verification it had: an agent's restore never makes
+        something the user's own words (review 2026-10-24, F-04).
         """
 
         identifier = (record_id or "").strip().strip("[]")
@@ -681,7 +766,13 @@ class Memory:
             raise MemoryInputError(f"There is no memory [{identifier}].")
         if record.status == "active":
             raise MemoryInputError(f"[{identifier}] is already active.")
-        self.store.restore(identifier, verification="user_stated", now=self._clock())
+        if not by_user and in_users_words(record):
+            # Only the user brings back their own rule, preference, or decision: an agent's restore would undo
+            # the user's retirement of it (Codex review of the gate, 2026-10-24).
+            return (f"[{identifier}] is in the user's own words; only the user restores it (the app, or "
+                    f"`restore {identifier} --by-user` when the user just asked for this).")
+        self.store.restore(identifier, verification="user_stated" if by_user else record.verification,
+                           now=self._clock())
         self.record_event("restore", record.text, outcome="restored", project_id=record.project_id, record_ids=[identifier])
         text = f"Restored [{identifier}]: {_shorten(record.text, 120)}"
         if record.superseded_by:

@@ -419,17 +419,28 @@ def settle(memory: Memory, question: dict[str, Any], choice: str, *, by: str, ev
             _close_tasks(memory, current["id"], "done")
             return f"[{current['id']}] no longer applies: its memories had already changed; nothing was changed."
         older, newer = records
-        if choice == "use_new" and (is_users_choice(older) or (older.verification == "user_stated" and not checked)):
-            return None
+        actor = "maintenance" if by == "KnowItAll2" else "agent"
         if choice == "keep_mine" and newer.verification == "user_stated":
             return None
         if choice == "use_new":
-            if checked and newer.verification == "unverified":
-                memory.store.set_verification(newer.id, "observed", now=now)
-            memory.store.supersede(older.id, newer.id, now=now, reason=note)
+            if older.verification == "user_stated" and not checked:
+                return None
+            # An agent's checked report counts as an observation: it may replace what the user said about a
+            # system, never the user's decisions, preferences or rules, the line forget and remember draw too
+            # (review 2026-10-24, F-02).
+            verification = "observed" if checked and newer.verification == "unverified" else newer.verification
+            allowed, _why = memory.may_supersede_checked(older, newer, actor=actor, operation="settle",
+                                                         verification=verification)
+            if not allowed:
+                return None
+            if verification != newer.verification:
+                memory.store.set_verification(newer.id, verification, now=now)
+            if memory.supersede_checked(older.id, newer.id, actor=actor, operation="settle", reason=note) != memory.ALLOWED:
+                return None
             outcome = f"[{newer.id}] is right and replaces [{older.id}]."
         elif choice == "keep_mine":
-            memory.store.retire(newer.id, reason=note, now=now)
+            if memory.retire_checked(newer.id, actor=actor, reason=note) != memory.ALLOWED:
+                return None
             verification = "observed" if checked and older.verification == "unverified" else older.verification
             memory.store.confirm(older.id, verification=verification, now=now)
             outcome = f"[{older.id}] is still right; retired [{newer.id}]."
@@ -463,7 +474,9 @@ def _settle_possible_rule(memory: Memory, question: dict[str, Any], choice: str,
         if record.verification == "user_stated":
             return None
         if choice == "forget":
-            memory.store.retire(record.id, reason=note, now=now)
+            if memory.retire_checked(record.id, actor="maintenance" if by == "KnowItAll2" else "agent",
+                                     reason=note) != memory.ALLOWED:
+                return None
             outcome = f"Forgot the possible rule [{record.id}]."
         else:
             outcome = f"Kept the possible rule [{record.id}] as a note."
@@ -704,10 +717,10 @@ def _apply(memory: Memory, question: dict, records: list[RecordRow], choice: str
         older, newer = records
         if choice == "use_new":
             memory.store.set_verification(newer.id, "user_stated", now=now)
-            memory.store.supersede(older.id, newer.id, now=now)
+            memory.supersede_checked(older.id, newer.id, actor="user", operation="settle")
             outcome = f"[{newer.id}] is now your statement and replaces [{older.id}]."
         elif choice == "keep_mine":
-            memory.store.retire(newer.id, reason="the user kept the older memory", now=now)
+            memory.retire_checked(newer.id, actor="user", reason="the user kept the older memory")
             memory.store.confirm(older.id, verification="user_stated", now=now)
             outcome = f"Kept [{older.id}]; retired [{newer.id}]."
         else:
@@ -722,7 +735,7 @@ def _apply(memory: Memory, question: dict, records: list[RecordRow], choice: str
             memory.store.confirm(stated.id, verification="user_stated", now=now)
             outcome = f"Kept [{stated.id}]."
         else:
-            memory.store.retire(stated.id, reason="the user said it is no longer true", now=now)
+            memory.retire_checked(stated.id, actor="user", reason="the user said it is no longer true")
             outcome = f"Forgot [{stated.id}]."
     else:
         [note] = records
@@ -732,7 +745,7 @@ def _apply(memory: Memory, question: dict, records: list[RecordRow], choice: str
         elif choice == "keep_note":
             outcome = f"Kept [{note.id}] as a note."
         else:
-            memory.store.retire(note.id, reason="the user declined the proposed rule", now=now)
+            memory.retire_checked(note.id, actor="user", reason="the user declined the proposed rule")
             outcome = f"Forgot [{note.id}]."
     _close(memory, question["id"], choice)
     return outcome

@@ -80,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     restore = commands.add_parser("restore", help="bring back a retired or replaced memory")
     restore.add_argument("id")
+    restore.add_argument("--by-user", action="store_true",
+                         help="the user asked for it themselves: the memory becomes their own statement "
+                              "(agents leave this out; the memory then keeps the verification it had)")
     history = commands.add_parser("history", help="show recently retired or replaced memories")
     history.add_argument("--limit", type=int, default=20)
 
@@ -388,7 +391,7 @@ def _run(memory: Memory, store: Store, arguments: argparse.Namespace) -> str:
     if arguments.command == "forget":
         return memory.forget(arguments.id, reason=arguments.reason)
     if arguments.command == "restore":
-        return memory.restore(arguments.id)
+        return memory.restore(arguments.id, by_user=arguments.by_user)
     if arguments.command == "move":
         return _move(memory, store, arguments)
     if arguments.command == "rejoin":

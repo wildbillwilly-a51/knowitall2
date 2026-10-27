@@ -602,5 +602,106 @@ class RemoteAddedLaterTests(unittest.TestCase):
         self.assertEqual(identify(self.folder).id, self.project_of(saved.record.id))
 
 
+class GateTests(unittest.TestCase):
+    """Every retirement or replacement passes one gate (review 2026-10-24, R1): the user's own choice always
+    may; anyone else needs evidence at least as strong, never retires the user's words, and may not lose details
+    when the newer memory is to stand for the older one."""
+
+    def setUp(self) -> None:
+        self.store = Store.in_memory()
+        self.clock = Clock()
+        self.memory = Memory(self.store, agent="codex", clock=self.clock)
+
+    def tearDown(self) -> None:
+        self.store.close()
+
+    def state(self, record_id: str) -> tuple[str, str]:
+        record = self.store.get(record_id)
+        return record.status, record.verification
+
+    def test_the_users_own_words_yield_only_to_the_user(self) -> None:
+        decided = self.memory.remember("We decided the lab router keeps the static address 10.20.30.1.",
+                                       kind="decision", source="user").record
+        later = self.memory.remember("The lab router takes its address from DHCP.", source="observed").record
+        for actor in ("agent", "learner", "maintenance"):
+            self.assertEqual("the user's own words",
+                             self.memory.supersede_checked(decided.id, later.id, actor=actor, operation="correct"))
+            self.assertEqual("the user's own words", self.memory.retire_checked(decided.id, actor=actor, reason="wrong"))
+        self.assertEqual(("active", "user_stated"), self.state(decided.id))
+        # A rule gives way only to a rule, whatever the evidence.
+        rule = self.memory.remember("Never deploy on Fridays.", kind="rule", source="user").record
+        note = self.memory.remember("Deploying on Fridays is fine.", kind="note", source="user").record
+        self.assertEqual("the user's own words",
+                         self.memory.supersede_checked(rule.id, note.id, actor="agent", operation="settle"))
+        # The user's own choice always may.
+        self.assertEqual("done", self.memory.supersede_checked(decided.id, later.id, actor="user", operation="settle"))
+        self.assertEqual(("superseded", later.id), (self.store.get(decided.id).status,
+                                                    self.store.get(decided.id).superseded_by))
+        self.assertEqual("done", self.memory.retire_checked(rule.id, actor="user", reason="no longer"))
+        self.assertEqual("not active", self.memory.retire_checked(rule.id, actor="user"))
+        # What the user said about a system is evidence an observation may replace.
+        fact = self.memory.remember("The NAS is nas01.", source="user").record
+        seen = self.memory.remember("The NAS is nas02.", source="observed").record
+        self.assertEqual("done", self.memory.supersede_checked(fact.id, seen.id, actor="agent", operation="settle"))
+
+    def test_weaker_evidence_and_lossy_merges_are_refused(self) -> None:
+        known = self.memory.remember("The NAS nas01 listens on port 8443 and must not be restarted during backups.",
+                                     source="observed").record
+        guess = self.memory.remember("The NAS nas01 listens on port 8443.", source="inferred").record
+        self.assertEqual("weaker evidence",
+                         self.memory.supersede_checked(known.id, guess.id, actor="agent", operation="settle"))
+        self.assertEqual("weaker evidence",
+                         self.memory.supersede_checked(known.id, guess.id, actor="maintenance", operation="outdated"))
+        lossy = self.memory.remember("The NAS nas01 listens on port 8443 and is restarted during backups.",
+                                     source="observed").record
+        self.assertEqual("it would lose details",
+                         self.memory.supersede_checked(known.id, lossy.id, actor="learner", operation="merge"))
+        self.assertEqual("it would lose details",
+                         self.memory.supersede_checked(known.id, lossy.id, actor="maintenance", operation="duplicate"))
+        self.assertEqual(("active", "observed"), self.state(known.id))
+        # An explicit correction may change details, but never on weaker evidence, and a path must say what it
+        # is (Codex review of the gate, 2026-10-24).
+        weaker = self.memory.remember("The NAS is nas02 (checked).", subjects=["nas"]).record
+        self.assertEqual("weaker evidence", self.memory.supersede_checked(known.id, weaker.id, actor="learner",
+                                                                          operation="correct"))
+        self.assertEqual("unknown operation 'tidy'", self.memory.supersede_checked(known.id, lossy.id,
+                                                                                   actor="learner", operation="tidy"))
+        self.assertEqual("done", self.memory.supersede_checked(known.id, lossy.id, actor="learner",
+                                                               operation="correct", reason="corrected"))
+        self.assertEqual(("superseded", "corrected"), (self.store.get(known.id).status,
+                                                       self.store.get(known.id).retired_reason))
+        self.assertEqual("not active", self.memory.supersede_checked(known.id, lossy.id, actor="user", operation="correct"))
+        self.assertEqual("done", self.memory.retire_checked(lossy.id, actor="maintenance", reason="status"))
+        self.assertEqual("retired", self.store.get(lossy.id).status)
+
+    def test_an_agents_restore_keeps_the_verification_and_the_users_makes_it_theirs(self) -> None:
+        # Review 2026-10-24, F-04: restore made anything the user's own statement, whoever asked.
+        saved = self.memory.remember("The staging host is stage9.").record
+        self.memory.forget(saved.id)
+        self.assertIn("Restored", self.memory.restore(saved.id))
+        self.assertEqual(("active", "unverified"), self.state(saved.id))
+        self.memory.forget(saved.id)
+        self.memory.restore(saved.id, by_user=True)
+        self.assertEqual(("active", "user_stated"), self.state(saved.id))
+        # And an agent's restore never undoes the user's retirement of their own rule or decision (Codex review
+        # of the gate, 2026-10-24).
+        rule = self.memory.remember("Always squash commits before merging.", kind="rule", source="user").record
+        self.memory.forget(rule.id, by_user=True)
+        self.assertIn("only the user restores it", self.memory.restore(rule.id))
+        self.assertEqual(("retired", "user_stated"), self.state(rule.id))
+        self.assertIn("Restored", self.memory.restore(rule.id, by_user=True))
+        self.assertEqual(("active", "user_stated"), self.state(rule.id))
+
+    def test_replacing_with_what_the_user_already_said_is_judged_by_the_known_memorys_strength(self) -> None:
+        # Review 2026-10-24, F-03: the caller's weaker evidence, not the known memory's, decided the replacement.
+        stated = self.memory.remember("The NAS is nas01.", source="user").record
+        other = self.memory.remember("The NAS is nas02.", source="observed").record
+        again = self.memory.remember("The NAS is nas01.", replaces=other.id)
+        self.assertEqual(("already_known", other.id, None), (again.status, again.replaced.id, again.kept))
+        self.assertEqual(("superseded", stated.id), (self.store.get(other.id).status,
+                                                     self.store.get(other.id).superseded_by))
+        self.assertEqual([], self.store.open_questions(limit=5))
+
+
 if __name__ == "__main__":
     unittest.main()

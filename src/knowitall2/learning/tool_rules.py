@@ -246,8 +246,8 @@ def retire_orphans(memory: Memory) -> list[str]:
     for rule in rules:
         # Counted through what maintenance merged the lessons into, and with a disputed or not yet checked lesson
         # still standing: only lessons truly retired retire the rule (review b, F-H1, F-M1).
-        if not commands.rule_chats(rule.text, lookup, standing=True) and memory.store.retire(
-                rule.id, reason=RETIRED_REASON, now=memory.now()):
+        if (not commands.rule_chats(rule.text, lookup, standing=True)
+                and memory.retire_checked(rule.id, actor="learner", reason=RETIRED_REASON) == memory.ALLOWED):
             retired.append(rule.id)
     if retired:
         journal.record(memory.store, "catalog", f"Tool rules: retired {len(retired)} rules whose lessons no longer "
@@ -438,9 +438,10 @@ def _save(memory: Memory, group: Group, item: dict[str, Any],
                       pattern=proposed["pattern"], error=proposed["error"], sources=list(sources.values()))
     if saved is None:
         return None, []
-    for rule in replacing:
-        memory.store.supersede(rule.id, saved.id, now=memory.now(), reason=f"tool rules: replaced by [{saved.id}]")
-    return saved, [rule.id for rule in replacing]
+    replaced = [rule for rule in replacing
+                if memory.supersede_checked(rule.id, saved.id, actor="learner", operation="rule",
+                                            reason=f"tool rules: replaced by [{saved.id}]") == memory.ALLOWED]
+    return saved, [rule.id for rule in replaced]
 
 
 def save_rule(memory: Memory, *, advice: str, shell: str, programs: Sequence[str], pattern: str, error: str,

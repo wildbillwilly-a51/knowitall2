@@ -24,7 +24,7 @@ from ..commands import RULE_TAG
 from ..memory import (
     DISPUTED_TAG, PROVISIONAL_TAG, VERIFICATION_STRENGTH, Memory, MemoryInputError, _stem, in_users_words,
     is_users_choice,
-    may_replace_unasked, same_statement, significant_words,
+    same_statement, significant_words,
 )
 from ..store import RecordRow
 from .extractor import ClaudeCliExtractor, CodexCliExtractor, ExtractionError, payload_items
@@ -464,15 +464,19 @@ def apply_finding(
             elif (record.kind == "rule" and keep.kind != "rule") or (
                     record.kind == keep.kind and record.verification == keep.verification == "user_stated"
                     and record.created_at > keep.created_at):
-                memory.store.supersede(
-                    keep.id, record.id, now=now, reason=f"{REASON_PREFIX}duplicate of [{record.id}]{detail}",
-                )
+                done = memory.supersede_checked(keep.id, record.id, actor="maintenance", operation="duplicate",
+                                                reason=f"{REASON_PREFIX}duplicate of [{record.id}]{detail}")
+                if done != memory.ALLOWED:
+                    outcomes.append(kept(done, keep, record))
+                    continue
                 outcomes.append(changed("merged duplicate", keep, record, reason))
                 keep = record
             else:
-                memory.store.supersede(
-                    record.id, keep.id, now=now, reason=f"{REASON_PREFIX}duplicate of [{keep.id}]{detail}",
-                )
+                done = memory.supersede_checked(record.id, keep.id, actor="maintenance", operation="duplicate",
+                                                reason=f"{REASON_PREFIX}duplicate of [{keep.id}]{detail}")
+                if done != memory.ALLOWED:
+                    outcomes.append(kept(done, record, keep))
+                    continue
                 outcomes.append(changed("merged duplicate", record, keep, reason))
     elif kind == "outdated":
         # Only a memory saved later, with evidence at least as strong, makes another outdated: the model alone
@@ -483,10 +487,9 @@ def apply_finding(
             if newer.created_at <= older.created_at:
                 outcomes.append(kept("not newer", older, newer))
             elif (VERIFICATION_STRENGTH[newer.verification] >= VERIFICATION_STRENGTH[older.verification]
-                  and may_replace_unasked(older, kind=newer.kind, text=newer.text, verification=newer.verification)):
-                memory.store.supersede(
-                    older.id, newer.id, now=now, reason=f"{REASON_PREFIX}outdated by [{newer.id}]{detail}",
-                )
+                  and memory.supersede_checked(older.id, newer.id, actor="maintenance", operation="outdated",
+                                               reason=f"{REASON_PREFIX}outdated by [{newer.id}]{detail}")
+                  == memory.ALLOWED):
                 outcomes.append(changed("replaced outdated", older, newer, reason))
             else:
                 outcomes.append(_asked(review.ask_conflict(memory, older, newer)))
@@ -496,8 +499,8 @@ def apply_finding(
             record = current[item]
             if in_users_words(record):
                 outcomes.append("kept (the user's own)")   # what the user wants or decided is not a status
-            elif record.kind in SNAPSHOT_KINDS:
-                memory.store.retire(record.id, reason=f"{REASON_PREFIX}temporary status{detail}", now=now)
+            elif record.kind in SNAPSHOT_KINDS and memory.retire_checked(
+                    record.id, actor="maintenance", reason=f"{REASON_PREFIX}temporary status{detail}") == memory.ALLOWED:
                 outcomes.append(changed("retired snapshot", record, None, reason))
             else:
                 outcomes.append(f"kept ({record.kind})")
@@ -560,7 +563,7 @@ def retire_old_status(memory: Memory) -> int:
             continue
         reason = f"{REASON_PREFIX}temporary status, kept {STATUS_DAYS} days"
         with memory.store.transaction():
-            if memory.store.retire(record.id, reason=reason, now=memory.now()):
+            if memory.retire_checked(record.id, actor="maintenance", reason=reason) == memory.ALLOWED:
                 retired += 1
                 journal.record(memory.store, "change", record.text, outcome="retired snapshot", agent=MAINTENANCE_AGENT,
                                project_id=record.project_id, record_ids=[record.id], details={"reason": reason},
@@ -612,8 +615,11 @@ def _combine(memory: Memory, records: list[RecordRow], text: str, detail: str, c
     for record in records:
         if record.id == holder.id:
             continue
-        memory.store.supersede(record.id, holder.id, now=memory.now(),
-                               reason=f"{REASON_PREFIX}combined into [{holder.id}]{detail}")
+        done = memory.supersede_checked(record.id, holder.id, actor="maintenance", operation="combine",
+                                        reason=f"{REASON_PREFIX}combined into [{holder.id}]{detail}")
+        if done != memory.ALLOWED:
+            outcomes.append(f"kept ({done})")
+            continue
         outcomes.append(changed("combined", record, holder, detail.lstrip(": ")))
     return outcomes
 
@@ -644,6 +650,22 @@ def keeps_everything(sources: list[str], combined: str, *, minimum_word_share: f
         and _share_kept(source, meaning) >= (KEPT_WORDS_SHARE if minimum_word_share is None else minimum_word_share)
         for source in sources
     )
+
+
+def lost_details(source: str, combined: str) -> set[str]:
+    """The hard details of ``source`` that ``combined`` no longer has: its proper names, its names with a digit
+    or a dot, slash, colon or at sign in them (hosts, addresses, paths, commands), its numbers, and its words
+    that turn a statement around ("not", "never"). Casefolded, so the caller can tell which of them a review
+    named as wrong. Empty when ``combined`` keeps them all; significant words are not counted here, since a
+    correction may reword what it keeps (review 2026-10-24, F-07b)."""
+
+    words = {word.casefold() for word in _WORD.findall(combined)}
+    kept, numbers, polarity = combined.casefold(), set(_NUMBERS.findall(combined)), _polarity(combined)
+    lost = _proper_names(source) - words
+    lost.update(name for name in _names(source) if name not in kept)
+    lost.update(set(_NUMBERS.findall(source)) - numbers)
+    lost.update(_polarity(source) - polarity)
+    return lost
 
 
 # Each input's significant words stay too: "nightly", "encrypted", "restic", "read-only" carry meaning that

@@ -318,7 +318,7 @@ class LifecycleTests(RuleTestCase):
             self.memory.forget(item, reason="found wrong")
         self.upkeep()
         self.assertEqual("retired", self.store.get(self.rule).status)
-        self.memory.restore(self.rule)
+        self.memory.restore(self.rule, by_user=True)
         self.upkeep()
         self.assertEqual(("active", "user_stated"), (self.store.get(self.rule).status,
                                                      self.store.get(self.rule).verification))

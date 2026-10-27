@@ -721,7 +721,10 @@ def _save_candidate(memory: Memory, candidate: dict[str, Any], dossier: Dossier,
         if known is not None and same and known.kind == "rule":
             return "already known", [known.id]   # one of the user's rules says it already
         if known is not None and same:
-            return _said_again(memory, checked, dossier, known)
+            if checked["source"] == "user":
+                return _said_again(memory, checked, dossier, known)
+            # An agent's paraphrase of a preference is not the user saying it again (review 2026-10-24, F-05).
+            return "already known", [known.id]
         older = known   # nearly the same words, with another number or a "not": the user changed it
     if older is None and checked["relation"] == "repeats" and not _named_a_preference(memory, checked, dossier):
         return "already known", []   # it repeats something that is not one of the user's preferences
@@ -747,6 +750,15 @@ def _save_candidate(memory: Memory, candidate: dict[str, Any], dossier: Dossier,
             older = None
             checked["text"] = " ".join(str(candidate.get("own_text") or checked["text"]).split())
         # Otherwise it changes what a better-supported memory, or the user's own words, say: kept, and asked.
+    if merge and older is not None and not in_users_words(older):
+        from .maintenance import keeps_everything
+
+        if not keeps_everything([older.text], checked["text"]):
+            # Evidence enough to take the known memory's place, but the merged text drops something it says: a
+            # replacement may reword, never lose. Both stand, the candidate in its own words (review 2026-10-24,
+            # F-07).
+            older = None
+            checked["text"] = " ".join(str(candidate.get("own_text") or checked["text"]).split())
     earlier = older is not None and _said_before(memory, checked, older)
     if earlier and VERIFICATION_STRENGTH[older.verification] >= VERIFICATION_STRENGTH[verification]:
         return "already known", [older.id]   # older words: what is known now was said since, and newer words win
@@ -849,7 +861,9 @@ def _merge(memory: Memory, checked: dict[str, Any], dossier: Dossier, older: Rec
     with memory.store.transaction():
         if VERIFICATION_STRENGTH[older.verification] > VERIFICATION_STRENGTH[result.record.verification]:
             memory.store.set_verification(result.record.id, older.verification, now=now)
-        memory.store.supersede(older.id, result.record.id, now=now, reason=f"merged into [{result.record.id}]")
+        if memory.supersede_checked(older.id, result.record.id, actor="learner", operation="merge",
+                                    reason=f"merged into [{result.record.id}]") != memory.ALLOWED:
+            return "saved", [result.record.id]   # the gate found a reason the checks above did not: both stand
     return "updated", [result.record.id, older.id]
 
 

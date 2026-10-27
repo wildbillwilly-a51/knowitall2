@@ -560,5 +560,40 @@ class StoreSafetyTests(unittest.TestCase):
         self.assertEqual([], [result for result in results if result != "ok"])
 
 
+class CheckedReportTests(ReviewTestCase):
+    """An agent's checked report counts as an observation: it may settle what the user said about a system, never
+    the user's decisions, preferences or rules, the same line forget draws (review 2026-10-24, F-02)."""
+
+    def check(self, older, newer, found: str) -> str:
+        self.assertTrue(review.ask_conflict(self.memory, older, newer))
+        [question] = self.store.open_questions(limit=10)
+        task_id = review.start_check(self.memory, question, [older, newer], plain=None, labels=None, reason=None)
+        agent = Memory(self.store, agent="codex", clock=self.clock)
+        return review.settle_task(agent, task_id, choice="use_new", found=found, certain=True)
+
+    def test_a_checked_report_never_replaces_the_users_decision(self) -> None:
+        decided = self.save("We decided the lab router keeps the static address 10.20.30.1.", kind="decision",
+                            source="user")
+        later = self.save("The lab router takes its address from DHCP.")
+        reply = self.check(decided, later, "the router shows a DHCP lease")
+        self.assertIn("the user decides", reply)
+        self.assertEqual(("active", "user_stated"), (self.store.get(decided.id).status,
+                                                     self.store.get(decided.id).verification))
+        # Nor does the report's say-so make its own side an observation.
+        self.assertEqual(("active", "unverified"), (self.store.get(later.id).status,
+                                                    self.store.get(later.id).verification))
+        [question] = self.store.open_questions(limit=10)
+        self.assertEqual("open", self.store.question(question["id"])["status"])
+
+    def test_a_checked_report_may_correct_what_the_user_said_about_a_system(self) -> None:
+        stated = self.save("The lab router is at 10.20.30.1.", source="user")
+        seen = self.save("The lab router is at 10.20.30.2.")
+        reply = self.check(stated, seen, "ssh 10.20.30.2 answered as the router")
+        self.assertIn("Settled", reply)
+        self.assertEqual(("superseded", seen.id), (self.store.get(stated.id).status,
+                                                   self.store.get(stated.id).superseded_by))
+        self.assertEqual("observed", self.store.get(seen.id).verification)
+
+
 if __name__ == "__main__":
     unittest.main()

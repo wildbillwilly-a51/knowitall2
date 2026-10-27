@@ -328,9 +328,20 @@ class FinishTests(unittest.TestCase):
                                   "9.1.0: Your rules, your preferences, and how your projects work are told apart",
                                   "9.1.0: Less that goes out of date"], update.changelog_since("9.0.0"))
 
+    def test_an_unreleased_section_is_not_yet_whats_new(self) -> None:
+        # Between releases the changelog has an undated "## Unreleased" section; "What's new" lists releases.
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## Unreleased\n\n- **Coming.** Text.\n\n## 9.0.0 (2026-10-12)\n\n- **Older.** Text.\n",
+                encoding="utf-8")
+            with mock.patch.object(update, "checkout_root", return_value=Path(folder)):
+                self.assertEqual(["9.0.0: Older"], update.changelog_since("8.0.0"))
+                self.assertEqual([], update.changelog_since(None))
+
     def test_every_heading_of_the_real_changelog_is_read_whole(self) -> None:
         text = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
-        headings = re.findall(r"^- \*\*", text, re.MULTILINE)
+        released = re.sub(r"^## Unreleased\n.*?(?=^## )", "", text, flags=re.MULTILINE | re.DOTALL)
+        headings = re.findall(r"^- \*\*", released, re.MULTILINE)
         notes = update.changelog_since("0.0.0", limit=10_000)
         self.assertEqual(len(headings), len(notes))
         self.assertIn("0.11.0: Your rules, your preferences, and how your projects work are told apart", notes)

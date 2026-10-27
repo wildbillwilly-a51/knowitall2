@@ -94,10 +94,10 @@ You have two jobs.
 
 Job 1: review every provisional memory, against this part and against how the stretch ended, and decide one action:
 - "confirm": it is accurate as of the end of the stretch, lasting, filed in the right place with the right kind, and no existing memory and no other provisional memory already says it. It becomes permanent as written.
-- "correct": it holds lasting knowledge, but something is wrong with it: a detail the session later changed or corrected, a claim the session does not support, the wrong project or scope, the wrong kind, status or a work record mixed in with the lasting part, or it repeats an existing memory while adding something real (then write the merged memory and set repeat_of to that memory's id). Write the whole corrected memory in text, and give kind, scope, project, subjects, and evidence quoted exactly from this part of the session or from how it ended.
+- "correct": it holds lasting knowledge, but something in it is wrong: a detail the session later changed or corrected, a claim the session does not support, the wrong project or scope, the wrong kind, status or a work record mixed in with the lasting part, or it repeats an existing memory while adding something real (then write the merged memory and set repeat_of to that memory's id). A correction fixes what is wrong and keeps everything else: write the whole corrected memory in text, keeping every name, number, path, address, command, and every "not" or "never" of the original that you do not dispute, and quote the wrong part of the original exactly in disputed (the wrong detail or claim, not the whole memory). A memory that is right but could be worded better is confirmed, not corrected: a correction that drops an undisputed detail is kept beside the original instead of replacing it. Give kind, scope, project, subjects, and evidence quoted exactly from this part of the session or from how it ended.
 - "retire": it should not be kept: the session later overturned, disproved, removed, or replaced it; it is status, a reading of the moment, or a record of the session's own work; it is a guess or something left unresolved; or an existing memory or another provisional memory already says all of it (set repeat_of to that id). Retire a repeat only when it adds nothing: when it adds a detail, correct it into the merged memory instead. A lesson about how a tool or command behaves (an error and what fixed it) is lasting: never retire it as not lasting. Give retire_reason.
 - "not_here": only when this part does not show the stretch of the session it came from and nothing in this part or in how the stretch ended bears on it; a review of another part decides it. The input shows earlier review states and original evidence as session data. On the last part, explicitly revisit still-undecided memories. An in-range memory left not_here or omitted keeps the whole review pending; never invent support to finish it.
-Use "" or [] for text, kind, scope, project, subjects, evidence, and repeat_of when they do not apply, and "" for retire_reason unless retiring.
+Use "" or [] for text, kind, scope, project, subjects, evidence, repeat_of, and disputed when they do not apply, and "" for retire_reason unless retiring.
 
 Job 2: add memories the quick pass missed: lasting knowledge in this part that no provisional memory and no known memory already holds. Do not add a memory that restates a provisional one; correct the provisional one instead.
 
@@ -119,10 +119,11 @@ _REVIEW: dict[str, Any] = {
         "project": {"type": "string"},
         "subjects": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
         "evidence": {"type": "string"},
+        "disputed": {"type": "string"},
         "reason": {"type": "string"},
     },
     "required": ["id", "action", "retire_reason", "repeat_of", "text", "kind", "scope", "project", "subjects",
-                 "evidence", "reason"],
+                 "evidence", "disputed", "reason"],
     "additionalProperties": False,
 }
 

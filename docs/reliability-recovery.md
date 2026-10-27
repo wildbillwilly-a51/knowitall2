@@ -26,6 +26,11 @@ preservation checks. A proposed replacement must retain every significant source
 word and technical token; otherwise the original remains. Explicit corrections
 are distinguished from duplicates. Incomplete decisions name their record IDs
 and remain pending; an unexplained retirement cannot complete a review.
+Source-aware review exclusively owns lastingness and retirement. Relationship
+reconciliation chooses only new/update/repeat; legacy drop decisions fail closed.
+Targets must have appeared in the current call's rendered pool. Application
+refreshes their live state; repeats follow replacements and updates require the
+named row itself still active. These preservation rules may retain paraphrases.
 
 Call budgets retain the complete active window, regardless of call volume.
 Call timestamps describe individual completion, not the learning run's start.

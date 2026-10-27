@@ -268,7 +268,7 @@ def memory_action(query, body, match) -> dict[str, Any]:
             message = memory.forget(record_id, reason=_text(body, "reason", required=False) or "forgotten in the app",
                                     by_user=True)
         elif action == "restore":
-            message = memory.restore(record_id)
+            message = memory.restore(record_id, by_user=True)   # the app is the user's own hand
         else:
             message = memory.confirm(record_id)
     return {"message": message, "id": record_id}

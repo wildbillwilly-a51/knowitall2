@@ -165,7 +165,7 @@ class GateTests(MaintenanceTestCase):
         self.assertEqual(("superseded", full.id), (merged.status, merged.superseded_by))
         self.assertEqual(f"maintenance: duplicate of [{full.id}]: Same NAS address.", merged.retired_reason)
         self.assertIn(f"[{short.id}]", self.memory.history())
-        self.assertIn("is also still active", self.memory.restore(short.id))
+        self.assertIn("is also still active", self.memory.restore(short.id, by_user=True))
         restored = self.store.get(short.id)
         self.assertEqual(("active", "user_stated"), (restored.status, restored.verification))
 

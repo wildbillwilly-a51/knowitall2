@@ -1539,7 +1539,7 @@ class FakeEngine(FakeExtractor):
 
 def review(key: str, action: str, **fields) -> dict:
     base = {"id": key, "action": action, "retire_reason": "", "repeat_of": "", "text": "", "kind": "", "scope": "",
-            "project": "", "subjects": [], "evidence": "", "reason": "test"}
+            "project": "", "subjects": [], "evidence": "", "disputed": "", "reason": "test"}
     return {**base, **fields}
 
 
@@ -2056,6 +2056,182 @@ class TwoPassTests(LearningTestCase):
         self.assertEqual(0, self.state.limited_calls_since(since))
         self.sample_log().write(self.log_path)
         self.assertEqual(1, self.learn(FakeEngine()).calls)
+
+
+    def test_the_final_pass_never_replaces_or_retires_the_users_own_words(self) -> None:
+        # Review 2026-10-24, F-01: a provisional memory in the user's own words stood for the model's to overwrite
+        # or retire; now it stands, and a correction stands beside it with a question for the user.
+        decided = "We decided the homelab router keeps the static address 10.20.30.1 for the lab."
+        backups = "We decided the homelab backups stay on the NAS at nas01."
+        (LogBuilder(self.project).user(decided)
+         .assistant(text("Understood: the router address will be handled by DHCP from now on."))
+         .user(backups).assistant(text("Noted."))).write(self.log_path, idle=False)
+        first = {"text": decided, "kind": "decision", "subjects": ["router"], "scope": "global", "project": "",
+                 "evidence": decided, "relation": "new", "known_id": ""}
+        second = {**first, "text": backups, "subjects": ["backups"], "evidence": backups}
+        self.learn(FakeEngine([[first, second]]), quick=True)
+        router, nas = self.provisional()
+        self.assertEqual(("user_stated", "user_stated"), (router.verification, nas.verification))
+        quiet_longer(self.log_path)
+        corrected = review("p1", "correct", text="The homelab router takes its address from DHCP.", kind="fact",
+                           scope="global", subjects=["router"],
+                           evidence="the router address will be handled by DHCP from now on")
+        report = self.learn(FakeEngine(finals=[{"reviews": [corrected, review("p2", "retire", retire_reason="wrong")],
+                                                "memories": []}]))
+        self.assertEqual([], self.provisional())
+        for record in (router, nas):
+            self.assertEqual(("active", "user_stated"), (self.store.get(record.id).status,
+                                                         self.store.get(record.id).verification))
+        self.assertEqual(2, report.outcomes["kept (the user's own words)"])
+        [question] = self.store.open_questions(limit=5)
+        self.assertEqual("conflict", question["kind"])
+        self.assertIn(router.id, question["record_ids"])
+
+    def test_a_correction_on_weaker_evidence_stands_beside_what_it_corrects(self) -> None:
+        # Codex review of the gate, 2026-10-24: the final pass's correction passed the gate whatever its own
+        # evidence; now a correction whose evidence came out weaker than what it corrects (an observation
+        # corrected from the agent's words alone) stands beside it, with a question for the user.
+        self.sample_log().write(self.log_path, idle=False)
+        self.learn(FakeEngine([[self.ROUTER]]), quick=True)
+        [router] = self.provisional()
+        self.assertEqual("observed", router.verification)
+        quiet_longer(self.log_path)
+        corrected = review("p1", "correct", text="The homelab router runs OpenWrt 22.03.", kind="fact",
+                           scope="global", subjects=["router"],
+                           evidence="DNS is fixed; dnsmasq needed a restart after editing /etc/config/dhcp.")
+        report = self.learn(FakeEngine(finals=[{"reviews": [corrected], "memories": []}]))
+        self.assertEqual([], self.provisional())
+        self.assertEqual(("active", "observed"), (self.store.get(router.id).status,
+                                                  self.store.get(router.id).verification))
+        self.assertEqual(1, report.outcomes["kept (weaker evidence)"])
+        self.assertIn("The homelab router runs OpenWrt 22.03.", self.memory.recall("router OpenWrt"))
+        [question] = self.store.open_questions(limit=5)
+        self.assertEqual("conflict", question["kind"])
+        self.assertIn(router.id, question["record_ids"])
+
+    def test_a_merge_at_equal_strength_that_drops_a_detail_stands_beside_the_known_memory(self) -> None:
+        # Review 2026-10-24, F-07: the detail check guarded only the weaker-evidence branch, so a merge with
+        # evidence as strong as the known memory's could take its place while dropping what it said.
+        self.sample_log().write(self.log_path, idle=False)
+        known = self.memory.remember("On the homelab router, dnsmasq listens on port 5353 and must not be "
+                                     "restarted during backups.", subjects=["router", "dnsmasq"]).record
+        self.assertEqual("unverified", known.verification)
+        self.learn(FakeEngine([[self.DNSMASQ]]), quick=True)
+        [lesson] = self.provisional()
+        self.assertEqual("unverified", lesson.verification)
+        quiet_longer(self.log_path)
+        lossy = "On the homelab router, dnsmasq is restarted after editing /etc/config/dhcp (port 5353)."
+        self.learn(FakeEngine(finals=[{"reviews": [review("p1", "confirm")], "memories": []}],
+                              checks=[{"decisions": [{"index": 0, "action": "update", "known_id": known.id,
+                                                      "text": lossy, "reason": ""}]}]))
+        self.assertEqual("active", self.store.get(known.id).status)
+        self.assertEqual([], self.provisional())
+        texts = [row.text for row in self.store.list_active(project_id=None, scope="global", limit=10)]
+        self.assertNotIn(lossy, texts)
+        self.assertIn(self.DNSMASQ["text"], texts)
+        self.assertEqual([], self.store.open_questions(limit=5))
+
+    def test_a_correction_that_drops_an_undisputed_detail_stands_beside_the_original(self) -> None:
+        # Review 2026-10-24, F-07b: 85 of 94 recent corrections dropped a name, number or "not" of the memory they
+        # corrected; the final pass used "correct" to reword. A correction that loses a detail it did not name as
+        # wrong is a rewording: the original stands, no longer provisional, the rewording beside it, no question.
+        self.sample_log().write(self.log_path, idle=False)
+        self.learn(FakeEngine([[self.DNSMASQ]]), quick=True)
+        [lesson] = self.provisional()
+        quiet_longer(self.log_path)
+        reworded = "On the homelab router, dnsmasq needs a restart after editing its DHCP config."
+        correction = review("p1", "correct", text=reworded, kind="lesson", scope="global", subjects=["dnsmasq"],
+                            evidence="dnsmasq needed a restart after editing /etc/config/dhcp")
+        report = self.learn(FakeEngine(finals=[{"reviews": [correction], "memories": []}]))
+        self.assertEqual(1, report.outcomes["kept (correction would lose details)"])
+        self.assertEqual([], self.provisional())
+        self.assertEqual("active", self.store.get(lesson.id).status)
+        texts = [row.text for row in self.store.list_active(project_id=None, scope="global", limit=10)]
+        self.assertIn(self.DNSMASQ["text"], texts)
+        self.assertIn(reworded, texts)
+        self.assertEqual([], self.store.open_questions(limit=5))
+
+    def test_a_correction_that_drops_an_undisputed_never_stands_beside_the_original(self) -> None:
+        # F-07b's sample on the store: "never" and "not" dropped from a lesson (k-bc2b405665 to k-315d1df338).
+        self.sample_log().write(self.log_path, idle=False)
+        careful = {**self.DNSMASQ, "text": "On the homelab router, never restart dnsmasq during a backup; it needs "
+                                           "a restart after editing /etc/config/dhcp."}
+        self.learn(FakeEngine([[careful]]), quick=True)
+        [lesson] = self.provisional()
+        quiet_longer(self.log_path)
+        reworded = "On the homelab router, dnsmasq needs a restart after editing /etc/config/dhcp, even during a backup."
+        correction = review("p1", "correct", text=reworded, kind="lesson", scope="global", subjects=["dnsmasq"],
+                            evidence="dnsmasq needed a restart after editing /etc/config/dhcp")
+        report = self.learn(FakeEngine(finals=[{"reviews": [correction], "memories": []}]))
+        self.assertEqual(1, report.outcomes["kept (correction would lose details)"])
+        self.assertEqual(("active", []), (self.store.get(lesson.id).status, self.provisional()))
+        self.assertIn(careful["text"], self.memory.recall("dnsmasq backup restart"))
+
+    def test_a_correction_that_changes_the_disputed_detail_replaces_the_original(self) -> None:
+        # The gate's correction class is unchanged: a correction may change the detail it disputes.
+        self.sample_log().write(self.log_path, idle=False)
+        wrong = {**self.DNSMASQ, "text": "On the homelab router, dnsmasq needs a restart after editing /etc/config/network."}
+        self.learn(FakeEngine([[wrong]]), quick=True)
+        [lesson] = self.provisional()
+        quiet_longer(self.log_path)
+        correction = review("p1", "correct", text=self.DNSMASQ["text"], kind="lesson", scope="global",
+                            subjects=["dnsmasq"], evidence="dnsmasq needed a restart after editing /etc/config/dhcp",
+                            disputed="/etc/config/network")
+        report = self.learn(FakeEngine(finals=[{"reviews": [correction], "memories": []}]))
+        self.assertEqual(1, report.outcomes["corrected"])
+        self.assertEqual("superseded", self.store.get(lesson.id).status)
+        self.assertEqual(self.DNSMASQ["text"], self.store.get(self.store.get(lesson.id).superseded_by).text)
+        self.assertEqual([], self.provisional())
+        self.assertEqual([], self.store.open_questions(limit=5))
+
+    def test_a_lossy_correction_found_to_repeat_a_known_memory_leaves_the_original_standing(self) -> None:
+        # The other correction path: the corrected text repeats a known memory, which holds the corrected text but
+        # not every undisputed detail of the original. The original stands; nothing is retired.
+        self.sample_log().write(self.log_path, idle=False)
+        known = self.memory.remember("On the homelab router, dnsmasq needs a restart after editing its DHCP config.",
+                                     kind="lesson", subjects=["router", "dnsmasq"]).record
+        self.learn(FakeEngine([[self.DNSMASQ]]), quick=True)
+        [lesson] = self.provisional()
+        quiet_longer(self.log_path)
+        correction = review("p1", "correct", text=known.text, kind="lesson", scope="global", subjects=["dnsmasq"],
+                            evidence="dnsmasq needed a restart after editing /etc/config/dhcp")
+        report = self.learn(FakeEngine(finals=[{"reviews": [correction], "memories": []}],
+                                       checks=[{"decisions": [{"index": 0, "action": "repeat", "known_id": known.id,
+                                                               "text": "", "reason": ""}]}]))
+        self.assertEqual(1, report.outcomes["kept (correction would lose details)"])
+        self.assertEqual("active", self.store.get(lesson.id).status)
+        self.assertNotIn("provisional", self.store.get(lesson.id).tags)
+        self.assertEqual("active", self.store.get(known.id).status)
+        self.assertEqual([], self.store.open_questions(limit=5))
+
+    def test_the_final_pass_asks_a_correction_to_keep_what_it_does_not_dispute(self) -> None:
+        from knowitall2.learning.prompts import FINAL_PROMPT, FINAL_SCHEMA
+
+        self.assertIn("keeping every name, number, path, address, command, and every \"not\" or \"never\" of the "
+                      "original that you do not dispute", FINAL_PROMPT)
+        self.assertIn("quote the wrong part of the original exactly in disputed", FINAL_PROMPT)
+        self.assertIn("A memory that is right but could be worded better is confirmed, not corrected", FINAL_PROMPT)
+        item = FINAL_SCHEMA["properties"]["reviews"]["items"]
+        self.assertIn("disputed", item["required"])
+        self.assertEqual({"type": "string"}, item["properties"]["disputed"])
+
+    def test_an_agents_paraphrase_never_counts_as_the_user_saying_a_preference_again(self) -> None:
+        # Review 2026-10-24, F-05: a preference the model reworded from a near quote of the user's words (an exact
+        # quote becomes the user's own sentence) was counted as the user saying it again, and three such counts
+        # make it a lasting preference.
+        said = "Always squash commits before merging."
+        (LogBuilder(self.project).user("Squash the commits before you merge them, please.")
+         .assistant(text("Will do."))).write(self.log_path, idle=False)
+        holder = self.memory.remember(said, kind="note", tags=["preference"], source="user", session="chat-0").record
+        before = self.store.times_said(holder.id)
+        candidate = {"text": said, "kind": "preference", "subjects": ["git"], "scope": "global", "project": "",
+                     "evidence": "Squash the commits before you merge, please", "relation": "new", "known_id": ""}
+        quiet_longer(self.log_path)
+        report = self.learn(FakeEngine(finals=[{"reviews": [], "memories": [candidate]}]))
+        self.assertEqual({"already known": 1}, dict(report.outcomes))
+        self.assertEqual(before, self.store.times_said(holder.id))
+        self.assertEqual([holder.id], [row.id for row in self.store.list_active(project_id=None, scope="global",
+                                                                                limit=10)])
 
 
 class ExtractorTests(unittest.TestCase):
