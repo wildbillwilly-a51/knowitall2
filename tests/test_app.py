@@ -318,6 +318,27 @@ class MemoryScreenTests(AppTestCase):
 
 
 class LearningScreenTests(AppTestCase):
+    def test_learning_keeps_failed_final_review_visible_after_quick_success(self) -> None:
+        from knowitall2.learning.state import LearnerState
+        from knowitall2.learning.provenance import hold
+        state = LearnerState()
+        state.logs[str(self.root / "chat.jsonl")] = {
+            "status": "done", "offset": 100, "settled": 0, "final_failures": 2,
+            "pending_reviews": {"final": {"reason": "source review incomplete"}}}
+        state.save()
+        store, memory = self.memory()
+        try:
+            record = memory.remember("The lab router uses local DNS.", tags=["provisional"]).record
+            store.set_tags(record.id, ["provisional"], now=memory.now())
+            hold(store, record, "source review needed")
+        finally:
+            store.close()
+        with mock.patch.object(api, "_waiting", return_value={}):
+            status, data, _ = self.request("GET", "/api/learning")
+        self.assertEqual(200, status)
+        self.assertEqual((1, 2, 1), tuple(data["review_progress"][key]
+                                         for key in ("final_pending", "final_failures", "source_pending")))
+
     def test_learning_shows_runs_and_why_candidates_were_not_kept(self) -> None:
         store = Store.open(database_path())
         try:

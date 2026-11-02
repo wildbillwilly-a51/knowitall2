@@ -1812,6 +1812,9 @@ class TwoPassTests(LearningTestCase):
         self.sample_log().write(copy)
         saved = self.memory.remember("dnsmasq restarts are needed on the homelab router.", session=SESSION).record
         self.store.set_tags(saved.id, [PROVISIONAL_TAG], now=Clock()())
+        from knowitall2.learning import provenance
+        source_session, _ = read_session(copy)
+        provenance.put(self.store, saved.id, provenance.descriptor(build_dossiers(source_session)[0]))
         report = self.learn(FakeEngine(finals=[{"reviews": [review("p1", "confirm")], "memories": []}]), logs=[copy])
         self.assertEqual(1, report.outcomes["confirmed"])
         self.assertEqual([], self.provisional())
@@ -1823,8 +1826,12 @@ class TwoPassTests(LearningTestCase):
         self.sample_log().write(self.log_path, idle=False)
         self.learn(FakeEngine([[self.DNSMASQ]]), quick=True)
         session, _ = read_session(self.log_path)
-        [part] = build_dossiers(session)
-        part.text = part.text[:part.body_start] + "[user] something else entirely, said at length here\n\n"
+        boundary = self.log_path.stat().st_size
+        with self.log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"type": "user", "sessionId": SESSION, "cwd": str(self.project),
+                                    "message": {"content": "something else entirely, said at length here"}}) + "\n")
+        later, _ = read_session(self.log_path, start=boundary)
+        [part] = build_dossiers(later, require_user=False)
         engine = FakeEngine()
         settle(self.memory, engine, [part], session=session, run=None, partial=True)
         self.assertNotIn("[p1]", engine.inputs[0][1])

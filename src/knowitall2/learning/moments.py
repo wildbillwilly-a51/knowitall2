@@ -86,7 +86,8 @@ def commits_since_last_look(transcript: str | os.PathLike[str], *,
     from .transcripts import read_session
 
     path = Path(transcript)
-    marker = learner_dir() / "watch" / f"{key(str(path))}.json"
+    from .log_identity import path_key
+    marker = learner_dir() / "watch" / f"{key(path_key(path))}.json"
     try:
         start = int(json.loads(read_text(marker)).get("offset", 0))
     except (OSError, ValueError, AttributeError, TypeError):
@@ -174,9 +175,10 @@ def done_with(items: Iterable[dict[str, Any]]) -> None:
 def by_session(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Requests grouped by session log, in the order they first arrived."""
 
+    from .log_identity import path_key
     groups: dict[str, list[dict[str, Any]]] = {}
     for item in items:
-        groups.setdefault(os.path.normcase(str(item["transcript"])), []).append(item)
+        groups.setdefault(path_key(item["transcript"]), []).append(item)
     return list(groups.values())
 
 
@@ -289,7 +291,8 @@ def _newest_here(listing: list[tuple[float, Path]], wanted: str, cutoff: float) 
 
 
 def _same_folder(value: str) -> str:
-    return os.path.normcase(os.path.normpath(value)).rstrip("\\/")
+    from .log_identity import path_key
+    return path_key(value).rstrip("\\/")
 
 
 # What is happening now -----------------------------------------------------
@@ -410,7 +413,8 @@ def session_keys(transcript: str | None, session_id: str | None) -> list[str]:
 
 def _session_key(transcript: str | None, session_id: str | None) -> str | None:
     if transcript:
-        return "t" + key(str(transcript))
+        from .log_identity import path_key
+        return "t" + key(path_key(transcript))
     if session_id:
         return "s" + key(session_id)
     return None

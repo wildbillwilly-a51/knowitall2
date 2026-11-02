@@ -848,13 +848,17 @@ class IntegrityTests(unittest.TestCase):
         from knowitall2.learning.settle import settle, _in_parts
         t = self.learning()
         builder = t.sample_log()
+        builder.write(t.log_path, idle=False)
+        t.learn(fixtures.FakeEngine([[t.DNSMASQ]]), quick=True)
         for _ in range(8):
             builder.assistant(fixtures.text("Unrelated investigation output. " + "x " * 800))
+        builder.write(t.log_path, idle=False)
+        t.learn(fixtures.FakeEngine([[]]), quick=True)
         later = "The observatory telescope uses a cobalt calibration lamp at midnight."
         builder.assistant(fixtures.text(later)).write(t.log_path, idle=False)
         candidate = {"text": later, "kind": "fact", "subjects": ["telescope"], "scope": "global",
                      "project": "", "evidence": later, "relation": "new", "known_id": ""}
-        t.learn(fixtures.FakeEngine([[t.DNSMASQ, candidate]]), quick=True)
+        t.learn(fixtures.FakeEngine([[candidate]]), quick=True)
         first = next(r for r in t.provisional() if r.text == t.DNSMASQ["text"])
         session, _ = read_session(t.log_path)
         parts = build_dossiers(session, budget=4000)

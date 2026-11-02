@@ -310,6 +310,8 @@ def learning(query, body, match) -> dict[str, Any]:
         runs = store.events(kinds=["learning"], limit=40)
         summary = store.candidate_summary(since=week)
         week_runs = store.events(kinds=["learning"], since=week, limit=1000)
+        from ..learning.provenance import waiting
+        review_progress = {**LearnerState().progress(), "source_pending": len(waiting(store))}
     totals = {"runs": len(week_runs), "sessions": 0, "calls": 0, "review_calls": 0,
               "tokens": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}}
     for event in week_runs:
@@ -325,6 +327,7 @@ def learning(query, body, match) -> dict[str, Any]:
                     totals["tokens"][name] += value
     return {
         "settings": asdict(settings),
+        "review_progress": review_progress,
         "engines": {name: {"name": _ENGINE_NAMES[name], "found": engine_path(name) is not None,
                            "path": str(engine_path(name) or "")} for name in _ENGINE_NAMES},
         "running": RunLock().busy(),

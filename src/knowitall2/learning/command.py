@@ -52,6 +52,9 @@ _ENGINE_NAMES = {"claude-cli": "Claude Code", "codex-cli": "Codex"}
 
 
 def run_learn(arguments: argparse.Namespace) -> int:
+    if getattr(arguments, "history_plan", None) or getattr(arguments, "repair_history", None):
+        from .history import run
+        return run(arguments)
     if getattr(arguments, "recovery_plan", None) or getattr(arguments, "recover", None):
         from .recovery import run
         return run(arguments)
@@ -72,7 +75,7 @@ def run_learn(arguments: argparse.Namespace) -> int:
     state = LearnerState()
     if arguments.dry_run:
         report = learn(
-            logs=list(dict.fromkeys([*session_logs(), *(Path(path) for path, entry in state.logs.items()
+            logs=list(dict.fromkeys([*session_logs(), *(Path(entry.get("log_path", path)) for path, entry in state.logs.items()
                                                        if entry.get("recovery_ranges"))])), state=state, settings=settings,
             memory_factory=None, extractor=None, dry_run=True,
         )
@@ -105,7 +108,9 @@ def run_learn(arguments: argparse.Namespace) -> int:
                 finally:
                     moments.set_now(None)
             # A request that arrived while the lock was held is learned before stopping.
-            if not moments.pending_requests():
+            pending = moments.pending_requests()
+            if not pending or all(LearnerState().entry(Path(item["transcript"]), physical=False).get("history_hold")
+                                  for item in pending):
                 break
             sweep = False
     except LockBusy:
@@ -158,7 +163,7 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         moments.set_now({"since": moments.now_iso(), "doing": "learning from sessions that ended without being learned",
                          "reason": "catch-up"})
         report = learn(
-            logs=list(dict.fromkeys([*session_logs(), *(Path(path) for path, entry in state.logs.items()
+            logs=list(dict.fromkeys([*session_logs(), *(Path(entry.get("log_path", path)) for path, entry in state.logs.items()
                                                        if entry.get("recovery_ranges"))])), state=state, settings=settings,
             memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
             extractor=extractor, dry_run=False, run=run,
@@ -331,6 +336,10 @@ def learn_requests(store, state: LearnerState, settings: LearnerSettings, extrac
         chosen = min(group, key=lambda item: _REASON_ORDER.index(item["reason"])
                      if item.get("reason") in _REASON_ORDER else len(_REASON_ORDER))
         detail = chosen.get("detail") or ""
+        if state.entry(Path(chosen["transcript"])).get("history_hold"):
+            # Keep the request reachable. A repair hold is not budget failure,
+            # and it must not discard requests made while the user works.
+            continue
         if summary.blocked:
             report = LearnReport(blocked=summary.blocked)
             moments.add_news(news_entry(report, settings, reason=chosen["reason"], detail=detail, run="",
@@ -955,6 +964,16 @@ def _status(settings) -> str:
     for entry in state.logs.values():
         counts[str(entry.get("status"))] = counts.get(str(entry.get("status")), 0) + 1
     progress = ", ".join(f"{name} {count}" for name, count in sorted(counts.items())) or "none yet"
+    phases = state.progress()
+    try:
+        from .provenance import waiting
+        source_store = Store.open(database_path())
+        try:
+            source_pending = len(waiting(source_store))
+        finally:
+            source_store.close()
+    except (OSError, sqlite3.Error, StoreError):
+        source_pending = "unavailable"
     since = day_ago(datetime.now(timezone.utc))
     recent, limited = state.calls_since(since), state.limited_calls_since(since)
     paused = active(settings.backend)
@@ -967,5 +986,9 @@ def _status(settings) -> str:
         f"Upkeep's own calls a day: maintenance {settings.maintenance_calls_per_day}, catalog "
         f"{settings.catalog_calls_per_day}, noting commands {settings.command_calls_per_day}",
         f"Sessions: {progress}",
+        f"Quick passes complete: {phases['quick_done']}; final reviews needing retry: {phases['final_pending']}; "
+        f"waiting for normal final review: {phases['awaiting_final']}",
+        f"Memories awaiting source review: {source_pending}; transcript identity conflicts: "
+        f"{phases['identity_conflicts']}; history repairs held: {phases['history_holds']}",
         *([f"Backend paused until {paused['retry_at']}: {paused['reason']}"] if paused else []),
     ])

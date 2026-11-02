@@ -666,9 +666,9 @@ def _unlearned(transcript: str) -> bool:
 def _learned_to(transcript: str) -> int:
     """How far into a session's log the learner has read."""
 
-    entry = LearnerState().logs.get(os.path.normcase(str(Path(transcript))), {})
+    entry = LearnerState().entry(Path(transcript), physical=False)
     try:
-        return int(entry.get("offset", 0))
+        return max(int(entry.get("offset", 0)), int(entry.get("settled", 0)))
     except (TypeError, ValueError):
         return 0
 

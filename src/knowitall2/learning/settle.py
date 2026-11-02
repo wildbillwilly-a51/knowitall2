@@ -18,6 +18,8 @@ memories were mostly retired or corrected.
 from __future__ import annotations
 
 import dataclasses
+import copy
+from contextlib import nullcontext
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -91,7 +93,10 @@ def ending_of(session: Session) -> str:
 
 
 def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Session, run: str | None,
-           on_call: Any = None, partial: bool = False, recovery: bool = False) -> Settled:
+           on_call: Any = None, partial: bool = False, recovery: bool = False,
+           review_start: tuple[int, int] | None = None, selected_ids: set[str] | None = None,
+           extract_new: bool = True, before_apply: Any = None, after_apply: Any = None,
+           apply_lock: Any = None) -> Settled:
     """The final pass over ``parts``, the settled stretch of ``session``; see the module's description.
 
     ``on_call`` is told of each model call as it is made, for the budget. An ``ExtractionError`` stops the pass
@@ -101,6 +106,7 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
     """
 
     from .learner import known_context
+    from . import provenance
 
     report = Settled()
     session_id = parts[0].session_id if parts else session.session_id
@@ -110,24 +116,53 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         # non-authoritative records, leaving the user's choices and direct statements untouched.
         provisional = [record for record in memory.store.from_session(session_id, limit=100_000)
                        if record.source_agent == "learner" and record.verification != "user_stated"]
-    candidates = [(record, _as_candidate(memory, record)) for record in provisional]
-    if partial or recovery:
-        # An approved recovery prefix can be one of several histories of the same session. Review only
-        # evidence this slice shows; keep the full session excluded from duplicate/update targets below.
-        candidates = [(record, candidate) for record, candidate in candidates if _in_parts(candidate, parts)]
-    items = [_Item(f"p{number}", candidate, record) for number, (record, candidate) in enumerate(candidates, 1)]
     mine = {record.id for record in provisional}
+    if selected_ids is not None:
+        provisional = [record for record in provisional if record.id in selected_ids]
+        if {record.id for record in provisional} != selected_ids:
+            raise ExtractionError("selected history records changed or are no longer provisional")
+    candidates = []
+    legacy_cache: dict = {}
+    for record in provisional:
+        source = provenance.locate_legacy(memory, record, session.path, legacy_cache)
+        if source is None:
+            provenance.hold(memory.store, record, "original source has not been located unambiguously")
+            if selected_ids is not None or recovery:
+                raise ExtractionError(f"source review is pending for {record.id}")
+            continue
+        if review_start is not None and tuple(source["end"]) <= review_start and selected_ids is None:
+            provenance.hold(memory.store, record, "original source precedes established final progress")
+            continue
+        if not provenance.owned(source, parts):
+            if provenance.intersects(source, parts):
+                provenance.hold(memory.store, record, "complete original source window needs a bounded review")
+            if selected_ids is not None:
+                raise ExtractionError(f"selected record source is outside the approved snapshot: {record.id}")
+            continue
+        candidate = _as_candidate(memory, record)
+        candidate["_source"] = source
+        candidates.append((record, candidate))
+    items = [_Item(f"p{number}", candidate, record) for number, (record, candidate) in enumerate(candidates, 1)]
     ending = ending_of(session)
     reviewing = callable(getattr(extractor, "run", None))
+    schema, prompt = FINAL_SCHEMA, FINAL_PROMPT
+    if not extract_new:
+        schema = copy.deepcopy(FINAL_SCHEMA)
+        schema["properties"]["memories"]["maxItems"] = 0
+        prompt += ("\nThis is a selected-record historical audit. Review only the listed existing memories. "
+                   "Return an empty memories list. Do not extract additions. A record's source range identifies "
+                   "its original context; defer decisions until that context or a later outcome supports them.")
     for number, part in enumerate(parts):
         part.known = known_context(memory, part, exclude=mine)
         if reviewing:
             payload = _call(extractor, report, _final_input(memory, items, part, number, len(parts), ending, mine,
                                                             partial=partial),
-                            FINAL_SCHEMA, FINAL_PROMPT, on_call)
+                            schema, prompt, on_call)
             if not isinstance(payload.get("reviews"), list) or not isinstance(payload.get("memories"), list):
                 raise ExtractionError("the final pass did not return reviews and memories lists", counted=True)
             reviews, memories = payload["reviews"], payload["memories"]
+            if not extract_new and memories:
+                raise ExtractionError("a selected-record audit may not extract new memories", counted=True)
             if any(not isinstance(item, dict) or item.get("action") not in
                    {"confirm", "correct", "retire", "not_here"} for item in reviews):
                 raise ExtractionError("the final pass returned an invalid review decision", counted=True)
@@ -142,8 +177,7 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         _review(items, reviews, number)
         for candidate in [item for item in memories if isinstance(item, dict)][:FINAL_CANDIDATES]:
             items.append(_Item(f"n{len(items) + 1}", candidate, status="added", part=number))
-    undecided = [item for item in items if reviewing and (item.status == "pending" or
-                 (item.status == "deferred" and _in_parts(item.candidate, parts)))]
+    undecided = [item for item in items if reviewing and item.status in ("pending", "deferred")]
     if undecided:
         keys = ", ".join(f"{item.key} ({item.record.id if item.record else 'new'}, {item.status})"
                          for item in undecided[:10])
@@ -153,7 +187,18 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
     shown: dict[int, list[RecordRow]] = {}
     if kept and reviewing:
         decisions, shown = _reconcile(memory, extractor, report, kept, mine, on_call)
-    _apply(memory, items, kept, decisions, shown, parts, report, run)
+    if not extract_new:
+        # A history audit can retire/reconcile its selected records, but never
+        # supersede an unrelated existing row through an "update" decision.
+        decisions = {i: ({"action": "new"} if d.get("action") == "update" else d)
+                     for i, d in decisions.items()}
+    with apply_lock if apply_lock is not None else nullcontext():
+        with memory.store.transaction():
+            if before_apply is not None:
+                before_apply()
+            _apply(memory, items, kept, decisions, shown, parts, report, run)
+            if after_apply is not None:
+                after_apply(report)
     return report
 
 
@@ -212,6 +257,11 @@ def _final_input(memory: Memory, items: list[_Item], part: Dossier, number: int,
         lines.append(f"    review so far: {item.status}")
         if candidate.get("evidence"):
             lines.append(f"    original evidence (session data): {_line(candidate['evidence'])[:1000]}")
+        if source := candidate.get("_source"):
+            from .provenance import intersects, owned
+            coverage = "complete" if owned(source, [part]) else "partial" if intersects(source, [part]) else "not here"
+            lines.append(f"    original context bytes/events: {source['start']} through {source['end']}; "
+                         f"coverage in this part: {coverage}. Decide from that source or an explicit later outcome.")
         for _share, row in memory.nearest(_about(candidate), project_id=None, scope="everywhere",
                                           limit=NEAR_PER_PROVISIONAL, exclude=mine):
             item.shown.add(row.id)
@@ -556,7 +606,11 @@ def _dossier_for(candidate: dict[str, Any], item: _Item, parts: list[Dossier]) -
 
     evidence = _line(candidate.get("evidence"))
     preferred = [parts[item.part]] if item.part is not None and item.part < len(parts) else []
-    for dossier in [*preferred, *parts]:
+    from .provenance import intersects
+    source = item.candidate.get("_source")
+    owned = [d for d in parts if source and intersects(source, [d])]
+    order = [*preferred, *owned, *parts] if item.corrected else [*owned, *preferred, *parts]
+    for dossier in order:
         if evidence and _shows(evidence, dossier):
             return dossier
     return preferred[0] if preferred else parts[0]
@@ -568,6 +622,8 @@ def _confirm(memory: Memory, record: RecordRow) -> None:
         if current is None or PROVISIONAL_TAG not in current.tags:
             return
         memory.store.set_tags(record.id, [tag for tag in current.tags if tag != PROVISIONAL_TAG], now=memory.now())
+        from .provenance import release
+        release(memory.store, record.id)
 
 
 def _repeat_preserves(candidate: dict[str, Any], target: RecordRow | None, record: RecordRow | None = None,
@@ -676,6 +732,10 @@ def _earlier_candidate(decision: dict[str, Any], index: int) -> int | None:
 def _in_parts(candidate: dict[str, Any], parts: list[Dossier]) -> bool:
     """Whether the stretch shows the evidence of ``candidate``: a memory whose evidence is not known counts."""
 
+    from .provenance import intersects
+    if candidate.get("_source"):
+        from .provenance import owned
+        return owned(candidate["_source"], parts)
     evidence = _line(candidate.get("evidence"))
     if not evidence:
         return True
@@ -713,9 +773,13 @@ def confirm_session(memory: Memory, session_id: str | None) -> int:
     if not session_id:
         return 0
     records = memory.store.tagged_active(PROVISIONAL_TAG, session=session_id)
-    for record in records:
+    from .provenance import held
+    from .state import LearnerState
+    state = LearnerState()
+    ready = [record for record in records if not held(memory.store, record, state=state)]
+    for record in ready:
         _confirm(memory, record)
-    return len(records)
+    return len(ready)
 
 
 def confirm_stale(memory: Memory, *, now: datetime, mine_only: bool = False,
@@ -724,12 +788,16 @@ def confirm_stale(memory: Memory, *, now: datetime, mine_only: bool = False,
     ``mine_only``, only those this computer learned."""
 
     from ..store import computer_name
+    from .provenance import held
+    from .state import LearnerState
 
     cutoff = (now - timedelta(days=PROVISIONAL_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     here = computer_name()
+    state = LearnerState()
     stale = [record for record in memory.store.tagged_active(PROVISIONAL_TAG) if record.created_at < cutoff
              and record.source_session not in (exclude_sessions or set())
-             and (not mine_only or record.source_computer in (None, "", here))]
+             and (not mine_only or record.source_computer in (None, "", here))
+             and not held(memory.store, record, state=state)]
     for record in stale:
         _confirm(memory, record)
     return len(stale)

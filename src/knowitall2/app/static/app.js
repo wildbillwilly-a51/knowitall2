@@ -1170,6 +1170,9 @@ function learningStatus(data) {
     <div class="stat-line"><span>Last run</span><span class="v">${lastRun ? html`${timeTag(lastRun.at)} ${outcomeChip(lastRun.outcome)}` : 'not yet'}</span></div>
     <div class="stat-line"><span>Sessions ready to read</span><span class="v">${waiting.error ? html`<span class="faint">${waiting.error}</span>` : number(waiting.ready)}</span></div>
     <div class="stat-line"><span>Sessions still going</span><span class="v">${waiting.error ? '' : number(waiting.active)}</span></div>
+    <div class="stat-line"><span>Final reviews needing retry</span><span class="v">${number((data.review_progress || {}).final_pending)}</span></div>
+    <div class="stat-line"><span>Memories awaiting source review</span><span class="v">${number((data.review_progress || {}).source_pending)}</span></div>
+    ${(data.review_progress || {}).history_holds ? html`<div class="stat-line"><span>History repairs in progress</span><span class="v">${number(data.review_progress.history_holds)}</span></div>` : ''}
     <div class="stat-line"><span>Model calls in the last 24 hours</span><span class="v">${number(data.calls_today)} of ${number(settings.max_calls_per_day)} allowed</span></div>
     <div class="bar ${used >= 90 ? 'warn' : ''} bar-gap"><span data-width="${used}"></span></div>
     <div class="btn-row mt-8">

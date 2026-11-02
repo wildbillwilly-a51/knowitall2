@@ -311,6 +311,7 @@ def learn(
     run: str | None = None,
     right_away: bool = False,
     quick: bool = False,
+    stop_at: int | None = None,
 ) -> LearnReport:
     """Learn from each log; ``run`` labels the journal entries of this run.
 
@@ -327,6 +328,7 @@ def learn(
     """
 
     from .settle import PART_CHARACTERS, needed_calls, settle
+    from .log_identity import unique_logs
 
     moment = now or datetime.now(timezone.utc)
     settled_since = moment - timedelta(minutes=settings.settle_minutes)
@@ -341,7 +343,7 @@ def learn(
 
     try:
         found = []
-        for log in logs:
+        for log in unique_logs(logs):
             try:
                 found.append((log, log.stat()))
             except OSError:
@@ -352,11 +354,16 @@ def learn(
         set_aside_before = moment - timedelta(days=SET_ASIDE_DAYS)
         for log, status in found:
             entry = state.entry(log)
+            if entry.get("identity_conflicts"):
+                report.blocked = "transcript aliases have independent progress; prepare an audited history repair"
+                break
             recovery = next(iter(entry.get("recovery_ranges", [])), None) if not quick else None
             if SETTLED not in entry:
                 # Learned before 0.11: what was read then was learned for good.
                 entry[SETTLED] = int(entry.get("offset", 0))
-            start = int(entry.get("offset", 0)) if quick else int(entry[SETTLED])
+            quick_position = max((int(entry.get("offset", 0)), int(entry.get("event_index", 0))),
+                                 (int(entry[SETTLED]), int(entry.get(SETTLED_EVENT_INDEX, 0))))
+            start = quick_position[0] if quick else int(entry[SETTLED])
             if recovery:
                 from .recovery import prefix_hash
                 if prefix_hash(log, recovery["end"]) != recovery["sha256"]:
@@ -364,10 +371,25 @@ def learn(
                     break
                 start = int(recovery["cursor"])
             phase = "recovery" if recovery else "quick" if quick else "final"
+            if entry.get("history_hold") and stop_at is None:
+                report.deferred += 1
+                continue
             retry_at = entry.get(f"{phase}_retry_at")
             if retry_at and datetime.fromisoformat(retry_at) > moment:
                 report.deferred += 1
                 continue
+            if (stop_at is not None and (type(stop_at) is not int or stop_at > status.st_size or stop_at <= start)):
+                report.blocked = "invalid bounded final-review endpoint"
+                break
+            if stop_at is not None:
+                if quick or recovery or len(logs) != 1:
+                    report.blocked = "a bounded endpoint requires one ordinary final-review source"
+                    break
+                with log.open("rb") as boundary:
+                    boundary.seek(stop_at - 1)
+                    if boundary.read(1) != b"\n":
+                        report.blocked = "bounded review must stop on a complete transcript line"
+                        break
             if status.st_size <= start:
                 continue
             if not dry_run and remaining() <= 0:
@@ -389,8 +411,8 @@ def learn(
                 report.set_aside += 1
                 continue
             # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
-            session, end = read_session(log, start=start, stop=recovery["end"] if recovery else int(entry.get(LEARN_TO) or 0) or None)
-            event_index = int(recovery["cursor_event_index"] if recovery else entry.get("event_index" if quick else SETTLED_EVENT_INDEX, 0))
+            session, end = read_session(log, start=start, stop=recovery["end"] if recovery else stop_at or int(entry.get(LEARN_TO) or 0) or None)
+            event_index = int(recovery["cursor_event_index"] if recovery else quick_position[1] if quick else entry.get(SETTLED_EVENT_INDEX, 0))
             session.events = [event for event in session.events if event.start != start or event.index >= event_index]
             dossiers = build_dossiers(session, require_user=start == 0 and event_index == 0,
                                       **({} if quick else {"budget": PART_CHARACTERS}))
@@ -406,6 +428,22 @@ def learn(
                 # user never has (candidate reviews, C-L2, D-M2, D-M6).
                 dossiers = dossiers[:left - 1]
                 end = dossiers[-1].end_offset
+                if memory is not None:
+                    from .provenance import safe_cut
+                    cut = safe_cut(memory, session, (start, event_index),
+                                   (end, dossiers[-1].end_event_index))
+                    if cut != (end, dossiers[-1].end_event_index):
+                        prefix = dataclasses.replace(session, events=[e for e in session.events
+                                                                     if (e.start, e.index) < cut])
+                        dossiers = build_dossiers(prefix, require_user=start == 0 and event_index == 0,
+                                                  budget=PART_CHARACTERS)
+                        if not dossiers:
+                            report.deferred += 1
+                            continue
+                        dossiers[-1].end_offset, dossiers[-1].end_event_index = cut
+                        file_by_work(dossiers, known=memory.store.all_project_paths(), resolve=memory.stored_project,
+                                     started=session.started_at, ended=session.ended_at)
+                        end = cut[0]
             # What the final pass settled is told apart from what the quick pass read: the same text, read again.
             prints = [item.fingerprint if quick else SETTLED_PRINT + item.fingerprint for item in dossiers]
             duplicates = [item for item, mark in zip(dossiers, prints) if state.seen(mark) or mark in run_seen]
@@ -449,7 +487,8 @@ def learn(
 
                 try:
                     settled = settle(memory, extractor, dossiers, session=session, run=run, on_call=counted,
-                                     partial=partial or bool(entry.get(LEARN_TO)), recovery=bool(recovery))
+                                     partial=partial or bool(entry.get(LEARN_TO)), recovery=bool(recovery),
+                                     review_start=(start, event_index))
                 except ExtractionError as exc:
                     report.calls += len(made)
                     if exc.blocking:
@@ -641,9 +680,17 @@ def publish_with_ids(memory: Memory, candidate: dict[str, Any], dossier: Dossier
     says, it takes its place and its better verification, instead of becoming a copy and a question.
     """
 
+    from . import provenance
     dossier = filed_where_named(memory, candidate, dossier)
-    outcome, record_ids = _publish(memory, candidate, dossier, provisional=provisional, merge=merge)
-    _record_candidate(memory, candidate, dossier, outcome, record_ids, run)
+    with memory.store.transaction():
+        outcome, record_ids = _publish(memory, candidate, dossier, provisional=provisional, merge=merge)
+        _record_candidate(memory, candidate, dossier, outcome, record_ids, run)
+        source = provenance.descriptor(dossier)
+        if source and outcome.startswith("saved"):
+            for record_id in record_ids:
+                row = memory.store.get(record_id)
+                if row and row.source_session == dossier.session_id and row.source_agent == LEARNER_AGENT:
+                    provenance.put(memory.store, record_id, source)
     return outcome, record_ids
 
 
@@ -698,6 +745,9 @@ def _record_candidate(
         said_at = _when_said(" ".join(str(candidate.get("evidence") or "").split()), dossier)
         if said_at:
             details["said_at"] = said_at
+        from .provenance import descriptor
+        if source := descriptor(dossier):
+            details["source"] = source
     if reason:
         details["reason"] = reason
     journal.record(
@@ -1369,6 +1419,9 @@ def _pending_review(entry, phase, start, event_index, end, end_index, session_id
         "reason": redact(str(error))[:300], "at": moment.isoformat(), "attempts": attempts, "timeouts": timeouts,
         "category": getattr(error, "category", "content"),
     }
+    entry[f"{phase}_last_error"] = redact(str(error))[:300]
+    if phase == "quick":
+        entry["quick_status"] = "pending"
     counter = f"{phase}_failures" if phase != "quick" else "failures"
     failures = max(entry.get(counter, 0), timeouts)
     if failures >= MAX_FAILURES:
@@ -1392,12 +1445,16 @@ def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime, 
         previous = (int(entry.get("offset", 0)), int(entry.get("event_index", 0)))
         end, event_index = max((end, event_index), previous)
         entry["final_failures"] = 0
+        entry.pop("final_last_error", None)
         entry.pop("final_retry_at", None)
         entry.get("pending_reviews", {}).pop("final", None)
     entry.pop("quick_retry_at", None)
     entry.get("pending_reviews", {}).pop("quick", None)
+    pending = list(entry.get("pending_reviews", {}).values())
     entry.update(
         {"session_id": session_id, "offset": end, "event_index": event_index,
-         "status": "partial" if event_index else "done", "failures": 0, "last_error": None,
+         "status": "review pending" if pending else "partial" if event_index else "done",
+         "quick_status": "partial" if event_index else "done", "failures": 0,
+         "last_error": pending[0].get("reason") if pending else None,
          "updated_at": moment.isoformat()}
     )

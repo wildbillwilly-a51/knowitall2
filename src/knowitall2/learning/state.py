@@ -136,6 +136,8 @@ class LearnerState:
         self.calls: list[dict[str, Any]] = data.get("calls", []) if isinstance(data, dict) else []
         self.fingerprints: list[str] = data.get("fingerprints", []) if isinstance(data, dict) else []
         self.review_resets: list[dict] = data.get("review_resets", []) if isinstance(data, dict) else []
+        self.log_aliases: dict[str, str] = data.get("log_aliases", {}) if isinstance(data, dict) else {}
+        self._file_ids: dict[str, tuple | None] = {}
         self._seen = set(self.fingerprints)
 
     def seen(self, fingerprint: str) -> bool:
@@ -152,15 +154,72 @@ class LearnerState:
                     self._seen.discard(stale)
                 del self.fingerprints[:-FINGERPRINTS_KEPT]
 
-    def entry(self, log: Path) -> dict[str, Any]:
-        key = os.path.normcase(str(log))
-        if key not in self.logs:
-            resolved = os.path.normcase(os.path.realpath(log))
-            for existing in self.logs:
-                if (Path(existing).name.casefold() == log.name.casefold()
-                        and os.path.normcase(os.path.realpath(existing)) == resolved):
-                    return self.logs[existing]
-        return self.logs.setdefault(key, {"offset": 0, "status": "new", "failures": 0})
+    def entry(self, log: Path, *, physical: bool = True) -> dict[str, Any]:
+        from .log_identity import path_key, same_log
+
+        key = path_key(log)
+        if not physical and key in self.log_aliases and self.log_aliases[key] in self.logs:
+            return self.logs[self.log_aliases[key]]
+        matches = [(name, entry) for name, entry in self.logs.items() if path_key(name) == key]
+        if physical:
+            def file_id(name):
+                if name not in self._file_ids:
+                    try:
+                        status = os.stat(name)
+                        self._file_ids[name] = (status.st_dev, status.st_ino) if status.st_ino else None
+                    except OSError:
+                        self._file_ids[name] = None
+                return self._file_ids[name]
+            identity = file_id(str(log))
+            matched = {name for name, _ in matches}
+            # At most one stat per indexed path in a learner run. Hot hooks
+            # use the persisted alias map and lexical normalization only.
+            matches += [(name, entry) for name, entry in self.logs.items() if name not in matched
+                        and ((identity is not None and file_id(entry.get("log_path", name)) == identity)
+                             or (identity is None and same_log(entry.get("log_path", name), log)))]
+        if not matches:
+            return self.logs.setdefault(key, {"offset": 0, "status": "new", "failures": 0,
+                                             "log_path": str(log.absolute())})
+        established = set(self.log_aliases.values())
+        matches.sort(key=lambda pair: (pair[0] not in established,
+                                       str(pair[0]).startswith("\\\\?\\"), "~" in pair[0], pair[0]))
+        name, chosen = matches[0]
+        conflicts = []
+        for alias, other in matches[1:]:
+            if (other.get("pending_reviews") or other.get("recovery_ranges")
+                    or any(other.get(field) for field in ("failures", "final_failures", "recovery_failures"))
+                    or (other.get("session_id") and chosen.get("session_id")
+                        and other["session_id"] != chosen["session_id"])
+                    or any((int(other.get(field, 0)), int(other.get(index, 0))) >
+                           (int(chosen.get(field, 0)), int(chosen.get(index, 0)))
+                           for field, index in (("offset", "event_index"), ("settled", "settled_event_index")))):
+                conflicts.append(alias)
+        if conflicts:
+            chosen["identity_conflicts"] = conflicts
+        else:
+            chosen.pop("identity_conflicts", None)
+        if physical:
+            chosen["log_path"] = str(log.absolute())
+            for alias, _ in matches:
+                self.log_aliases[path_key(alias)] = name
+            self.log_aliases[key] = name
+        return chosen
+
+    def progress(self) -> dict[str, int]:
+        """Quick completion and pending final work are independent phases."""
+        from .log_identity import path_key
+        entries = {self.log_aliases.get(path_key(name), path_key(name)): self.entry(Path(name), physical=False)
+                   for name in list(self.logs)}
+        return {
+            "quick_done": sum(e.get("quick_status", e.get("status")) == "done" for e in entries.values()),
+            "final_pending": sum(bool(e.get("pending_reviews", {}).get("final")) for e in entries.values()),
+            "final_failures": sum(int(e.get("final_failures", 0)) for e in entries.values()),
+            "awaiting_final": sum((int(e.get("offset", 0)), int(e.get("event_index", 0))) >
+                                  (int(e.get("settled", 0)), int(e.get("settled_event_index", 0)))
+                                  for e in entries.values()),
+            "identity_conflicts": sum(bool(e.get("identity_conflicts")) for e in entries.values()),
+            "history_holds": sum(bool(e.get("history_hold")) for e in entries.values()),
+        }
 
     def record_call(self, *, at: datetime, session: str, outcome: str, origin: str | None = None) -> None:
         if at.tzinfo is None:
@@ -201,10 +260,11 @@ class LearnerState:
         # A log deleted long ago (an agent's old sessions cleaned up) needs no entry: the file stays small.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=FORGET_MISSING_LOGS_DAYS)).isoformat()
         for key in [key for key, entry in self.logs.items()
-                    if str(entry.get("updated_at") or "9999") < cutoff and not os.path.exists(key)]:
+                    if str(entry.get("updated_at") or "9999") < cutoff
+                    and not os.path.exists(entry.get("log_path", key))]:
             del self.logs[key]
         document = {"schema_version": 1, "logs": self.logs, "calls": self.calls, "fingerprints": self.fingerprints,
-                    "review_resets": self.review_resets}
+                    "review_resets": self.review_resets, "log_aliases": self.log_aliases}
         write_text_atomic(self.path, json.dumps(document, indent=2) + "\n")
 
 

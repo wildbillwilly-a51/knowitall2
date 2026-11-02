@@ -175,3 +175,35 @@ $env:PYTHONPATH="$env:USERPROFILE\.knowitall2\app\src"; python -P -m knowitall2 
 
 Your memories are kept in `.knowitall2`; delete that folder to remove
 everything.
+
+## Auditing an alias-replayed learning history
+
+Ordinary updates prevent further alias replays. An existing interrupted history
+needs a reviewed repair plan; do not reset its cursors or remove provisional tags.
+
+Prepare artifacts without changing the memory database or learning progress:
+
+    python -m knowitall2 learn --history-plan /private/path/repair.json --session SESSION-ID --replay-run RUN-ID --max-calls 32
+
+The plan contains exact record seals, original source bindings, canonical progress,
+a hash-bound transcript snapshot and the pending final range. It rejects ambiguous
+sources and independent conflicting alias work. Keep the plan, source snapshot,
+model checkpoints and results outside source control: transcripts are private.
+Back up the database and learner state consistently before an approved repair.
+
+Run the reviewed plan with the already selected learning backend and model:
+
+    python -m knowitall2 learn --repair-history /private/path/repair.json
+
+Execution holds learning, audits only the selected older/crossing-source records,
+forbids new extraction during that audit, and then reviews exactly the failed
+forward range. A committed receipt and unchanged source allow safe resumption;
+changed records, changed history or an exhausted call cap leave the repair pending.
+Existing quick progress is preserved. Alias bookkeeping is retired only after
+identity and independent-work checks. Partial logical-record final boundaries
+remain unsupported by this repair command and are rejected explicitly.
+
+Source metadata and unresolved-source queues are local bookkeeping, included in
+full database backups. Other computers need their own update; old clients cannot
+honor a newer client's local pending-source queue. A provisional memory remains
+unchecked until its source-aware review actually succeeds.

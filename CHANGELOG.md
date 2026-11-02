@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.5 (2026-11-02)
+
+- **One transcript keeps one learning history.** Windows extended drive and
+  UNC spellings, short names and physical file aliases share progress. A quick
+  pass cannot restart before established final progress. Conflicting alias
+  histories stay held for explicit repair rather than having cursors merged.
+- **Final reviews use original source context.** Learned records retain local
+  source ranges independently of journal retention. Legacy bindings are
+  reconstructed from the original learning run and evidence; a repeated quote
+  in another stretch does not claim ownership. Unknown or earlier sources stay
+  queued for review, including when learning is disabled or stale provisional
+  records would otherwise be confirmed. Quick success no longer hides an
+  unfinished final review; the Learning page shows the pending counts.
+- **Historical repairs are bounded and resumable.** The new history-plan and
+  repair-history commands seal the selected records, transcript snapshot and
+  progress. They review existing records without extracting additions, verify
+  seals again inside the application transaction, retain committed receipts,
+  and finish only the approved final range. See the testing guide. Update each
+  computer that learns; no server or shared-database schema update is needed.
+
 ## 0.12.4 (2026-11-02)
 
 - **Long-running Windows Codex chats stay learnable.** Finding the current

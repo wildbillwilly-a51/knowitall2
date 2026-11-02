@@ -19,6 +19,7 @@ from .learner import LEARN_TO, RESUME_AT, RESUME_EVENT_INDEX, SETTLED, SETTLED_E
 from .settle import PART_CHARACTERS, needed_calls
 from .state import LearnerState, learner_lock
 from .transcripts import read_session, session_folder, session_logs
+from .log_identity import path_key
 
 SKIPPED = "baseline"
 # Where a session's set-aside part ends. It stays when later activity in the same
@@ -81,7 +82,7 @@ def groups(*, since: str | None = None) -> list[dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
     for log, active in _skipped(state, since=since):
         folder = session_folder(log) or "(unknown folder)"
-        key = os.path.normcase(folder)
+        key = path_key(folder)
         group = found.setdefault(key, {"folder": folder, "sessions": 0, "last_active": active})
         group["sessions"] += 1
         group["last_active"] = max(group["last_active"], active)
@@ -145,13 +146,13 @@ def catch_up(folder: str, *, since: str | None = None, max_calls: int | None = N
 
 
 def _matching(folder: str, *, since: str | None, state: LearnerState | None = None) -> list[Path]:
-    target = os.path.normcase(os.path.normpath(folder))
+    target = path_key(folder)
     matched = []
     for log, _ in sorted(_skipped(state or LearnerState(), since=since), key=lambda item: item[1], reverse=True):
         worked_in = session_folder(log)
         if worked_in is None:
             continue
-        candidate = os.path.normcase(os.path.normpath(worked_in))
+        candidate = path_key(worked_in)
         if candidate == target or candidate.startswith(target.rstrip(os.sep) + os.sep):
             matched.append(log)
     return matched
@@ -162,7 +163,7 @@ def _skipped(state: LearnerState, *, since: str | None) -> list[tuple[Path, str]
 
     found = []
     for log in session_logs():
-        if not is_skipped(state.logs.get(os.path.normcase(str(log)), {})):
+        if not is_skipped(state.entry(log)):
             continue
         try:
             modified = log.stat().st_mtime

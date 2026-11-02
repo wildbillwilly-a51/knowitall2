@@ -80,6 +80,10 @@ class Dossier:
     from_documents: bool = False  # a project's own documents, not a session: what it teaches stays with that project
     user_times: list = field(default_factory=list)  # when each of ``user_texts`` was said, as the log recorded it
     ended_at: str | None = None  # when its last event was recorded
+    source_path: str | None = None
+    start_offset: int | None = None
+    start_event_index: int = 0
+    source_events: list[Event] = field(default_factory=list, repr=False)
 
     @property
     def known_ids(self) -> set[str]:
@@ -115,7 +119,11 @@ def build_dossiers(
         if len(current.text) + len(entry) > budget and current.text != header:
             dossiers.append(current)
             current = _new_dossier(session, project, header, len(dossiers))
+        if current.start_offset is None:
+            current.source_path = str(session.path)
+            current.start_offset, current.start_event_index = event.start, event.index
         current.text += entry
+        current.source_events.append(event)
         following = session.events[position + 1] if position + 1 < len(session.events) else None
         if event.end and following is not None and following.end == event.end:
             current.end_offset, current.end_event_index = event.start, event.index + 1

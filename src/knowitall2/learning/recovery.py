@@ -19,6 +19,7 @@ from ..files import write_text_atomic
 from ..paths import database_path, data_home
 from .state import LearnerState, learner_lock
 from .transcripts import line_boundary, read_session
+from .log_identity import same_log, unique_logs
 
 
 def prefix_hash(path: Path, end: int) -> str:
@@ -49,10 +50,14 @@ def plan(connection, state: LearnerState, *, since: str = "") -> dict:
                 (item.get("dossiers") for item in detail.get("sessions", []) if item.get("session") == session), None)})
     entries, unresolved = [], []
     for session, events in incidents.items():
-        matches = [(Path(path), entry) for path, entry in state.logs.items()
+        matches = [(Path(entry.get("log_path", path)), entry) for path, entry in state.logs.items()
                    if entry.get("session_id") == session or session in path]
         usable = False
-        for path, entry in matches:
+        for path in unique_logs([path for path, _ in matches]):
+            entry = state.entry(path)
+            if entry.get("identity_conflicts"):
+                unresolved.append({"session": session, "reason": "conflicting transcript aliases require history repair"})
+                continue
             if not path.is_file():
                 continue
             end = line_boundary(path)
@@ -102,7 +107,7 @@ def validate(item: dict) -> None:
     if item["start"] >= item["end"]:
         raise ValueError("recovery range must be nonempty")
     path = Path(item["path"])
-    if not path.is_absolute() or str(path.resolve()) != item["path"]:
+    if not path.is_absolute():
         raise ValueError("recovery transcript must use its exact absolute path")
     if prefix_hash(path, item["end"]) != item["sha256"]:
         raise ValueError("recovery transcript changed; prepare a new plan")
@@ -128,7 +133,7 @@ def queue(manifest: dict, state: LearnerState, *, allow_whole_session: bool = Fa
         if not isinstance(item, dict):
             raise ValueError("recovery ranges must be objects")
         validate(item)
-        if not any(Path(path).resolve() == Path(item["path"]) for path in state.logs):
+        if not any(same_log(entry.get("log_path", path), item["path"]) for path, entry in state.logs.items()):
             raise ValueError("recovery transcript is not indexed in this installation's learner state")
         if item["scope"] == "historical_whole_session" and not allow_whole_session:
             raise ValueError("historical boundaries are unknown; --allow-whole-session is required")
@@ -144,10 +149,9 @@ def queue(manifest: dict, state: LearnerState, *, allow_whole_session: bool = Fa
     added = 0
     for item in entries:
         # Windows logs may already be indexed using an 8.3 spelling of the same path.
-        entry = next((value for path, value in state.logs.items()
-                      if Path(path).resolve() == Path(item["path"])), None)
-        if entry is None:
-            entry = state.entry(Path(item["path"]))
+        entry = state.entry(Path(item["path"]))
+        if entry.get("identity_conflicts"):
+            raise ValueError("conflicting transcript aliases require history repair first")
         if item["id"] in entry.get("recovery_completed", []) or any(
                 old["id"] == item["id"] for old in entry.get("recovery_ranges", [])):
             continue
