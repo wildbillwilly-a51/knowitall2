@@ -375,6 +375,14 @@ _FORMAT_FIELD = re.compile(r"^\{[A-Za-z_][\w.]*\}?$")  # f"PGPASSWORD={password}
 _CONSTANT = re.compile(r"^[A-Z]{4,}$")  # password=PASSWORD names a constant; HUNTER22 is a value
 # $NAME, $env:NAME, %NAME%; a digit inside or a symbol makes "$uperS3cret!" a value.
 _SHELL_VARIABLE = re.compile(r"^(?:\$(?:env:)?[A-Za-z_][A-Za-z_]*\d*|%[A-Za-z_][A-Za-z0-9_]*%)$", re.IGNORECASE)
+# A credential file under an environment variable, including JSON's doubled backslashes. Bare shell names
+# must be uppercase so "$ecret/2024" stays a password; the other forms have distinctive delimiters.
+# As for absolute paths, '+' and '=' can instead mean key material. Only the loose key/token reference
+# checks use this: password values and strict URL/login-command checks keep their existing screening.
+_VARIABLE_PATH = re.compile(
+    r"(?:%[A-Za-z_][A-Za-z0-9_]*%|\$(?i:env):[A-Za-z_][A-Za-z0-9_]*|\$[A-Z_][A-Z0-9_]*)"
+    r"[\\/]{1,2}[^\s\\/@:*?\"<>|+=][^\s@:*?\"<>|+=]*"
+)
 # PowerShell that fetches a secret: "$password = Read-Host -AsSecureString"
 _FETCH_COMMAND = re.compile(r"^(?:Read-Host|Get-[A-Z][A-Za-z]+|ConvertTo-SecureString|ConvertFrom-[A-Z][A-Za-z]+"
                             r"|New-Object|Import-[A-Z][A-Za-z]+)$", re.IGNORECASE)
@@ -684,6 +692,8 @@ def _is_reference(value: str, *, loose: bool = False, strict: bool = False, code
     if strict:
         return False
     named = candidate.rstrip(_TRAILING)
+    if loose and _VARIABLE_PATH.fullmatch(named):
+        return True
     if code and _IDENTIFIER.match(named) and _secret_key(named):
         return True
     lowered = candidate.lstrip("([").strip().lower().rstrip(_TRAILING)

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Credential-file references keep their paths.** A key-file location such as
+  `%USERPROFILE%\.ssh\id_ed25519` or `$HOME/.ssh/id_ed25519` is no longer
+  mistaken for key material in a memory. The same check covers saving, shared
+  memory and retrying a previously refused change, including JSON-escaped
+  Windows paths. Password assignments, password flags, login commands and
+  URL credentials keep their existing screening. For a change already
+  refused by a server, update the server and this computer, then retry it
+  with `sync --retry-rejected ID`; the memory does not need rewording or
+  dismissing.
+
 ## 0.12.2 (2026-10-27)
 
 0.12.1 was built and pushed only to the private release repository; its public push was refused over a test fixture, so 0.12.2 is the first public release with these changes.

@@ -125,6 +125,11 @@ class StoreBoundaryTests(unittest.TestCase):
         self.store.set_tags(record.id, [FAKE_TOKEN], now=NOW)
         self.assertEqual((FAKE_TOKEN,), self.store.get(record.id).tags)
 
+    def test_a_key_file_reference_is_saved_without_rewording(self) -> None:
+        text = r"The controller private key is %USERPROFILE%\.ssh\controller-ed25519."
+        record = self.save(text)
+        self.assertEqual(text, self.store.get(record.id).text)
+
 
 class ServerBoundaryTests(unittest.TestCase):
     """The server screens the same columns (``exchange`` through ``sync.screen_row``), for a client that does not."""
@@ -172,6 +177,36 @@ class ServerBoundaryTests(unittest.TestCase):
         self.assertNotIn("row", answers[0])
         self.assertEqual("moved to nas02",
                          sync.read_row(self.server.connection, sync.table_for("records"), record.id)["retired_reason"])
+
+    def test_a_key_file_reference_from_an_older_client_passes_unchanged(self) -> None:
+        memory = Memory(self.computer, agent="codex", clock=Clock(NOW))
+        record = memory.remember("The controller key file is documented.", project_path=self.plain).record
+        [operation] = sync.pending_operations(self.computer)
+        # The server must screen independently of the sender's version and local validation.
+        text = r"The controller private key is %USERPROFILE%\.ssh\controller-ed25519."
+        operation["row"]["text"] = text
+        [answer] = exchange.apply_operations(self.server, "c-a", [operation], now=NOW)
+        self.assertEqual("applied", answer["result"], answer)
+        self.assertEqual(text, self.server.get(record.id).text)
+
+    def test_a_quarantined_key_file_reference_can_be_retried_without_rewording(self) -> None:
+        memory = Memory(self.computer, agent="codex", clock=Clock(NOW))
+        record = memory.remember("The controller key file is documented.", project_path=self.plain).record
+        text = r"The controller private key is %USERPROFILE%\.ssh\controller-ed25519."
+        # This row was saved by an older client before the prose-token detector existed.
+        self.computer.connection.execute("UPDATE records SET text = ? WHERE id = ?", (text, record.id))
+        [operation] = sync.pending_operations(self.computer)
+        sync.quarantine(self.computer, operation, "the memory looks like it holds a secret")
+        [rejection] = sync.rejections(self.computer)
+        self.assertFalse(rejection["sensitive"])  # the serialized row also preserves its reference
+        # A previous detector may already have discarded the queued payload as sensitive.
+        rejection.update(sensitive=True, operation=None)
+        self.computer.set_meta(sync.REJECTIONS_KEY, json.dumps([rejection]))
+        sync.resolve_rejection(self.computer, rejection["id"], retry=True)
+        self.assertEqual([], sync.rejections(self.computer))
+        answers = exchange.apply_operations(self.server, "c-a", sync.pending_operations(self.computer), now=NOW)
+        self.assertEqual(["applied"], [answer["result"] for answer in answers])
+        self.assertEqual(text, self.server.get(record.id).text)
 
 
 if __name__ == "__main__":

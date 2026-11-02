@@ -1,4 +1,5 @@
 import base64
+import json
 import random
 import string
 import time
@@ -571,6 +572,49 @@ class SecretDetectionTests(unittest.TestCase):
         for sample in ("password=$uperS3cret!", "password=$3cr3tPass", "password=%Xk9mQ2vL8"):
             with self.subTest(sample):
                 self.assertTrue(contains_secret(sample), sample)
+
+    def test_environment_variable_key_file_paths_are_preserved(self) -> None:
+        paths = (r"%USERPROFILE%\.ssh\controller-ed25519", "%KEY_ROOT_2%/keys/id_ed25519",
+                 r"$env:UserProfile\.ssh\controller-ed25519", "$EnV:KEY_ROOT_2/keys/id_ed25519",
+                 "$HOME/.ssh/id_ed25519", "$KEY2_ROOT/keys/id_ed25519")
+        for path in paths:
+            for text in (f"The controller private key is {path}.", f"private_key={path}",
+                         f"tool --private-key {path}"):
+                for sample in (text, json.dumps({"text": text})):
+                    with self.subTest(sample=sample):
+                        self.assertEqual([], find_secrets(sample))
+                        self.assertEqual(sample, redact(sample))
+
+    def test_environment_variable_paths_do_not_exempt_inline_login_passwords(self) -> None:
+        for value in ("%ROOT%/secret123", r"%ROOT%\secret123", "$HOME/secret123"):
+            for template in ("https://user:{}@host.example/path", "sshpass -p '{}' ssh host.example",
+                             "mysql -p{}", "curl -u 'admin:{}' https://host.example",
+                             "tool --password '{}'", "password={}"):
+                sample = template.format(value)
+                with self.subTest(sample=sample):
+                    self.assertTrue(contains_secret(sample))
+                    self.assertNotIn(value, redact(sample))
+
+    def test_variable_like_passwords_and_malformed_paths_are_still_detected(self) -> None:
+        values = ("$ecret/2024", "$unshine/99", "$uperS3cret!/keys/id_ed25519",
+                  "%KEY_ROOT%literalA1B2C3D4", "%PRIVATE_KEY_2026%/",
+                  "%KEY_ROOT%/tokenA1B2C3D4+", "%KEY_ROOT%/tokenA1B2C3D4=",
+                  "%KEY_ROOT%/user:secret123", "%KEY_ROOT%/user@host123")
+        for value in values:
+            sample = f"password={value}"
+            with self.subTest(sample=sample):
+                self.assertTrue(contains_secret(sample))
+                self.assertNotIn(value, redact(sample))
+
+    def test_a_key_file_reference_does_not_hide_real_secret_material(self) -> None:
+        path = r"%USERPROFILE%\.ssh\controller-ed25519"
+        for sample, secret in ((f"The private key is {path}; password={PASSWORD}", PASSWORD),
+                               (f"The private key is {path}; token={TOKEN}", TOKEN),
+                               ("The private key is %KEY_ROOT%/sk-" + "c3" * 16, "sk-" + "c3" * 16),
+                               (f"The private key is {path}\n{PEM}", PEM_BODY[0])):
+            with self.subTest(sample=sample):
+                self.assertTrue(contains_secret(sample))
+                self.assertNotIn(secret, redact(sample))
 
     def test_long_texts_are_checked_quickly(self) -> None:
         # A key-name pattern that backtracks takes seconds on 10,000 characters of these.
