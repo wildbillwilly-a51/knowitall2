@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.3 (2026-11-02)
 
 - **Credential-file references keep their paths.** A key-file location such as
   `%USERPROFILE%\.ssh\id_ed25519` or `$HOME/.ssh/id_ed25519` is no longer
