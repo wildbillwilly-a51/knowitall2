@@ -39,6 +39,7 @@ LOOK_AHEAD_BYTES = 1024 * 1024
 # Where each session's log was found last, by place and agent: newest_session_log looks there first.
 FOUND_LOGS_FILE = "found-logs.json"
 FOUND_LOGS_KEPT = 100
+CHAT_LOGS_CHECKED = 32
 
 # A command that makes a commit: ``git commit`` (also with ``-C dir`` or
 # ``-c name=value`` first), ``git cherry-pick``, or ``git revert``.
@@ -182,30 +183,43 @@ def by_session(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 def newest_session_log(cwd: str | os.PathLike[str], agent: str | None, *, within_minutes: int = 30) -> Path | None:
     """The log of the session working in ``cwd`` right now: the newest one there, written recently.
 
-    It looks first where that log would be: today's and yesterday's Codex
-    date folders, and the folder of the log found last for this place and
-    agent (a session asks on every tool call, each in a fresh process, so
-    that is kept in a file). Only when those have none does it go through
-    every log, as for a session that began days ago.
+    Look in recent Codex date folders, the remembered log and hook chat
+    states. Rank matching interactive sessions by bounded transcript activity,
+    since Windows can leave an open log's mtime stale for hours. Without a
+    caller session id, most recent activity is a best-effort choice.
+
+    Directory listings check only mtime-fresh logs: a never-hooked,
+    never-remembered log with stale mtime cannot be found cheaply.
     """
 
-    from .transcripts import claude_code_listing, codex_listing, folder_listing, recent_codex_listing
+    from .transcripts import claude_code_listing, codex_listing, folder_listing, is_codex_log, recent_codex_listing
 
     wanted = _same_folder(str(cwd))
     cutoff = datetime.now(timezone.utc).timestamp() - within_minutes * 60
     place = key(f"{agent}\n{wanted}")
     found_before = _found_logs().get(place)
     likely = recent_codex_listing() if agent in ("codex", None) else []
+    likely = [item for item in likely if item[0] >= cutoff]
+    if agent in ("codex", None):
+        likely += _chat_logs()
     if isinstance(found_before, str):
-        likely += folder_listing(Path(found_before).parent)
-    found = _newest_here(sorted(set(likely), reverse=True), wanted, cutoff)
+        try:
+            log = Path(found_before)
+            likely.append((log.stat().st_mtime, log))
+            if agent in ("claude-code", None) and not is_codex_log(log):
+                # Claude Code files siblings by project, not date. A fresh
+                # remembered session must not hide a newer chat there.
+                likely += [item for item in folder_listing(log.parent) if item[0] >= cutoff]
+        except OSError:
+            pass
+    found = _newest_here(likely, wanted, cutoff)
     if found is None:
         listing: list[tuple[float, Path]] = []
         if agent in ("codex", None):
             listing += codex_listing()
         if agent in ("claude-code", None):
             listing += claude_code_listing()
-        found = _newest_here(sorted(listing, key=lambda item: item[0], reverse=True), wanted, cutoff)
+        found = _newest_here([item for item in listing if item[0] >= cutoff], wanted, cutoff)
     if found is not None and str(found) != found_before:
         _remember_found(place, found)
     return found
@@ -219,6 +233,33 @@ def _found_logs() -> dict[str, Any]:
     return found if isinstance(found, dict) else {}
 
 
+def _chat_logs() -> list[tuple[float, Path]]:
+    """Exact old-date logs from a bounded number of recent hook states."""
+
+    states = []
+    try:
+        with os.scandir(data_home() / "chats") as entries:
+            for entry in entries:
+                try:
+                    if entry.name.endswith(".json") and entry.is_file():
+                        states.append((entry.stat().st_mtime, Path(entry.path)))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    logs = []
+    for _, path in sorted(states, reverse=True)[:CHAT_LOGS_CHECKED]:
+        try:
+            state = json.loads(read_text(path))
+            name = state.get("log") if isinstance(state, dict) else None
+            if isinstance(name, str) and Path(name).name.startswith("rollout-"):
+                log = Path(name)
+                logs.append((log.stat().st_mtime, log))
+        except (OSError, ValueError):
+            continue
+    return logs
+
+
 def _remember_found(place: str, log: Path) -> None:
     found = {name: value for name, value in _found_logs().items() if name != place}
     found[place] = str(log)
@@ -230,15 +271,21 @@ def _remember_found(place: str, log: Path) -> None:
 
 
 def _newest_here(listing: list[tuple[float, Path]], wanted: str, cutoff: float) -> Path | None:
-    from .transcripts import session_folder
+    from .transcripts import ACTIVITY_MAX_BYTES, ACTIVITY_TAIL_BYTES, session_activity, session_folder
 
-    for modified, log in listing:  # newest first
-        if modified < cutoff:
-            return None
-        folder = session_folder(log)
+    found = None
+    newest = cutoff
+    unique: dict[Path, float] = {}
+    for modified, log in listing:
+        unique[log] = max(modified, unique.get(log, modified))
+    for log, modified in unique.items():
+        folder = session_folder(log, interactive_only=True)
         if folder and _same_folder(folder) == wanted:
-            return log
-    return None
+            active = session_activity(log, modified=modified,
+                                      max_bytes=ACTIVITY_MAX_BYTES if modified < cutoff else ACTIVITY_TAIL_BYTES)
+            if active >= newest:
+                newest, found = active, log
+    return found
 
 
 def _same_folder(value: str) -> str:

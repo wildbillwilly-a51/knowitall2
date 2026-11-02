@@ -154,6 +154,59 @@ def is_codex_log(path: Path) -> bool:
     return path.name.startswith("rollout-")
 
 
+ACTIVITY_TAIL_BYTES = 64 * 1024
+ACTIVITY_MAX_BYTES = 1024 * 1024
+# Codex writes timestamp first. A raw newline starts a JSONL record; quoted
+# payload timestamps (including escaped newlines) cannot match this prefix.
+_ACTIVITY_PREFIX = re.compile(rb'(?:\A|\n)[ \t]*\{[ \t]*"timestamp"[ \t]*:[ \t]*"([^"\r\n]{1,64})"')
+
+
+def session_activity(path: Path, *, modified: float, now: datetime | None = None,
+                     max_bytes: int = ACTIVITY_MAX_BYTES) -> float:
+    """Recent Codex activity despite Windows delaying an open log's mtime.
+
+    Read only timestamp prefixes, initially in a 64 KiB tail. If a large final
+    record hides its prefix, extend backwards up to 1 MiB total. A complete
+    prefix on a still-incomplete record counts as writing, never as learnable
+    content. Unknown/malformed timestamps fall back to mtime so idle logs can
+    still settle. Claude Code retains its existing mtime behavior.
+    """
+
+    if not is_codex_log(path):
+        return modified
+    latest_allowed = (now or datetime.now(timezone.utc)).timestamp() + 120
+    limit = max(0, min(max_bytes, ACTIVITY_MAX_BYTES))
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            tail = b""
+            while len(tail) < min(size, limit):
+                length = min(ACTIVITY_TAIL_BYTES, size - len(tail), limit - len(tail))
+                start = size - len(tail) - length
+                stream.seek(start)
+                chunk = stream.read(length)
+                if len(chunk) != length:
+                    break  # truncated/replaced while reading; try again next time
+                tail = chunk + tail
+                # The first byte might be mid-record; only trust it at BOF.
+                bounded = tail
+                if start:
+                    bounded = tail[tail.find(b"\n") + 1:] if b"\n" in tail else b""
+                stamps = []
+                for match in _ACTIVITY_PREFIX.finditer(bounded):
+                    try:
+                        stamp = datetime.fromisoformat(match.group(1).decode("ascii").replace("Z", "+00:00"))
+                        if stamp.tzinfo is not None and stamp.timestamp() <= latest_allowed:
+                            stamps.append(stamp.timestamp())
+                    except (ValueError, UnicodeError, OverflowError):
+                        continue
+                if stamps:
+                    return max(modified, max(stamps))
+    except OSError:
+        pass
+    return modified
+
+
 def line_boundary(path: Path, *, window: int = 1 << 16) -> int:
     """The offset just past the last complete line, so a later read starts on a record."""
 
@@ -416,8 +469,7 @@ def read_codex_session(path: Path, *, start: int = 0, stop: int | None = None) -
         session.session_id = meta["id"]
     if isinstance(meta.get("cwd"), str):
         session.cwd = meta["cwd"]
-    source = meta.get("source")
-    learnable = not (isinstance(source, dict) or source == "exec")
+    learnable = _interactive_codex(meta)
     offset = start
     with path.open("rb") as stream:
         stream.seek(start)
@@ -441,11 +493,19 @@ def read_codex_session(path: Path, *, start: int = 0, stop: int | None = None) -
     return session, offset
 
 
-def session_folder(path: Path) -> str | None:
+def _interactive_codex(meta: dict[str, Any]) -> bool:
+    source = meta.get("source")
+    return not (isinstance(source, dict) or source == "exec")
+
+
+def session_folder(path: Path, *, interactive_only: bool = False) -> str | None:
     """The folder a session worked in, read cheaply from the start of its log."""
 
     if is_codex_log(path):
-        cwd = _codex_meta(path).get("cwd")
+        meta = _codex_meta(path)
+        if interactive_only and not _interactive_codex(meta):
+            return None
+        cwd = meta.get("cwd")
         return cwd if isinstance(cwd, str) and cwd else None
     try:
         with path.open("rb") as stream:

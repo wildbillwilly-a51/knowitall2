@@ -165,7 +165,12 @@ def _skipped(state: LearnerState, *, since: str | None) -> list[tuple[Path, str]
         if not is_skipped(state.logs.get(os.path.normcase(str(log)), {})):
             continue
         try:
-            active = datetime.fromtimestamp(log.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            modified = log.stat().st_mtime
+            active = datetime.fromtimestamp(modified, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if since and active[:10] < since:
+                from .transcripts import session_activity
+                active = datetime.fromtimestamp(session_activity(log, modified=modified),
+                                                tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         except OSError:
             continue
         if since and active[:10] < since:

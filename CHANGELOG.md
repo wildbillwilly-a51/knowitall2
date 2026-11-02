@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.4 (2026-11-02)
+
+- **Long-running Windows Codex chats stay learnable.** Finding the current
+  session and waiting for its final learning pass now also check recent
+  transcript event timestamps: Windows can leave an open log's modification
+  time unchanged while work continues. Existing hook state and the remembered
+  log help find chats that started days ago. Timestamp reads are bounded,
+  helper and non-interactive sessions are excluded from current-chat lookup,
+  and incomplete transcript content is still left for the next read. This is
+  a client fix; it needs no server update or change to learning progress.
+
 ## 0.12.3 (2026-11-02)
 
 - **Credential-file references keep their paths.** A key-file location such as

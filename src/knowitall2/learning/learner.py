@@ -370,17 +370,23 @@ def learn(
                 continue
             if status.st_size <= start:
                 continue
+            if not dry_run and remaining() <= 0:
+                # No transcript reads or cursor transitions after the budget is
+                # exhausted, including freshness checks before setting aside.
+                # Old-log set-aside waits until a run has budget available.
+                report.deferred += 1
+                continue
             active_at = datetime.fromtimestamp(status.st_mtime, tz=timezone.utc)
+            if not recovery and not right_away and active_at <= settled_since:
+                from .transcripts import session_activity
+                active_at = datetime.fromtimestamp(session_activity(log, modified=status.st_mtime, now=moment),
+                                                   tz=timezone.utc)
             if not recovery and not right_away and active_at > settled_since:
                 report.active += 1
                 continue
             if (not recovery and not right_away and active_at < set_aside_before and not entry.get("caught_up_at")
                     and _set_aside(entry, log, moment)):
                 report.set_aside += 1
-                continue
-            if not dry_run and remaining() <= 0:
-                # Counted, not read: reading every waiting log took minutes at each run once the calls ran out.
-                report.deferred += 1
                 continue
             # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
             session, end = read_session(log, start=start, stop=recovery["end"] if recovery else int(entry.get(LEARN_TO) or 0) or None)
