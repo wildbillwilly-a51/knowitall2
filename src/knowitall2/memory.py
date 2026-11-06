@@ -486,6 +486,31 @@ class Memory:
         if not 1 <= count <= MAX_RECALL_LIMIT:
             raise MemoryInputError(f"limit must be between 1 and {MAX_RECALL_LIMIT}.")
         cleaned = " ".join(str(query or "").split())
+        # Headline/pointer context hands agents stable memory IDs. They are
+        # references, not words in the full-text index. Honor scope and status.
+        references = list(dict.fromkeys(re.findall(r"\bk-[0-9a-f]{10}\b", cleaned)))
+        if references:
+            project = self.project_for(project_path)
+            project_id = project.id if project else None
+            if scope == "project" and project is None:
+                raise MemoryInputError("No project was found for this folder, so there is nothing project-scoped to search.")
+            records = []
+            for record_id in references:
+                row = self.store.get(record_id)
+                if row is None or row.status != "active":
+                    continue
+                allowed = (scope == "everywhere" or
+                           scope == "global" and row.scope == "global" or
+                           scope == "project" and row.project_id == project_id or
+                           scope == "all" and (row.scope == "global" or row.project_id == project_id))
+                if allowed:
+                    records.append(row)
+            records = records[:count]
+            self._log_usage("recall", project, cleaned, [row.id for row in records])
+            if not records:
+                return (f"No active referenced memory is available in scope '{scope}'. "
+                        "For another project's records, use its project_path or scope 'everywhere'.")
+            return _format_recall(cleaned, records, project)
         terms = _query_terms(cleaned)
         match = _fts_match(terms)
         if match is None:
@@ -519,6 +544,12 @@ class Memory:
         found = [row.id for row in records + partial]
         self._log_usage("recall", project, cleaned, found)
         text = _format_recall(cleaned, records, project, partial=partial, unknown=unknown)
+        if not records:
+            if partial:
+                text += "\nRetry with two to four keywords for the specific procedure or capability."
+            if scope == "all" and project is not None:
+                text += ("\nThis searched this project and global memories. For a related project's procedures, "
+                         "use its project_path or scope 'everywhere'.")
         offers = self._task_lines(project_id=None, record_ids=found)
         return text + ("\n" + "\n".join(offers) if offers else "")
 

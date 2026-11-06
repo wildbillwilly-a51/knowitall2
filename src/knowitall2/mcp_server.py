@@ -83,14 +83,15 @@ TOOLS: list[dict[str, Any]] = [
             "Search KnowItAll2 memory by keywords: systems, hosts, services, projects, tools, procedures, "
             "decisions, lessons, and the user's rules. Use it before rediscovering something that may have been "
             "learned before. Each result shows its source, date, and whether it is verified; treat unverified "
-            "memories as leads to check."
+            "memories as leads to check. A memory ID is a direct lookup. If a search is partial or empty, "
+            "retry with fewer keywords; use the related project's project_path or scope 'everywhere' for its procedures."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "A few keywords, for example 'homelab router dns' or 'vcenter credentials'.",
+                    "description": "A few keywords, for example 'vcenter credentials', or memory IDs such as k-1a2b3c4d5e.",
                 },
                 "limit": {
                     "type": "integer", "minimum": 1, "maximum": MAX_RECALL_LIMIT,

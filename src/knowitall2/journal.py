@@ -28,7 +28,7 @@ from .paths import data_home, database_path
 # manual review run). Sharing: sync (changes sent to and received from a
 # KnowItAll2 server).
 EVENT_KINDS = (
-    "briefing", "recall", "remember", "forget", "restore", "confirm", "question", "answer", "settle", "task",
+    "briefing", "recall", "context", "remember", "forget", "restore", "confirm", "question", "answer", "settle", "task",
     "settings", "learning", "candidate", "change", "maintenance", "catalog", "move", "sync",
 )
 EVENTS_KEPT_DAYS = 90

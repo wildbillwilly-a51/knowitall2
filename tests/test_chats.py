@@ -28,6 +28,7 @@ class ChatTestCase(unittest.TestCase):
         self.environment = mock.patch.dict(os.environ, {
             "KNOWITALL2_HOME": str(self.root / "data"), "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
+            "KNOWITALL2_CONTEXT_DETAILS": "1",
         })
         self.environment.start()
         self.log_path = self.root / "claude" / "projects" / "C--work-alpha" / f"{SESSION}.jsonl"
@@ -105,7 +106,7 @@ class NewSinceTests(ChatTestCase):
         self.append(LogBuilder(self.alpha).tool("t1", "mcp__other__save", {"text": "x"}, f"Saved [{saved}] (fact)."))
         self.assertEqual("", self.prompt())
 
-    def test_many_new_memories_are_capped_without_advertising_the_rest(self) -> None:
+    def test_many_new_memories_are_capped_without_losing_the_unshown_rest(self) -> None:
         # 2026-10-13 study: "+N more" advertised 312 items behind 197 shown, and about 7% of what was shown was used.
         self.start()
         for number in range(5):
@@ -113,7 +114,46 @@ class NewSinceTests(ChatTestCase):
         context = self.prompt()
         self.assertEqual(chats.NEW_SHOWN, context.count("\n- "))
         self.assertNotIn("more; use recall", context)
+        # A cap limits this message, not every future opportunity to deliver
+        # the remaining memories. Unshown entries must not be marked as told.
+        following = self.prompt()
+        self.assertEqual(2, following.count("\n- "))
         self.assertEqual("", self.prompt())
+
+    def test_relevant_details_are_delivered_even_after_a_headline_was_told(self) -> None:
+        row = self.remember("Alpha browser extension controls use the existing connected inventory.", self.alpha,
+                            source="observed")
+        self.start()
+        payload = self.payload(hook_event_name="UserPromptSubmit", prompt="Use the Alpha browser extension controls")
+        result = json.loads(hooks.prompt_submit(payload))["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(row, result)
+        self.assertIn("existing connected inventory", result)
+        self.assertNotIn(row, hooks.prompt_submit(payload))
+        self.start()  # resume/compaction may have removed the earlier excerpt
+        self.assertIn(row, hooks.prompt_submit(payload))
+
+    def test_unvalidated_selector_is_not_enabled_by_default(self) -> None:
+        row = self.remember("Alpha browser extension controls use the existing connected inventory.", self.alpha,
+                            source="observed")
+        self.start()
+        with mock.patch.dict(os.environ, {"KNOWITALL2_CONTEXT_DETAILS": ""}):
+            output = hooks.prompt_submit(self.payload(prompt="Use Alpha browser extension controls"))
+        self.assertNotIn(row, output)
+
+    def test_relevant_context_survives_a_busy_store_without_waiting_for_its_writer(self) -> None:
+        row = self.remember("Alpha browser extension controls use the existing connected inventory.", self.alpha,
+                            source="observed")
+        self.start()
+        connection = sqlite3.connect(database_path())
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            output = hooks.prompt_submit(self.payload(prompt="Use Alpha browser extension controls"))
+            self.assertIn(row, output)
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            connection.rollback()
+            connection.close()
 
     def test_current_state_notes_are_left_out(self) -> None:
         self.start()
@@ -390,6 +430,18 @@ class ToolNewsTests(ChatTestCase):
             self.assertNotIn(own, self.prompt())
             self.assertNotIn(hooks.NEW_HEADER, self.call(server, "briefing", project_path=str(self.alpha)))
 
+    def test_tool_news_keeps_unshown_memories_pending(self) -> None:
+        self.start()
+        for number in range(5):
+            self.remember(f"Alpha module {number} has a unique deployment procedure {number}.", self.alpha)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SESSION}):
+            server = self.server()
+            first = self.call(server, "recall", query="zebra")
+            second = self.call(server, "recall", query="zebra")
+            self.assertEqual(3, first.count("\n- "))
+            self.assertEqual(2, second.count("\n- "))
+            self.assertNotIn(hooks.NEW_HEADER, self.call(server, "recall", query="zebra"))
+
     def test_without_a_session_id_the_chat_is_found_by_its_log(self) -> None:
         self.start()
         self.remember("Alpha's staging host is stage1.", self.alpha)
@@ -459,6 +511,15 @@ class StateWriteTests(ChatTestCase):
 
 
 class MovedProjectTests(ChatTestCase):
+    def test_experimental_details_follow_the_project_found_in_this_message(self) -> None:
+        row = self.remember("Browser extension routing uses the established inventory connection.", self.beta,
+                            source="observed")
+        self.start()
+        self.work_in_beta(chats.WORK_CALLS)
+        output = hooks.prompt_submit(self.payload(prompt="Check browser extension routing inventory"))
+        self.assertIn(row, output)
+        self.assertIn("established inventory connection", output)
+
     def work_in_beta(self, calls: int) -> None:
         builder = LogBuilder(self.alpha)
         for number in range(calls):

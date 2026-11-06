@@ -102,6 +102,8 @@ def save(chat: str, state: dict[str, Any], *, fresh: bool = False) -> None:
         current = None if fresh else load(chat)
         merged = state if current is None else _merged(current, state)
         merged["told"] = list(dict.fromkeys(merged.get("told") or []))[-TOLD_KEPT:]
+        if "context_seen" in merged:
+            merged["context_seen"] = list(dict.fromkeys(merged["context_seen"]))[-TOLD_KEPT:]
         write_text_atomic(path, json.dumps(merged) + "\n")
     finally:
         if held:

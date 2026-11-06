@@ -33,9 +33,9 @@ RECENT_EVENTS = 8
 # What each Activity filter shows. "all" leaves out single candidates, which a
 # learning run summarizes; the Learning filter has them.
 ACTIVITY_GROUPS: dict[str, tuple[str, ...]] = {
-    "all": ("briefing", "recall", "remember", "forget", "restore", "confirm", "question", "answer", "settle", "task",
+    "all": ("briefing", "recall", "context", "remember", "forget", "restore", "confirm", "question", "answer", "settle", "task",
             "settings", "learning", "change", "maintenance", "catalog", "move"),
-    "use": ("briefing", "recall"),
+    "use": ("briefing", "recall", "context"),
     "learning": ("learning", "candidate", "change", "maintenance", "catalog"),
     "changes": ("remember", "forget", "restore", "confirm", "question", "answer", "settle", "task", "settings",
                 "change", "move"),
@@ -274,7 +274,7 @@ def memory_action(query, body, match) -> dict[str, Any]:
     return {"message": message, "id": record_id}
 
 
-_CHANGE_KINDS = tuple(kind for kind in journal.EVENT_KINDS if kind not in ("briefing", "recall"))
+_CHANGE_KINDS = tuple(kind for kind in journal.EVENT_KINDS if kind not in ("briefing", "recall", "context"))
 
 
 def _matching_ids(store: Store, text: str, status: str) -> list[str]:

@@ -130,7 +130,7 @@ const VERIFICATION_HELP = {
   unverified: 'An agent concluded this without seeing proof. Agents treat it as a lead to check.',
 };
 const ACTIVITY_WORDS = {
-  briefing: 'Session start', recall: 'Search', remember: 'Saved', forget: 'Forgot', restore: 'Brought back',
+  briefing: 'Session start', recall: 'Search', context: 'Relevant details', remember: 'Saved', forget: 'Forgot', restore: 'Brought back',
   confirm: 'Confirmed', question: 'Question', answer: 'Your answer', settle: 'Settled', task: 'Request to agents',
   settings: 'Settings', learning: 'Learning run', candidate: 'Idea', change: 'Tidied up', maintenance: 'Tidy-up',
   catalog: 'Organizing', move: 'Moved',

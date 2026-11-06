@@ -51,6 +51,17 @@ class MemoryTests(unittest.TestCase):
         self.assertIn(saved.record.id, self.recall("10.20.30.1"))
         self.assertIn(saved.record.id, self.recall("/etc/config/dhcp"))
 
+    def test_memory_references_resolve_without_fts_and_respect_scope(self) -> None:
+        row = self.remember("The existing browser connection uses the extension.").record
+        self.assertIn(row.text, self.recall(f"Codex browser {row.id}"))
+        self.assertNotIn(row.id + "]", self.recall(row.id, scope="project"))
+        self.assertIn(row.id, self.recall(row.id, scope="global"))
+        private = self.memory.remember("A different project route.", project_path=self.other, scope="project").record
+        self.assertNotIn(private.id + "]", self.recall(private.id))
+        self.assertIn(private.id, self.recall(private.id, scope="everywhere"))
+        self.memory.forget(row.id)
+        self.assertNotIn(row.id + "]", self.recall(row.id))
+
     def test_results_show_provenance_and_unverified_facts(self) -> None:
         self.remember("Vaultwarden is the default credential store.", kind="rule", source="user")
         self.remember("The NAS exports media over SMB.")

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.12.6 (2026-11-05)
+
+- **Health checks accept equivalent default data homes.** Explicit and implicit
+  defaults match. Custom locations, Python/options changes and modified hook
+  code still fail validation; working registrations no longer require remembering
+  an environment-variable workaround.
+- **Automatic memory excerpts remain experimental and off by default.** They await
+  decision-level usefulness validation. Opt-in test coverage includes explicitly
+  named/active related projects and eligibility filtering before candidate limits.
+  Source data must be checked before the limit in historical evaluations too.
+- **Memory references resolve directly, and unshown news stays pending.** Recall
+  resolves IDs supplied in briefings and references while retaining
+  scope and active-record checks. Message and tool news leave unshown memories
+  pending rather than marking an entire capped batch as seen.
+
 ## 0.12.5 (2026-11-02)
 
 - **One transcript keeps one learning history.** Windows extended drive and

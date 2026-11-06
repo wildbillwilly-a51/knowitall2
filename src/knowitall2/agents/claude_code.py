@@ -38,6 +38,7 @@ from .base import (
     install_skill,
     json_object,
     launch_matches,
+    launcher_matches,
     remove_skill,
     render_hook_launcher,
     skill_check,
@@ -243,7 +244,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                     "launcher is missing" if any(_registered_the_earlier_way(hook) for hook in found[event]) else
                     f"the {what} hook is installed with different options than this installation")
                 return Check(name, False, detail, f"Run: {self.setup_command()}")
-        if not launcher.is_file() or launcher.read_text(encoding="utf-8") != render_launcher(launch):
+        if not launcher.is_file() or not launcher_matches(launcher.read_text(encoding="utf-8"), launch, "claude-code"):
             return Check(name, False, f"the hook launcher is missing or outdated: {launcher}",
                          f"Run: {self.setup_command()}")
         return Check(name, True, f"installed in {self.settings_path}")

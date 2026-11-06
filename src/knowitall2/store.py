@@ -953,6 +953,38 @@ class Store:
             raise
         return int(row[0])
 
+    def context_candidates(self, match: str, *, project_ids: Sequence[str], limit: int,
+                           as_of: str | None = None) -> list[tuple[RecordRow, float]]:
+        """Established context, filtered before the bounded FTS candidate limit.
+
+        ``as_of`` supports conservative read-only evaluation: today's records
+        created or changed after the decision are not historical evidence.
+        This is separate from manual recall, which also returns unchecked leads.
+        """
+        ids = list(dict.fromkeys(project_ids))
+        scope = "r.scope = 'global'"
+        if ids:
+            scope += f" OR r.project_id IN ({', '.join('?' for _ in ids)})"
+        historical = " AND r.created_at <= ? AND r.updated_at <= ?" if as_of else ""
+        sql = (
+            f"SELECT {_COLUMNS}, bm25(records_fts, 1.0, 2.0, 1.5) AS rank "
+            "FROM records_fts JOIN records r ON r.seq = records_fts.rowid "
+            "LEFT JOIN projects p ON p.id = r.project_id "
+            f"WHERE records_fts MATCH ? AND r.status = 'active' AND ({scope}) "
+            "AND r.verification IN ('observed', 'user_stated') "
+            "AND r.tags NOT LIKE '%\"provisional\"%' AND r.tags NOT LIKE '%\"disputed\"%' "
+            "AND NOT EXISTS (SELECT 1 FROM record_notes n WHERE n.record_id = r.id AND n.facet = 'status')"
+            + historical + " ORDER BY rank LIMIT ?"
+        )
+        parameters = [match, *ids, *([as_of, as_of] if as_of else []), limit]
+        try:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "fts5" in str(exc).lower() or "syntax" in str(exc).lower():
+                return []
+            raise
+        return [(RecordRow.from_row(row), float(row["rank"])) for row in rows]
+
     def substring_search(
         self, needle: str, *, project_id: str | None, scope: str, limit: int,
     ) -> list[RecordRow]:

@@ -11,7 +11,7 @@ from unittest import mock
 from _support import make_repository
 
 from knowitall2.agents import AgentError, ServerLaunch, server_launch
-from knowitall2.agents.base import JsonFile, render_hook_launcher
+from knowitall2.agents.base import JsonFile, render_hook_launcher, launch_matches, launcher_matches
 from knowitall2.agents.claude_code import ClaudeCodeAdapter, hook_launcher_path
 from knowitall2.agents import claude_code, codex, instructions
 from knowitall2.agents.codex import BEGIN, CodexAdapter, windows_command
@@ -701,6 +701,26 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
             self.adapter.setup(LAUNCH)
         self.assertEqual(before, self.config.read_bytes())
         self.assertFalse(self.settings.exists())
+
+
+class EffectiveLaunchTests(unittest.TestCase):
+    def test_explicit_and_implicit_default_home_are_equivalent(self):
+        implicit = ServerLaunch(LAUNCH.command, LAUNCH.args, dict(LAUNCH.env))
+        explicit = ServerLaunch(LAUNCH.command, LAUNCH.args,
+                                {**LAUNCH.env, "KNOWITALL2_HOME": str((Path.home()/'.knowitall2').resolve())})
+        self.assertTrue(launch_matches({"command": explicit.command, "args": explicit.args, "env": explicit.env}, implicit))
+        for agent in ("codex", "claude-code"):
+            self.assertTrue(launcher_matches(render_hook_launcher(explicit, agent), implicit, agent))
+            self.assertTrue(launcher_matches(render_hook_launcher(implicit, agent), explicit, agent))
+
+    def test_custom_home_options_and_modified_code_still_fail(self):
+        custom = ServerLaunch(LAUNCH.command, LAUNCH.args,
+                              {**LAUNCH.env, "KNOWITALL2_HOME": str(Path.home()/'.different-memory')})
+        self.assertFalse(launch_matches({"command": custom.command, "args": custom.args, "env": custom.env}, LAUNCH))
+        self.assertFalse(launcher_matches(render_hook_launcher(custom, "codex"), LAUNCH, "codex"))
+        self.assertFalse(launcher_matches(render_hook_launcher(LAUNCH, "codex")+'print(1)\n', LAUNCH, "codex"))
+        changed = {"command": LAUNCH.command, "args": [*LAUNCH.args, "--other"], "env": LAUNCH.env}
+        self.assertFalse(launch_matches(changed, LAUNCH))
 
 
 class JsonFileTests(unittest.TestCase):

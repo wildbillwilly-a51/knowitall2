@@ -15,7 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -354,8 +354,37 @@ def launch_matches(entry: object, launch: ServerLaunch) -> bool:
     return (
         entry.get("command") == launch.command
         and list(entry.get("args") or []) == list(launch.args)
-        and dict(entry.get("env") or {}) == launch.env
+        and _effective_launch_env(dict(entry.get("env") or {})) == _effective_launch_env(launch.env)
     )
+
+
+def _effective_launch_env(environment: dict[str, str]) -> dict[str, str]:
+    """An explicit default data home and an omitted default are equivalent.
+
+    Keep nondefault locations and every other option exact. A doctor invoked
+    without the optional variable must not claim a working registration is broken.
+    """
+    normalized = dict(environment)
+    value = normalized.get(HOME_ENVIRONMENT_VARIABLE)
+    if value:
+        default = (Path.home() / ".knowitall2").resolve()
+        location = Path(value).expanduser()
+        if location.is_absolute() and os.path.normcase(str(location.resolve())) == os.path.normcase(str(default)):
+            normalized.pop(HOME_ENVIRONMENT_VARIABLE)
+    return normalized
+
+
+def launcher_matches(text: str, launch: ServerLaunch, agent: str) -> bool:
+    """Accept only generated code, including the equivalent default-home form."""
+    if text == render_hook_launcher(launch, agent):
+        return True
+    environment = _effective_launch_env(launch.env)
+    if HOME_ENVIRONMENT_VARIABLE in environment:
+        return False  # a custom data home cannot be omitted
+    for env in (environment, {**environment, HOME_ENVIRONMENT_VARIABLE: str((Path.home() / ".knowitall2").resolve())}):
+        if text == render_hook_launcher(replace(launch, env=env), agent):
+            return True
+    return False
 
 
 def probe_server(launch: ServerLaunch, *, timeout: float = 20.0) -> Check:

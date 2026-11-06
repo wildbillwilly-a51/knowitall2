@@ -376,6 +376,32 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
             said, commands = [], []
             inputs, mentioned = chats.read_new(state, transcript, said=said, commands=commands)
             state["told"] = [*state.get("told", []), *sorted(mentioned)]
+        worked = chats.projects_worked_in(inputs, store.all_project_paths())
+        moved = [project_id for project_id, calls in sorted(worked.items(), key=lambda item: -item[1])
+                 if calls >= chats.WORK_CALLS and project_id not in state["projects"]]
+        if moved:
+            state["projects"].append(moved[0])
+            contents = memory.project_contents(moved[0], known=state["told"])
+            if contents:
+                parts.append(contents)
+                state["told"] += chats.RECORD_ID.findall(contents)
+        # A catalog headline is not the memory's procedure. Give the relevant
+        # details independently of headline/pointer bookkeeping.
+        try:
+            from . import context
+
+            detail, delivered = "", []
+            if context.enabled():
+                detail, delivered = context.for_message(
+                    memory, _text(payload, "prompt"),
+                    project=memory.stored_project(state["projects"][0]) if state.get("projects") else None,
+                    related_projects=[memory.stored_project(p) for p in reversed(state["projects"][1:])],
+                    seen=state.get("context_seen", []))
+            if detail:
+                parts.append(detail)
+                state["context_seen"] = [*state.get("context_seen", []), *delivered][-chats.TOLD_KEPT:]
+        except Exception as exc:
+            journal.problem(f"message hook ({agent})", f"relevant details could not be added: {exc}")
         pointers = _pointers(payload, store, said, state, commands)
         if pointers:
             parts.append("\n".join(line for _, line in pointers))
@@ -383,16 +409,6 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
             from .known import log_pointers
 
             log_pointers(agent, chat, [target for target, _ in pointers], at=memory.now())
-        worked = chats.projects_worked_in(inputs, store.all_project_paths())
-        moved = [project_id for project_id, calls in sorted(worked.items(), key=lambda item: -item[1])
-                 if calls >= chats.WORK_CALLS and project_id not in state["projects"]]
-        if moved:
-            # One project per message, the one worked in most; another follows if work goes on there.
-            state["projects"].append(moved[0])
-            contents = memory.project_contents(moved[0], known=state["told"])
-            if contents:
-                parts.append(contents)
-                state["told"] += chats.RECORD_ID.findall(contents)
         from .known import message_parts
 
         users, _ = message_parts(_text(payload, "prompt"))
@@ -414,7 +430,7 @@ def _chat_background(payload: dict[str, Any], agent: str, transcript: str | None
                                  touched=state["touched"])
         if new:
             parts.append("\n".join([NEW_HEADER, *(f"- {line}" for _, line in new[:chats.NEW_SHOWN])]))
-            state["told"] += [record_id for record_id, _ in new]  # all of them: the rest is not advertised
+            state["told"] += [record_id for record_id, _ in new[:chats.NEW_SHOWN]]
     finally:
         store.close()
     if reading:
@@ -484,7 +500,7 @@ def tool_news(memory: Any, *, cwd: str | os.PathLike[str], agent: str | None, sh
     lines = []
     if new:
         lines = [NEW_HEADER, *(f"- {line}" for _, line in new[:chats.NEW_SHOWN])]
-        told += [record_id for record_id, _ in new]
+        told += [record_id for record_id, _ in new[:chats.NEW_SHOWN]]
     if len(told) != len(state.get("told") or []):
         state["told"] = told
         chats.save(chat, state)
