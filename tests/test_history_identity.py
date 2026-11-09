@@ -68,14 +68,59 @@ class IdentityAndSourceTests(unittest.TestCase):
         self.assertEqual({"offset": 1, "settled": 0}, stale)
         self.assertEqual(0, self.t.learn(f.FakeEngine(), quick=True, logs=[self.alias()]).calls)
 
-    def test_alias_with_independent_pending_work_blocks_instead_of_merging(self):
+    def test_alias_with_independent_pending_work_holds_only_that_source(self):
         self.t.sample_log().write(self.t.log_path)
         chosen = self.t.state.entry(self.t.log_path)
         self.t.state.logs[str(self.alias())] = {"offset": 0, "settled": 0,
                                                 "pending_reviews": {"final": {"reason": "unfinished"}}}
-        report = self.t.learn(f.FakeEngine(), quick=True)
-        self.assertIn("aliases", report.blocked)
+        healthy = self.t.log_path.with_name("healthy.jsonl")
+        self.t.sample_log().write(healthy)
+        report = self.t.learn(f.FakeEngine([[self.t.DNSMASQ]]), quick=True, logs=[self.t.log_path, healthy])
+        self.assertIsNone(report.blocked)
+        self.assertEqual([self.t.log_path.stem], report.held)
+        self.assertEqual([healthy], [source.log for source in report.ready])
+        self.assertEqual(1, report.calls)
         self.assertEqual(0, chosen["offset"])
+
+    def test_request_for_conflicted_log_does_not_consume_other_requests(self):
+        from knowitall2.learning.command import learn_requests
+        self.t.sample_log().write(self.t.log_path, idle=False)
+        self.t.state.entry(self.t.log_path)
+        self.t.state.logs[str(self.alias())] = {"pending_reviews": {"quick": {"start": 0, "end": 10}}}
+        healthy = self.t.log_path.with_name("healthy.jsonl")
+        self.t.sample_log().write(healthy)
+        first = {"transcript": str(self.t.log_path), "reason": "finished"}
+        second = {"transcript": str(healthy), "reason": "finished"}
+        with mock.patch.object(moments, "pending_requests", return_value=[first, second]), \
+                mock.patch.object(moments, "preserve_requests") as preserve, \
+                mock.patch.object(moments, "done_with") as dropped:
+            report = learn_requests(self.t.store, self.t.state, self.t.settings, f.FakeEngine([[self.t.DNSMASQ]]))
+        self.assertIsNone(report.blocked)
+        self.assertEqual(1, report.calls)
+        preserve.assert_called_once_with([first])
+        dropped.assert_called_once_with([second])
+
+    def test_doctor_surfaces_recorded_source_conflicts(self):
+        from knowitall2.doctor import _learning_progress_check
+        self.t.sample_log().write(self.t.log_path)
+        self.t.state.entry(self.t.log_path)
+        self.t.state.logs[str(self.alias())] = {"offset": 1}
+        self.t.state.entry(self.t.log_path)
+        self.t.state.save()
+        with mock.patch("knowitall2.learning.state.LearnerState", return_value=LearnerState(self.t.state.path)):
+            result = _learning_progress_check()
+        self.assertFalse(result.ok)
+        self.assertIn("1 transcript", result.detail)
+
+    def test_status_does_not_infer_live_conflicts_from_missing_legacy_paths(self):
+        state = self.t.state
+        state.logs[r"C:\archive\missing.jsonl"] = {"offset": 5, "status": "done"}
+        state.logs[r"\\?\C:\archive\missing.jsonl"] = {"offset": 10, "status": "done"}
+        before = json.dumps(state.logs, sort_keys=True)
+        phases = state.progress()
+        self.assertEqual(0, phases["identity_conflicts"])
+        self.assertEqual(1, phases["quick_done"])
+        self.assertEqual(before, json.dumps(state.logs, sort_keys=True))
 
     def test_physical_hardlink_alias_uses_canonical_entry(self):
         self.t.sample_log().write(self.t.log_path)

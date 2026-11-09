@@ -8,7 +8,7 @@ from unittest import mock
 
 import _support
 import test_learning as f
-from knowitall2.learning.history import prepare, execute, validate, record_seal, RECEIPTS
+from knowitall2.learning.history import prepare, prepare_alias_conflicts, execute, validate, record_seal, RECEIPTS
 from knowitall2.learning.learner import learn
 from knowitall2.learning.extractor import ExtractionError
 from knowitall2.learning import provenance
@@ -71,6 +71,79 @@ class RepairTests(unittest.TestCase):
         self.assertNotIn("provisional", self.t.store.get(self.record.id).tags)
         self.assertNotIn(str(self.alias), self.t.state.logs)
         self.assertTrue(result["completed_at"])
+
+    def test_named_physical_history_reviews_its_records_and_leaves_sibling_intact(self):
+        from knowitall2.learning.dossier import build_dossiers
+        from knowitall2.learning.transcripts import read_session
+
+        sibling = self.t.log_path.with_name("sibling.jsonl")
+        statement = "The backup observatory uses a separate cobalt lamp."
+        self.builder.user(statement).write(sibling, idle=False)
+        sibling_entry = self.t.state.entry(sibling)
+        sibling_entry.update(session_id=f.SESSION, offset=sibling.stat().st_size)
+        other = self.t.memory.remember(statement, session=f.SESSION).record
+        self.t.store.set_tags(other.id, ["provisional"], now=self.t.memory.now())
+        source, _ = read_session(sibling)
+        provenance.put(self.t.store, other.id, provenance.descriptor(build_dossiers(source)[-1]))
+        before_source = provenance.get(self.t.store, other.id)
+        before_entry = dict(sibling_entry)
+        self.t.state.logs[str(self.alias)]["offset"] = 0
+        plan = prepare_alias_conflicts(self.t.store, self.t.state, session_id=f.SESSION,
+                                       transcript=self.t.log_path.resolve(), output=self.plan_path)
+        self.assertEqual([self.record.id], [binding["id"] for binding in plan["bindings"]])
+        self.assertEqual(0, plan["forward_start"])  # The original provisional source precedes final progress.
+        self.run_plan(plan, f.FakeEngine(finals=[{"reviews": [f.review("p1", "confirm")], "memories": []}]))
+        self.assertEqual(before_entry, self.t.state.entry(sibling))
+        self.assertEqual(before_source, provenance.get(self.t.store, other.id))
+        self.assertIsNone(self.t.store.get_meta(provenance.PENDING + other.id))
+        self.assertIn("provisional", self.t.store.get(other.id).tags)
+        self.assertNotIn("provisional", self.t.store.get(self.record.id).tags)
+
+    def test_named_single_checkpoint_resumes_after_forward_commit(self):
+        from knowitall2.learning.log_identity import path_key
+
+        del self.t.state.logs[str(self.alias)]
+        sibling = self.t.log_path.with_name("sibling.jsonl")
+        self.builder.write(sibling, idle=False)
+        self.t.state.entry(sibling).update(session_id=f.SESSION, offset=0)
+        self.t.state.save()
+        plan = prepare_alias_conflicts(self.t.store, self.t.state, session_id=f.SESSION,
+                                       transcript=self.t.log_path.resolve(), output=self.plan_path)
+        save = self.t.state.save
+
+        def interrupt():
+            if "history_hold" not in self.entry:
+                raise OSError("interrupted before checkpoint save")
+            save()
+
+        engine = f.FakeEngine(finals=[{"reviews": [f.review("p1", "confirm")], "memories": []}])
+        with mock.patch.object(self.t.state, "save", side_effect=interrupt):
+            with self.assertRaisesRegex(OSError, "before checkpoint save"):
+                self.run_plan(plan, engine)
+        restarted = LearnerState(self.t.state.path)
+        sibling_entry = restarted.entry(sibling)
+        sibling_entry["offset"] = sibling.stat().st_size
+        extra_route = path_key(sibling.with_name("new-route.jsonl"))
+        restarted.log_aliases[extra_route] = path_key(sibling)
+        before = dict(sibling_entry)
+        never = f.FakeEngine()
+        execute(self.t.store, restarted, plan, never, checkpoint=self.checkpoint)
+        self.assertEqual([], never.inputs)
+        self.assertEqual(self.end, restarted.entry(self.t.log_path)["settled"])
+        self.assertNotIn("history_hold", restarted.entry(self.t.log_path))
+        self.assertEqual(before, restarted.entry(sibling))
+        self.assertEqual(path_key(sibling), restarted.log_aliases[extra_route])
+
+    def test_named_pending_final_range_preserves_the_completed_prefix(self):
+        self.t.store.set_tags(self.record.id, [], now=self.t.memory.now())
+        self.t.state.logs[str(self.alias)]["offset"] = 0
+        plan = prepare_alias_conflicts(self.t.store, self.t.state, session_id=f.SESSION,
+                                       transcript=self.t.log_path.resolve(), output=self.plan_path)
+        self.assertEqual(self.start, plan["forward_start"])
+        engine = f.FakeEngine(finals=[{"reviews": [], "memories": []}])
+        self.run_plan(plan, engine)
+        self.assertEqual(0, self.entry["final_failures"])
+        self.assertEqual({}, self.entry["pending_reviews"])
 
     def test_completed_repair_is_idempotent(self):
         plan = self.plan()
@@ -158,6 +231,111 @@ class RepairTests(unittest.TestCase):
         self.t.state.logs[str(self.alias)]["pending_reviews"] = {"final": {"reason": "other work"}}
         with self.assertRaisesRegex(ValueError, "independent"):
             self.plan()
+
+    def alias_plan(self):
+        self.entry["final_failures"] = 0
+        self.entry["pending_reviews"] = {"quick": {"start": self.start, "end": self.end}}
+        self.t.state.logs[str(self.alias)].update(
+            offset=self.start, pending_reviews={"quick": {"start": 0, "end": self.end}})
+        self.t.state.save()
+        return prepare_alias_conflicts(self.t.store, self.t.state, session_id=f.SESSION, output=self.plan_path)
+
+    def test_conflicting_quick_ranges_are_reviewed_before_checkpoints_are_consolidated(self):
+        plan = self.alias_plan()
+        self.assertEqual(0, plan["forward_start"])
+        original = json.loads(json.dumps(plan["alias_entries"]))
+        engine = f.FakeEngine(finals=[{"reviews": [f.review("p1", "confirm")], "memories": []}])
+        result = self.run_plan(plan, engine)
+        self.assertEqual(original, result["forward"]["original_alias_entries"])
+        self.assertEqual(self.end, self.entry["settled"])
+        self.assertFalse(self.entry["pending_reviews"])
+        self.assertNotIn(str(self.alias), self.t.state.logs)
+        self.assertNotIn("provisional", self.t.store.get(self.record.id).tags)
+        self.assertEqual(result, self.run_plan(plan, f.FakeEngine()))
+
+    def test_alias_plan_keeps_established_final_prefix_when_all_sources_follow_it(self):
+        from knowitall2.learning.dossier import build_dossiers
+        from knowitall2.learning.transcripts import read_session
+        self.t.store.set_tags(self.record.id, [], now=self.t.memory.now())
+        statement = "The observatory uses a cobalt backup lamp."
+        self.builder.user(statement).write(self.t.log_path, idle=False)
+        self.end = self.t.log_path.stat().st_size
+        self.entry.update(offset=self.end, final_failures=0, pending_reviews={})
+        self.t.state.logs[str(self.alias)].update(
+            offset=self.start, pending_reviews={"quick": {"start": self.start, "end": self.end}})
+        later = self.t.memory.remember(statement, session=f.SESSION).record
+        self.t.store.set_tags(later.id, ["provisional"], now=self.t.memory.now())
+        suffix, _ = read_session(self.t.log_path, start=self.start)
+        provenance.put(self.t.store, later.id, provenance.descriptor(build_dossiers(suffix, require_user=False)[0]))
+        plan = prepare_alias_conflicts(self.t.store, self.t.state, session_id=f.SESSION, output=self.plan_path)
+        self.assertEqual(self.start, plan["forward_start"])
+        engine = f.FakeEngine(finals=[{"reviews": [f.review("p1", "confirm")], "memories": []}])
+        result = self.run_plan(plan, engine)
+        self.assertEqual(self.end, result["forward"]["final_end"])
+        self.assertNotIn("provisional", self.t.store.get(later.id).tags)
+
+    def test_alias_receipt_can_resume_after_database_commit_before_state_save(self):
+        plan = self.alias_plan()
+        save = self.t.state.save
+        def interrupted():
+            if str(self.alias) not in self.t.state.logs:
+                raise OSError("interrupted before alias save")
+            save()
+        engine = f.FakeEngine(finals=[{"reviews": [f.review("p1", "confirm")], "memories": []}])
+        with mock.patch.object(self.t.state, "save", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "before alias save"):
+                self.run_plan(plan, engine)
+        restarted = LearnerState(self.t.state.path)
+        self.assertIn(str(self.alias), restarted.logs)
+        never = f.FakeEngine()
+        result = execute(self.t.store, restarted, plan, never, checkpoint=self.checkpoint)
+        self.assertNotIn(str(self.alias), restarted.logs)
+        self.assertEqual([], never.inputs)
+        self.assertEqual(plan["alias_entries"], result["forward"]["original_alias_entries"])
+
+    def test_alias_plan_rejects_new_pending_work_before_using_model(self):
+        plan = self.alias_plan()
+        self.t.state.logs[str(self.alias)]["pending_reviews"]["quick"]["end"] += 1
+        engine = f.FakeEngine()
+        with self.assertRaisesRegex(ValueError, "checkpoint changed"):
+            self.run_plan(plan, engine)
+        self.assertEqual([], engine.inputs)
+        self.assertIn("provisional", self.t.store.get(self.record.id).tags)
+
+    def test_new_alias_plan_can_replace_failed_review_without_releasing_checkpoints(self):
+        plan = self.alias_plan()
+        wrong = f.FakeEngine(finals=[{"reviews": [f.review("p1", "not_here")], "memories": []}])
+        with self.assertRaisesRegex(ExtractionError, "unreviewed"):
+            self.run_plan(plan, wrong)
+        self.assertEqual(self.start, self.entry["settled"])
+        self.assertIn(str(self.alias), self.t.state.logs)
+        self.assertIn("provisional", self.t.store.get(self.record.id).tags)
+        new = prepare_alias_conflicts(self.t.store, LearnerState(self.t.state.path), session_id=f.SESSION,
+                                      output=self.t.root / "retry.json")
+        execute(self.t.store, self.t.state, new,
+                f.FakeEngine(finals=[{"reviews": [f.review("p1", "confirm")], "memories": []}]),
+                checkpoint=self.t.root / "retry-model-cache.json")
+        prior = json.loads(self.t.store.get_meta(RECEIPTS + new["id"] + ".supersedes"))
+        self.assertEqual(plan["id"], prior["plan"])
+        self.assertEqual(self.end, self.entry["settled"])
+
+    def test_alias_repair_resumes_after_state_save_before_completion_receipt(self):
+        plan = self.alias_plan()
+        set_meta = self.t.store.set_meta
+        def interrupted(key, value):
+            if key == RECEIPTS + plan["id"] + ".complete":
+                raise OSError("interrupted before completion receipt")
+            set_meta(key, value)
+        engine = f.FakeEngine(finals=[{"reviews": [f.review("p1", "confirm")], "memories": []}])
+        with mock.patch.object(self.t.store, "set_meta", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "before completion receipt"):
+                self.run_plan(plan, engine)
+        restarted = LearnerState(self.t.state.path)
+        self.assertNotIn(str(self.alias), restarted.logs)
+        never = f.FakeEngine()
+        execute(self.t.store, restarted, plan, never, checkpoint=self.checkpoint)
+        self.assertEqual([], never.inputs)
+        self.assertEqual(self.end, restarted.entry(self.t.log_path)["settled"])
 
     def test_forward_commit_receipt_survives_interruption_before_cursor_save(self):
         plan = self.plan()

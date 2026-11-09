@@ -203,6 +203,33 @@ Existing quick progress is preserved. Alias bookkeeping is retired only after
 identity and independent-work checks. Partial logical-record final boundaries
 remain unsupported by this repair command and are rejected explicitly.
 
+If `doctor` reports conflicting checkpoints for one physical transcript,
+preserve a database and state backup, then use the separate planning mode:
+
+    python -m knowitall2 learn --history-plan /private/path/alias.json --session SESSION-ID --alias-conflicts --max-calls 32
+
+This mode seals every competing checkpoint, requires the same physical
+transcript and complete-line boundaries, and binds each provisional memory to
+its original source. It keeps the canonical final checkpoint when all pending
+evidence fits after it. Otherwise it reviews the full sealed prefix to include
+the earlier evidence. Only after that review commits
+does `--repair-history` consolidate the checkpoints. The review receipt retains
+the original entries. An interruption can resume against the same manifest.
+If a model review failed before committing, a newly sealed alias plan may
+replace it and will record which plan it replaced.
+The live transcript and any new text beyond the sealed prefix stay available.
+Pending final ranges require an explicit transcript. Recovery or catch-up
+operations require separate review. Other
+transcripts can continue learning while a conflict is held.
+
+When distinct files share a session ID, verify every provisional record against
+its original journal and physical transcript before planning. Add
+`--transcript /absolute/path/to/rollout.jsonl` to select one physical file.
+Only that file's records and checkpoints are reviewed. The plan also seals the
+sibling checkpoints and routes so a change there invalidates the plan. An
+explicit transcript plan can include a complete-line pending final range.
+Create a fresh plan for each sibling after the preceding review completes.
+
 Source metadata and unresolved-source queues are local bookkeeping, included in
 full database backups. Other computers need their own update; old clients cannot
 honor a newer client's local pending-source queue. A provisional memory remains

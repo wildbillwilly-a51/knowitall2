@@ -360,13 +360,18 @@ def _reconcile(memory: Memory, extractor: Any, report: Settled, kept: list[_Item
                 or decision["index"] not in range(len(kept)) or decision["index"] in decisions
                 or decision.get("action") not in {"new", "update", "repeat"}):
             raise ExtractionError("the reconciliation returned an invalid decision", counted=True)
-        decisions[decision["index"]] = decision
+        index = decision["index"]
+        earlier = _earlier_candidate(decision, index)
+        if decision["action"] == "update" and earlier is not None:
+            # Candidates have no durable record to update. Keep the original
+            # statement and let the ordinary publication checks compare it.
+            decision = {"action": "new"}
+        decisions[index] = decision
         if decision["action"] in {"repeat", "update"}:
-            earlier = _earlier_candidate(decision, decision["index"])
             if _shown(shown, decision) is None and not (
                     decision["action"] == "repeat" and earlier is not None):
                 raise ExtractionError(f"the reconciliation referenced a memory it was not shown: candidate "
-                                      f"{decision['index']}, action {decision['action']}, "
+                                      f"{index}, action {decision['action']}, "
                                       f"target {str(decision.get('known_id') or '')[:100]}; its range remains pending",
                                       counted=True)
     if set(decisions) != set(range(len(kept))):

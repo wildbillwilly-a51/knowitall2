@@ -42,7 +42,7 @@ from .maintenance import MAINTENANCE_AGENT, EngineReviewer, MaintenanceReport, m
 from .settle import confirm_stale
 from .state import (
     CLAUDE_MODEL, FORMER_CLAUDE_MODELS, LearnerSettings, LearnerState, LockBusy, RunLock, day_ago, learner_lock,
-    load_settings, save_settings, upkeep_allowance,
+    load_settings, save_settings, source_held, upkeep_allowance,
 )
 from .transcripts import claude_code_logs, codex_logs, is_codex_log, read_session, session_folder, session_logs
 from .transcripts import line_boundary as _line_boundary
@@ -52,6 +52,10 @@ _ENGINE_NAMES = {"claude-cli": "Claude Code", "codex-cli": "Codex"}
 
 
 def run_learn(arguments: argparse.Namespace) -> int:
+    if getattr(arguments, "transcript", None) is not None and not (
+            getattr(arguments, "history_plan", None) and getattr(arguments, "alias_conflicts", False)):
+        print("--transcript requires --history-plan and --alias-conflicts.", file=sys.stderr)
+        return 1
     if getattr(arguments, "history_plan", None) or getattr(arguments, "repair_history", None):
         from .history import run
         return run(arguments)
@@ -108,9 +112,7 @@ def run_learn(arguments: argparse.Namespace) -> int:
                 finally:
                     moments.set_now(None)
             # A request that arrived while the lock was held is learned before stopping.
-            pending = moments.pending_requests()
-            if not pending or all(LearnerState().entry(Path(item["transcript"]), physical=False).get("history_hold")
-                                  for item in pending):
+            if not moments.runnable_requests():
                 break
             sweep = False
     except LockBusy:
@@ -169,7 +171,7 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
             extractor=extractor, dry_run=False, run=run,
         )
         print(report.describe(dry_run=False))
-        if report.calls or report.blocked:
+        if report.calls or report.blocked or report.held:
             moments.add_news(news_entry(report, settings, reason="catch-up", run=run, requests=[]))
         # What the quick pass saved from a chat that will not be settled (learning was off, the log is gone).
         pending_sessions = {entry.get("session_id") for entry in state.logs.values()
@@ -336,9 +338,13 @@ def learn_requests(store, state: LearnerState, settings: LearnerSettings, extrac
         chosen = min(group, key=lambda item: _REASON_ORDER.index(item["reason"])
                      if item.get("reason") in _REASON_ORDER else len(_REASON_ORDER))
         detail = chosen.get("detail") or ""
-        if state.entry(Path(chosen["transcript"])).get("history_hold"):
+        entry = state.entry(Path(chosen["transcript"]))
+        if source_held(entry):
             # Keep the request reachable. A repair hold is not budget failure,
             # and it must not discard requests made while the user works.
+            moments.preserve_requests(group)
+            if entry.get("identity_conflicts"):
+                state.save()
             continue
         if summary.blocked:
             report = LearnReport(blocked=summary.blocked)
@@ -458,6 +464,8 @@ def record_learning_run(store, run: str, report: LearnReport, upkeep: Maintenanc
     if report.set_aside:
         summary += (f"; {report.set_aside} waiting over {SET_ASIDE_DAYS} days set aside "
                     "(`knowitall2 learn --catch-up` lists them)")
+    if report.held:
+        summary += f"; {len(report.held)} held for transcript checkpoint conflicts"
     details = {
         "logs": report.logs, "active": report.active, "calls": report.calls, "deferred": report.deferred,
         "sessions": [{"session": item.session_id, "path": str(item.log), "dossiers": item.dossiers,
@@ -465,7 +473,7 @@ def record_learning_run(store, run: str, report: LearnReport, upkeep: Maintenanc
                       "event_index": item.event_index, "end_event_index": item.end_event_index}
                      for item in report.ready],
         "outcomes": dict(report.outcomes), "failed": report.failed, "skipped": report.skipped,
-        "blocked": report.blocked, "engine": engine.name, "model": getattr(engine, "model", None) or "",
+        "blocked": report.blocked, "held": report.held, "engine": engine.name, "model": getattr(engine, "model", None) or "",
         "seconds": round(seconds, 1), "usage": dict(report.usage), "set_aside": report.set_aside,
     }
     if trigger is not None:
@@ -810,7 +818,7 @@ def _start_from_now(agent: str) -> int:
                 except OSError:
                     continue
                 entry = state.entry(log)
-                if int(entry.get("offset", 0)) < boundary:
+                if not source_held(entry) and int(entry.get("offset", 0)) < boundary:
                     entry.update({"offset": boundary, "event_index": 0, "status": "baseline", "baseline_to": boundary,
                                   "updated_at": moment})
                     marked += 1

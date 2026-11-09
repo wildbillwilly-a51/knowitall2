@@ -1768,6 +1768,26 @@ class TwoPassTests(LearningTestCase):
         self.assertIn("[c0] candidate 0 of this session", engine.inputs[1][1])
         self.assertEqual({"confirmed": 1, "rejected (repeat)": 1}, dict(report.outcomes))
 
+    def test_an_update_to_an_earlier_candidate_keeps_both_original_statements(self) -> None:
+        statement = "The spare laptop verifies DHCP leases on the guest network."
+        self.sample_log().user(statement).write(self.log_path, idle=False)
+        lease_check = {**self.DNSMASQ, "text": statement, "evidence": statement}
+        self.learn(FakeEngine([[self.DNSMASQ, lease_check]]), quick=True)
+        originals = {record.id: record.text for record in self.provisional()}
+        self.assertEqual(2, len(originals))
+        quiet_longer(self.log_path)
+        engine = FakeEngine(finals=[{"reviews": [review("p1", "confirm"), review("p2", "confirm")], "memories": []}],
+                            checks=[{"decisions": [
+                                {"index": 0, "action": "new", "known_id": "", "text": "", "reason": ""},
+                                {"index": 1, "action": "update", "known_id": "c0", "text": "replacement",
+                                 "reason": "adds detail"}]}])
+        report = self.learn(engine)
+        self.assertEqual({"confirmed": 2}, dict(report.outcomes))
+        for record_id, original in originals.items():
+            record = self.store.get(record_id)
+            self.assertEqual(("active", original), (record.status, record.text))
+        self.assertEqual([], self.provisional())
+
     def test_a_retired_repeat_of_another_provisional_memory_points_to_it(self) -> None:
         self.sample_log().write(self.log_path, idle=False)
         again = {**self.DNSMASQ, "text": "dnsmasq on the homelab router needs a restart after /etc/config/dhcp edits."}

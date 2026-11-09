@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.12.7 (2026-11-09)
+
+- **Checkpoint conflicts hold only the affected transcript.** Other chats can
+  keep learning, and the health check reports recorded conflicts that need
+  attention.
+- **Repair follows the physical transcript.** When an original and a resumed
+  file share a session ID, an explicit repair verifies the source of each
+  pending record and keeps sibling checkpoints separate. It preserves original
+  checkpoint evidence and can resume after an interruption. Repairs remain
+  opt-in. See the testing guide for the recovery commands.
+- **Agents check what is already known.** Updated instructions tell agents to
+  recall project details before asking users to repeat them and to check for
+  an existing deployment before proposing another one.
+
 ## 0.12.6 (2026-11-05)
 
 - **Health checks accept equivalent default data homes.** Explicit and implicit

@@ -268,6 +268,7 @@ class LearnReport:
     failed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     blocked: str | None = None
+    held: list[str] = field(default_factory=list)
     usage: Counter = field(default_factory=Counter)
     # Each candidate's outcome, with its text (redacted, and none for one that held a secret) and memory ids.
     results: list[dict[str, Any]] = field(default_factory=list)
@@ -284,6 +285,8 @@ class LearnReport:
             noun = "session" if self.set_aside == 1 else "sessions"
             lines.append(f"Set aside {self.set_aside} {noun} waiting more than {SET_ASIDE_DAYS} days; "
                          "`knowitall2 learn --catch-up` lists them.")
+        if self.held:
+            lines.append(f"Transcript checkpoint conflicts held for repair: {len(self.held)}. Other sessions can continue.")
         if dry_run:
             lines.append("Dry run: no model calls were made and nothing was saved.")
             return "\n".join(lines)
@@ -355,8 +358,8 @@ def learn(
         for log, status in found:
             entry = state.entry(log)
             if entry.get("identity_conflicts"):
-                report.blocked = "transcript aliases have independent progress; prepare an audited history repair"
-                break
+                report.held.append(entry.get("session_id") or log.stem)
+                continue
             recovery = next(iter(entry.get("recovery_ranges", [])), None) if not quick else None
             if SETTLED not in entry:
                 # Learned before 0.11: what was read then was learned for good.

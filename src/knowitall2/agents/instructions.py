@@ -26,8 +26,13 @@ knowledge alongside the project's own files, the way you would search before dig
 
 - When you orient yourself on a task, read the KnowItAll2 briefing at the start of the chat, including what it
   lists as known for the project; if the chat has none, call `briefing`.
-- Before you work out something that may have been found before (a host or service, how to reach or sign in to
-  a system, a procedure, a tool's quirk, a past decision), call `recall` with a few keywords first.
+- Before asking the user to repeat a project detail or acting on a guess about an existing setup, call
+  `recall` with a few keywords about the specific fact or decision you need. If the first search misses,
+  try fewer keywords and the related project's scope, or search everywhere if the project is unclear.
+- Before proposing or creating another instance or service, search for the named site's existing deployment
+  and prior decisions about reuse. Do this even for a plan or dry run. Check which environment and date a
+  result describes before using an older lab procedure to decide how to handle the current site.
+- Use `recall` before rediscovering a host, access route, procedure, tool behavior or past decision.
 - What KnowItAll2 knows about the project and the systems it uses is also in the `knowitall2-known/` folder at
   the project's root (its `README.md` lists the files): search it like any project file, for example for a host,
   a tool, or an error message, and use `recall` for anything else. When KnowItAll2 points you to one of its

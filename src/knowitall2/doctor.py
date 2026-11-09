@@ -26,7 +26,7 @@ def run_checks(*, agents: Iterable[str] | None = None, user_home: Path | None = 
 
     launch = server_launch()
     checks = [_python_check(), _fts5_check(), _location_check(), *_store_checks(), _sharing_check(),
-              _engine_check(), _maintenance_check(), _known_files_check(), *_refused_folder_checks(),
+              _engine_check(), _learning_progress_check(), _maintenance_check(), _known_files_check(), *_refused_folder_checks(),
               *_cloud_folder_checks(),
               probe_server(launch)]
     for name in agents or AGENT_NAMES:
@@ -68,6 +68,16 @@ def _engine_check() -> Check:
         return Check("learning engine", False, f"learning is on, but {name} was not found on this computer, so "
                      "nothing new is learned", f"Make sure {name} is installed and opens, then run doctor again.")
     return Check("learning engine", True, f"{name} at {describe_engine(found)}")
+
+
+def _learning_progress_check() -> Check:
+    from .learning.state import LearnerState
+
+    conflicts = LearnerState().progress()["identity_conflicts"]
+    if conflicts:
+        return Check("learning progress", False, f"{conflicts} transcript checkpoint conflict(s) held for review.",
+                     "Preserve the checkpoints and prepare an alias recovery plan.")
+    return Check("learning progress", True, "no recorded transcript checkpoint conflicts")
 
 
 def _maintenance_check() -> Check:

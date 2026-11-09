@@ -123,6 +123,10 @@ def save_settings(settings: LearnerSettings) -> None:
     write_text_atomic(path, json.dumps(data, indent=2) + "\n")
 
 
+def source_held(entry: dict[str, Any]) -> bool:
+    return bool(entry.get("history_hold") or entry.get("identity_conflicts"))
+
+
 class LearnerState:
     """Progress for each session log, plus recent model calls for the daily budget."""
 
@@ -208,8 +212,14 @@ class LearnerState:
     def progress(self) -> dict[str, int]:
         """Quick completion and pending final work are independent phases."""
         from .log_identity import path_key
-        entries = {self.log_aliases.get(path_key(name), path_key(name)): self.entry(Path(name), physical=False)
-                   for name in list(self.logs)}
+        entries = {}
+        for name in sorted(self.logs, key=lambda name: (name.startswith("\\\\?\\"), "~" in name, name)):
+            key = path_key(name)
+            canonical = self.log_aliases.get(key)
+            if canonical in self.logs:
+                entries[canonical] = self.logs[canonical]
+            else:
+                entries.setdefault(key, self.logs[name])
         return {
             "quick_done": sum(e.get("quick_status", e.get("status")) == "done" for e in entries.values()),
             "final_pending": sum(bool(e.get("pending_reviews", {}).get("final")) for e in entries.values()),
@@ -217,7 +227,7 @@ class LearnerState:
             "awaiting_final": sum((int(e.get("offset", 0)), int(e.get("event_index", 0))) >
                                   (int(e.get("settled", 0)), int(e.get("settled_event_index", 0)))
                                   for e in entries.values()),
-            "identity_conflicts": sum(bool(e.get("identity_conflicts")) for e in entries.values()),
+            "identity_conflicts": sum(bool(e.get("identity_conflicts")) for e in self.logs.values()),
             "history_holds": sum(bool(e.get("history_hold")) for e in entries.values()),
         }
 
@@ -259,8 +269,9 @@ class LearnerState:
     def save(self) -> None:
         # A log deleted long ago (an agent's old sessions cleaned up) needs no entry: the file stays small.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=FORGET_MISSING_LOGS_DAYS)).isoformat()
-        for key in [key for key, entry in self.logs.items()
-                    if str(entry.get("updated_at") or "9999") < cutoff
+        aliases = {alias for entry in self.logs.values() for alias in entry.get("identity_conflicts", [])}
+        for key in [key for key, entry in self.logs.items() if key not in aliases and not source_held(entry)
+                    and str(entry.get("updated_at") or "9999") < cutoff
                     and not os.path.exists(entry.get("log_path", key))]:
             del self.logs[key]
         document = {"schema_version": 1, "logs": self.logs, "calls": self.calls, "fingerprints": self.fingerprints,
@@ -423,9 +434,9 @@ def learner_lock() -> Iterator[RunLock]:
 
 def _start_for_waiting_requests() -> None:
     try:
-        from .moments import pending_requests
+        from .moments import runnable_requests
 
-        if pending_requests():
+        if runnable_requests():
             from ..hooks import maybe_start_learner
 
             maybe_start_learner(requests=True)

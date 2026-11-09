@@ -114,9 +114,9 @@ def held(store, record, *, state=None) -> bool:
         hold(store, record, "source has not been located for review")
         return True
     if source := get(store, record.id):
-        from .state import LearnerState
+        from .state import LearnerState, source_held
         entry = (state or LearnerState()).entry(Path(source["path"]))
-        if entry.get("history_hold") or entry.get("identity_conflicts"):
+        if source_held(entry):
             return True  # temporary conditions must not create permanent queues
         if tuple(source["end"]) <= (int(entry.get("settled", 0)), int(entry.get("settled_event_index", 0))):
             hold(store, record, "source precedes final progress")

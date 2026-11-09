@@ -147,6 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--history-plan", type=Path, metavar="FILE", help="prepare a sealed alias-history repair plan")
     mode.add_argument("--repair-history", type=Path, metavar="FILE", help="execute a sealed bounded history repair")
     learn.add_argument("--session", help="exact logical session ID for --history-plan")
+    learn.add_argument("--alias-conflicts", action="store_true",
+                       help="with --history-plan: review conflicting quick checkpoints against the same transcript")
+    learn.add_argument("--transcript", type=Path, metavar="FILE",
+                       help="with --history-plan --alias-conflicts: select one absolute physical transcript")
     learn.add_argument("--replay-run", action="append", help="saved alias-replay run to audit; repeatable")
     learn.add_argument("--allow-whole-session", action="store_true",
                        help="with --recover: explicitly approve conservative whole-session rereviews")

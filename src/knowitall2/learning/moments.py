@@ -158,12 +158,31 @@ def pending_requests() -> list[dict[str, Any]]:
         except (OSError, ValueError):
             path.unlink(missing_ok=True)
             continue
-        if stale or not isinstance(item, dict) or not item.get("transcript"):
+        if not isinstance(item, dict) or not item.get("transcript") or (stale and not item.get("held_for_review")):
             path.unlink(missing_ok=True)
             continue
         item["_path"] = str(path)
         items.append(item)
     return sorted(items, key=lambda item: str(item.get("at")))
+
+
+def runnable_requests() -> list[dict[str, Any]]:
+    from .state import LearnerState, source_held
+
+    requests = pending_requests()
+    if not requests:
+        return []
+    state = LearnerState()
+    return [item for item in requests if not source_held(state.entry(Path(item["transcript"]), physical=False))]
+
+
+def preserve_requests(items: Iterable[dict[str, Any]]) -> None:
+    """A source hold must not turn a request into an expired request."""
+    for item in items:
+        if item.get("_path") and not item.get("held_for_review"):
+            saved = {key: value for key, value in item.items() if key != "_path"}
+            saved["held_for_review"] = True
+            write_text_atomic(Path(item["_path"]), json.dumps(saved) + "\n")
 
 
 def done_with(items: Iterable[dict[str, Any]]) -> None:

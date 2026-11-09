@@ -81,8 +81,9 @@ TOOLS: list[dict[str, Any]] = [
         "title": "Recall memories",
         "description": (
             "Search KnowItAll2 memory by keywords: systems, hosts, services, projects, tools, procedures, "
-            "decisions, lessons, and the user's rules. Use it before rediscovering something that may have been "
-            "learned before. Each result shows its source, date, and whether it is verified; treat unverified "
+            "decisions, lessons, and the user's rules. Before asking for a known detail or proposing another "
+            "service, look up the specific fact or the site's existing deployment, including for plans. "
+            "Each result shows its source, date, and whether it is verified; treat unverified "
             "memories as leads to check. A memory ID is a direct lookup. If a search is partial or empty, "
             "retry with fewer keywords; use the related project's project_path or scope 'everywhere' for its procedures."
         ),
