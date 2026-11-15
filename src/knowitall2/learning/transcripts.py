@@ -6,7 +6,11 @@ system reminders, task notifications, compaction summaries, side-chain
 (helper agent) records, and KnowItAll2's own tool calls are dropped. Reports
 that helper agents deliver through the user channel are labeled as agent
 reports, never as user words.
-Codex helper-agent and non-interactive sessions are not learned from.
+Codex helper-agent and non-interactive sessions, and headless Claude Code runs
+(``claude -p`` and the Agent SDK, which other tools start), are not learned
+from: like Codex ``exec`` runs, they hold an agent's brief, not the user's chat,
+and learning them crowded the user's own chats out of the daily budget (on
+2026-11-12, 281 of the 317 chats waiting for learning were headless runs).
 """
 
 from __future__ import annotations
@@ -48,6 +52,14 @@ def is_document(path: str) -> bool:
 _SKIPPED_TOOLS = frozenset({"ToolSearch", "TodoWrite", "TaskStop", "SubagentHandback", "Skill", "EnterPlanMode", "ExitPlanMode"})
 _WEB_TOOLS = frozenset({"WebSearch", "WebFetch"})
 _OWN_TOOL_PREFIX = "mcp__knowitall2__"
+# Claude Code records how each message came in; "sdk-cli", "sdk-ts" and "sdk-py" are runs another program
+# started (``claude -p``, the Agent SDK), as opposed to the app, the terminal, or an editor.
+_HEADLESS_ENTRYPOINT_PREFIX = "sdk-"
+
+
+def _headless_claude(record: dict[str, Any]) -> bool:
+    entrypoint = record.get("entrypoint")
+    return isinstance(entrypoint, str) and entrypoint.startswith(_HEADLESS_ENTRYPOINT_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -102,22 +114,41 @@ def codex_log_root() -> Path:
     return base / "sessions"
 
 
-def codex_logs(root: Path | None = None) -> list[Path]:
-    """Codex session logs (``sessions/YYYY/MM/DD/rollout-*.jsonl``), newest first."""
+def codex_logs(root: Path | None = None, *, stored: bool = False) -> list[Path]:
+    """Codex session logs (``sessions/YYYY/MM/DD/rollout-*.jsonl``), newest first; see ``codex_listing``."""
 
-    return [path for _, path in codex_listing(root)]
+    return [path for _, path in codex_listing(root, stored=stored)]
 
 
-def codex_listing(root: Path | None = None) -> list[tuple[float, Path]]:
-    """Each Codex session log with the time it was last written, newest first."""
+def codex_listing(root: Path | None = None, *, stored: bool = False) -> list[tuple[float, Path]]:
+    """Each Codex session log with the time it was last written, newest first.
 
+    Plain logs under ``sessions`` only, which is where a chat in use is. With ``stored``, also the ones Codex
+    compressed in place or archived (``archived_sessions``), each named by its plain ``sessions`` spelling, the
+    identity its learning progress has always had (``codex_store``); a transcript found in two forms at once
+    (while Codex compresses it) is listed once.
+    """
+
+    from . import codex_store
+
+    sessions = root if root is not None else codex_log_root()
+    wanted = codex_store.is_rollout if stored else _is_rollout
     found: list[tuple[float, Path]] = []
-    waiting = [root if root is not None else codex_log_root()]
+    waiting = [sessions]
     while waiting:
-        files, folders = _scan(waiting.pop(), _is_rollout)
+        files, folders = _scan(waiting.pop(), wanted)
         found += files
         waiting += folders
-    return _newest_first(found)
+    if not stored:
+        return _newest_first(found)
+    found += _scan(sessions.parent / codex_store.ARCHIVE, codex_store.is_rollout)[0]
+    named: dict[str, tuple[float, Path]] = {}
+    for modified, path in found:
+        plain = codex_store.canonical(path)
+        key = os.path.normcase(str(plain))
+        if key not in named or path == plain:   # the plain file, when there is one, speaks for the transcript
+            named[key] = (modified, plain)
+    return _newest_first(list(named.values()))
 
 
 def recent_codex_listing(root: Path | None = None, *, days: int = 2) -> list[tuple[float, Path]]:
@@ -145,9 +176,9 @@ def folder_listing(folder: Path) -> list[tuple[float, Path]]:
 
 
 def session_logs() -> list[Path]:
-    """Every agent's session logs, newest first."""
+    """Every agent's session logs, newest first, including Codex logs it compressed or archived."""
 
-    return [path for _, path in _newest_first([*claude_code_listing(), *codex_listing()])]
+    return [path for _, path in _newest_first([*claude_code_listing(), *codex_listing(stored=True)])]
 
 
 def is_codex_log(path: Path) -> bool:
@@ -174,10 +205,15 @@ def session_activity(path: Path, *, modified: float, now: datetime | None = None
 
     if not is_codex_log(path):
         return modified
+    from . import codex_store
+
+    found = codex_store.physical(path)
+    if found is None or found.name.endswith(codex_store.COMPRESSED):
+        return modified  # Codex compresses only a chat that has gone quiet: its file's time is its activity
     latest_allowed = (now or datetime.now(timezone.utc)).timestamp() + 120
     limit = max(0, min(max_bytes, ACTIVITY_MAX_BYTES))
     try:
-        with path.open("rb") as stream:
+        with found.open("rb") as stream:
             size = stream.seek(0, os.SEEK_END)
             tail = b""
             while len(tail) < min(size, limit):
@@ -210,8 +246,10 @@ def session_activity(path: Path, *, modified: float, now: datetime | None = None
 def line_boundary(path: Path, *, window: int = 1 << 16) -> int:
     """The offset just past the last complete line, so a later read starts on a record."""
 
-    end = path.stat().st_size
-    with path.open("rb") as stream:
+    from . import codex_store
+
+    end = codex_store.status(path).st_size if is_codex_log(path) else path.stat().st_size
+    with (codex_store.open_log(path) if is_codex_log(path) else path.open("rb")) as stream:
         while end > 0:
             start = max(0, end - window)
             stream.seek(start)
@@ -350,6 +388,8 @@ def _consume(record: dict[str, Any], session: Session, pending: dict[str, tuple[
     kind = record.get("type")
     if kind not in {"user", "assistant"} or record.get("isSidechain") or record.get("isMeta"):
         return
+    if _headless_claude(record):
+        return
     if record.get("isApiErrorMessage") or record.get("isCompactSummary") or record.get("isVisibleInTranscriptOnly"):
         return
     if session.cwd is None and isinstance(record.get("cwd"), str):
@@ -459,9 +499,14 @@ def read_codex_session(path: Path, *, start: int = 0, stop: int | None = None) -
 
     Codex records each finished step as an ``item_completed`` event, which is
     all the learner needs. Helper-agent (subagent) and non-interactive
-    (``exec``) sessions yield no events.
+    (``exec``) sessions yield no events. ``path`` is the plain spelling; a log
+    Codex compressed or archived is read where it is now (``codex_store``), and
+    one that cannot be read raises ``codex_store.UnreadableLog``.
     """
 
+    from . import codex_store
+
+    path = codex_store.canonical(path)
     match = _CODEX_SESSION_ID.search(path.name)
     session = Session(agent="codex", session_id=match.group(1) if match else path.stem, path=path)
     meta = _codex_meta(path)
@@ -471,7 +516,7 @@ def read_codex_session(path: Path, *, start: int = 0, stop: int | None = None) -
         session.cwd = meta["cwd"]
     learnable = _interactive_codex(meta)
     offset = start
-    with path.open("rb") as stream:
+    with codex_store.open_log(path) as stream:
         stream.seek(start)
         for raw in stream:
             if not raw.endswith(b"\n") or (stop is not None and offset >= stop):
@@ -515,6 +560,8 @@ def session_folder(path: Path, *, interactive_only: bool = False) -> str | None:
                 except ValueError:
                     continue
                 if isinstance(record, dict) and isinstance(record.get("cwd"), str) and record["cwd"]:
+                    if interactive_only and _headless_claude(record):
+                        return None
                     return record["cwd"]
     except OSError:
         pass
@@ -522,10 +569,12 @@ def session_folder(path: Path, *, interactive_only: bool = False) -> str | None:
 
 
 def _codex_meta(path: Path) -> dict[str, Any]:
-    """The session's ``session_meta`` payload, which Codex writes first."""
+    """The session's ``session_meta`` payload, which Codex writes first; empty when it cannot be read."""
+
+    from . import codex_store
 
     try:
-        with path.open("rb") as stream:
+        with codex_store.open_log(path) as stream:
             for _, raw in zip(range(_CODEX_META_LINES), stream):
                 if b'"session_meta"' not in raw:
                     continue
@@ -598,7 +647,18 @@ def _codex_event(item: dict[str, Any]) -> Event | None:
     if kind == "WebSearch":
         query = item.get("query")
         return Event("tool", query, tool="WebSearch") if isinstance(query, str) and query else None
+    if kind == "FunctionCallOutput":
+        # A chat that another agent or ChatGPT (through Work Partners) opened with codex_app.create_thread gets its
+        # task as that call's output, not as a user message.
+        text = _codex_text(item.get("output"))
+        return Event("agent_report", text) if text.startswith(_CODEX_DELEGATION) else None
     return None
+
+
+def is_delegated_task(event: Event) -> bool:
+    """Whether ``event`` is the task another agent handed this chat: work asked for, though not in the user's words."""
+
+    return event.kind == "agent_report" and event.text.startswith(_CODEX_DELEGATION)
 
 
 def _codex_text(content: object) -> str:

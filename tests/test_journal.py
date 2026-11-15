@@ -344,7 +344,7 @@ class UsageTests(unittest.TestCase):
     def test_claude_reports_tokens_and_an_estimated_cost(self) -> None:
         envelope = {"structured_output": {"memories": []}, "total_cost_usd": 0.0123,
                     "usage": {"input_tokens": 10, "cache_read_input_tokens": 1000, "output_tokens": 50}}
-        self.assertEqual({"input_tokens": 1010, "output_tokens": 50, "cost_usd": 0.0123},
+        self.assertEqual({"input_tokens": 1010, "output_tokens": 50, "cache_read_input_tokens": 1000, "cost_usd": 0.0123},
                          claude_usage(json.dumps(envelope).encode()))
         self.assertIsNone(claude_usage(b"not json"))
 

@@ -34,7 +34,9 @@ from typing import Any, Callable
 from .. import catalog, review
 from ..secrets import redact
 from ..memory import VERIFICATION_STRENGTH, Memory, is_users_choice, keywords
+from . import ledger
 from .extractor import ExtractionError, payload_items
+from .state import chargeable
 
 CATALOG_AGENT = "catalog"
 FILE_BATCH = 25
@@ -190,6 +192,14 @@ class CatalogReport:
     left_out: set = field(default_factory=set)
     # What the batch being sent holds, by key, with what giving each up means.
     attempt: dict = field(default_factory=dict)
+    # Seconds from saving to filing, for each memory the latest filing call filed: how soon it could be found
+    # by system in the knowledge files and briefings (joint review 2026-11-13).
+    latencies: list = field(default_factory=list)
+    # Memories filed as general after the model skipped them twice: filed, without a system.
+    filed_general: int = 0
+    # The work waiting before and after the run (``queue``): what the catalog's calls are spent on.
+    queue_before: dict = field(default_factory=dict)
+    queue_after: dict = field(default_factory=dict)
 
     def describe(self) -> str:
         parts = [f"filed {self.filed} memories", f"{self.new_systems} new systems", f"described {self.profiled} systems"]
@@ -206,7 +216,8 @@ class CatalogReport:
     def details(self) -> dict[str, Any]:
         return {"calls": self.calls, "deferred": self.deferred, "filed": self.filed, "new_systems": self.new_systems,
                 "profiled": self.profiled, "questions": dict(self.questions), "failed": self.failed,
-                "refused": self.refused, "blocked": self.blocked, "usage": dict(self.usage)}
+                "refused": self.refused, "blocked": self.blocked, "usage": dict(self.usage),
+                "queue_before": dict(self.queue_before), "queue_after": dict(self.queue_after)}
 
 
 def run_catalog(*, memory: Memory, engine: Any, budget: int, state: Any = None,
@@ -214,18 +225,50 @@ def run_catalog(*, memory: Memory, engine: Any, budget: int, state: Any = None,
     """File, describe, and review, within ``budget`` model calls; ``state`` counts them, as from ``origin``."""
 
     report = CatalogReport()
+    report.queue_before = _queue_quietly(memory)
     try:
         return _run(memory, engine, budget, run, report, state, origin)
     finally:
+        report.queue_after = _queue_quietly(memory)
         if state is not None:
             state.save()
+
+
+def queue(memory: Memory) -> dict[str, Any]:
+    """What waits for the catalog (``plan``), with how long the oldest unfiled memory has waited, in seconds."""
+
+    waiting = plan(memory)
+    oldest = memory.store.unnoted_records(limit=1)
+    waiting["oldest_unfiled_seconds"] = _age(oldest[0].created_at, memory.now()) if oldest else None
+    return waiting
+
+
+def _queue_quietly(memory: Memory) -> dict[str, Any]:
+    try:
+        return queue(memory)
+    except Exception as exc:   # instrumentation never stops the catalog
+        return {"error": type(exc).__name__}
+
+
+def _age(created: str, now: str) -> int | None:
+    try:
+        then, at = datetime.fromisoformat(created.replace("Z", "+00:00")), datetime.fromisoformat(now.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    then = then if then.tzinfo else then.replace(tzinfo=timezone.utc)
+    at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+    return max(0, int((at - then).total_seconds()))
+
+
+_STEP_PURPOSE = {"_review_step": "catalog-review", "_file_step": "catalog-file", "_profile_step": "catalog-profile"}
 
 
 def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: CatalogReport, state: Any,
          origin: str) -> CatalogReport:
     def counted(outcome: str) -> None:
         if state is not None:
-            state.record_call(at=datetime.now(timezone.utc), session="catalog", outcome=outcome, origin=origin)
+            state.record_call(at=datetime.now(timezone.utc), session="catalog", outcome=outcome, origin=origin,
+                              attempt=getattr(engine, "last_attempt", None))
 
     report.questions.update({name: count for name, count in review.expire_tasks(memory).items() if count})
     unanswered = review.expire_unanswered(memory)
@@ -243,18 +286,31 @@ def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: Cata
                 if not first:
                     report.deferred += 1
                 break
-            report.attempt = {}
+            report.attempt, report.latencies = {}, []
+            purpose = _STEP_PURPOSE.get(step.__name__, "catalog")
+            before = (report.filed, report.profiled, report.new_systems, sum(report.questions.values()),
+                      report.filed_general)
             try:
-                calls = step(memory, report, engine=engine, run=run)
+                with ledger.context(purpose=purpose, origin=origin, run=run):
+                    calls = step(memory, report, engine=engine, run=run)
             except ExtractionError as exc:
                 report.usage.update(getattr(engine, "last_usage", None) or {})
                 if exc.blocking:
                     report.blocked = str(exc)
                     break
+                if not chargeable(exc):
+                    break   # refused before any call: nothing was spent, and nothing in the batch is blamed
                 report.calls += 1
                 report.failed += 1
                 counted("failed")
+                sent = len(report.attempt)
                 _refused(memory, report)
+                latencies = sorted(report.latencies)
+                with ledger.context(purpose=purpose, origin=origin, run=run):
+                    ledger.result(getattr(engine, "last_attempt", None), input=sent, refused=sent,
+                                  filed_general=report.filed_general - before[4],
+                                  latency_median_s=latencies[len(latencies) // 2] if latencies else None,
+                                  latency_max_s=latencies[-1] if latencies else None)
                 taken += 1
                 continue
             report.usage.update(getattr(engine, "last_usage", None) or {})
@@ -262,6 +318,15 @@ def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: Cata
             taken += 1
             if calls:
                 counted("ok")
+                latencies = sorted(report.latencies)
+                with ledger.context(purpose=purpose, origin=origin, run=run):
+                    ledger.result(getattr(engine, "last_attempt", None), input=len(report.attempt),
+                                  filed=report.filed - before[0], filed_general=report.filed_general - before[4],
+                                  profiled=report.profiled - before[1],
+                                  new_systems=report.new_systems - before[2],
+                                  questions=sum(report.questions.values()) - before[3],
+                                  latency_median_s=latencies[len(latencies) // 2] if latencies else None,
+                                  latency_max_s=latencies[-1] if latencies else None)
     return report
 
 
@@ -293,6 +358,7 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
     report.attempt = {record.id: _filing_as_general(memory, record, now) for record in batch}
     systems = memory.store.systems_list()
     payload = engine.run(_render_file_input(systems, batch), schema=FILE_SCHEMA, system_prompt=FILE_PROMPT)
+    applied = memory.now()   # when the answer is applied: the wait for filing includes the call itself
     wanted = {record.id: record for record in batch}
     with memory.store.transaction():
         # The batch was read before the model call: a memory filed meanwhile (such as by the user) keeps its
@@ -310,6 +376,7 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
                 written_by=CATALOG_AGENT, now=now,
             ):
                 report.filed += 1
+                _waited(report, record, applied)
         # A memory the model skipped (a short or cut-off answer) waits for the next batch; one skipped again
         # and again is filed as general, so it cannot hold the queue.
         skips = _skips(memory)
@@ -320,14 +387,32 @@ def _file_step(memory: Memory, report: CatalogReport, *, peek: bool = False, eng
                 continue
             report.left_out.add(record.id)
             if _skipped_again(skips, record.id):
-                _filing_as_general(memory, record, now)()
+                if _filing_as_general(memory, record, now)():
+                    report.filed_general += 1
+                    _waited(report, record, applied)
         _save_skips(memory, skips)
     return 1
 
 
-def _filing_as_general(memory: Memory, record: Any, now: str) -> Callable[[], None]:
-    return lambda: memory.store.add_note(record.id, headline=_clean(record.text, 100), system_id=None,
-                                         facet="other", written_by=CATALOG_AGENT, now=now)
+def _waited(report: CatalogReport, record: Any, applied: str) -> None:
+    age = _age(record.created_at, applied)
+    if age is not None:
+        report.latencies.append(age)
+
+
+class _FileAsGeneral:
+    """Giving up on a memory the model would not file: it is filed as general, without a system."""
+
+    def __init__(self, memory: Memory, record: Any, now: str) -> None:
+        self.memory, self.record, self.now = memory, record, now
+
+    def __call__(self) -> bool:
+        return self.memory.store.add_note(self.record.id, headline=_clean(self.record.text, 100), system_id=None,
+                                          facet="other", written_by=CATALOG_AGENT, now=self.now)
+
+
+def _filing_as_general(memory: Memory, record: Any, now: str) -> _FileAsGeneral:
+    return _FileAsGeneral(memory, record, now)
 
 
 def _fresh_first(waiting: list[Any], skips: dict[str, int], key: Callable[[Any], str], size: int) -> list[Any]:
@@ -346,8 +431,9 @@ def _refused(memory: Memory, report: CatalogReport) -> None:
         for key, give_up in report.attempt.items():
             report.left_out.add(key)
             report.refused += 1
-            if _skipped_again(skips, key):
-                give_up()
+            if _skipped_again(skips, key) and give_up() and isinstance(give_up, _FileAsGeneral):
+                report.filed_general += 1
+                _waited(report, give_up.record, memory.now())
         _save_skips(memory, skips)
     report.attempt = {}
 

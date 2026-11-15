@@ -487,8 +487,13 @@ class IntegrityTests(unittest.TestCase):
             second.explore("synthetic", folder=self.root, schema=OUTPUT_SCHEMA, system_prompt="test")
         self.assertFalse(blocked.exception.attempted)
         self.assertEqual(2, len(calls))
-        attempts = (self.root / "home/learner/backend-attempts.jsonl").read_text().splitlines()
-        self.assertEqual(2, len(attempts))
+        events = [json.loads(line) for line in
+                  (self.root / "home/learner/backend-attempts.jsonl").read_text().splitlines()]
+        ends = [event for event in events if event["event"] == "end"]
+        # Two launched calls (each a start and an end), two refused by the pause before any launch.
+        self.assertEqual(["confirmed", "confirmed"], [event["launch"] for event in ends])
+        self.assertEqual(2, sum(event["event"] == "start" for event in events))
+        self.assertEqual(["cooldown", "cooldown"], [event["category"] for event in events if event["event"] == "deferred"])
 
     def test_bookkeeping_contention_never_discards_a_valid_result(self):
         def runner(command, **kwargs):

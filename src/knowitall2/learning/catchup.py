@@ -166,7 +166,9 @@ def _skipped(state: LearnerState, *, since: str | None) -> list[tuple[Path, str]
         if not is_skipped(state.entry(log)):
             continue
         try:
-            modified = log.stat().st_mtime
+            from .codex_store import status
+
+            modified = status(log).st_mtime   # a Codex log Codex compressed or archived, where it is now
             active = datetime.fromtimestamp(modified, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if since and active[:10] < since:
                 from .transcripts import session_activity

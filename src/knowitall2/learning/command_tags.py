@@ -19,6 +19,8 @@ from typing import Any, Sequence
 
 from .. import commands
 from ..store import RecordRow, Store
+from . import ledger
+from .state import chargeable
 
 SCOPE_KEY = "commands"
 BATCH = 50
@@ -146,16 +148,19 @@ def _tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: An
             report.deferred = sum(len(item) for item in batches[number:])
             break
         try:
-            answer = engine.run(render(batch), schema=SCHEMA, system_prompt=SYSTEM_PROMPT)
+            with ledger.context(purpose="command-tags", origin=origin):
+                answer = engine.run(render(batch), schema=SCHEMA, system_prompt=SYSTEM_PROMPT)
         except Exception as exc:
-            if state is not None:
-                state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="failed", origin=origin)
+            charged = chargeable(exc)
+            if state is not None and charged:
+                state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="failed", origin=origin,
+                                  attempt=getattr(engine, "last_attempt", None))
             if getattr(exc, "blocking", True):
                 # The engine itself (signed out, a usage limit): nothing in this batch is marked looked at.
                 report.blocked = str(exc)[:300]
                 break
             # The model refused or failed this batch: each memory in it counts a refusal, and the rest go on.
-            report.calls += 1
+            report.calls += int(charged)
             report.refused += len(batch)
             with store.transaction():
                 for record in batch:
@@ -163,7 +168,8 @@ def _tag_commands(store: Store, engine: Any, *, budget: int, now: str, state: An
             continue
         report.calls += 1
         if state is not None:
-            state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="ok", origin=origin)
+            state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="ok", origin=origin,
+                              attempt=getattr(engine, "last_attempt", None))
         given = {str(item.get("id", "")).strip("[] "): item for item in answer.get("lessons", [])
                  if isinstance(item, dict)}
         with store.transaction():

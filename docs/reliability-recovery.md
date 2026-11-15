@@ -10,9 +10,28 @@ against a transcript. Native model consumers share a durable backend pause in
 `learner/backend-availability.json`. Explicit reset metadata takes precedence;
 when a reset cannot be interpreted, a labelled probe interval starts at 15
 minutes and increases to six hours after repeated rejections.
-`learn --retry-backend` permits one explicit probe during a pause. Attempts,
-including blocked native requests, are recorded separately in
-`learner/backend-attempts.jsonl`; suppressed calls do not launch a model.
+`learn --retry-backend` permits one explicit probe during a pause.
+
+Every native model call is written to the call ledger,
+`learner/backend-attempts.jsonl` (`learning/ledger.py`, kept 15 days): a
+`start` before the launch with what the call is for (purpose, origin, mode,
+trigger, run, work, source session and agent, configured model), an `end`
+with its outcome and whether the engine actually ran (`launch`: confirmed,
+none, unknown; a `start` without an `end` is uncertain), a `deferred` for a
+call refused before launch (a pause, a provenance hold), and a `result` with
+what came of an answer (counts only; a final review's totals are one `work`
+result listing its calls). Budgets stay in `state.json`, each charged call
+naming its ledger entry (`attempt`); each charge is also written to the
+ledger as it is made (`charge`), so a stop before the budget file is saved
+leaves it visible, and the summary tells calls charged, exempt by the rule,
+and due but with no charge recorded (`charge missing`). The engine runner
+marks errors raised after the process started, so a broken pipe is recorded
+as a launch, not as an engine that never ran. One rule decides a charge
+for every consumer (`state.chargeable`): an answer, or a launched call that
+failed for its content; never an unavailable engine, a timeout, or a refusal
+before launch. `learn --ignore-daily-limit` charges its sweep as `override`,
+outside the background allowance. `knowitall2 stats` sums the ledger for
+seven days.
 
 Quick and final passes have separate failure counters. Failed ranges remain
 pending, with their byte/event boundaries and reasons. Repeated content errors

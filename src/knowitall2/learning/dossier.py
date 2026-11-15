@@ -12,7 +12,7 @@ from typing import Callable, Iterable
 
 from ..identity import ProjectIdentity, identify
 from ..secrets import redact
-from .transcripts import Event, Session
+from .transcripts import Event, Session, is_delegated_task
 
 MAX_DOSSIER_CHARACTERS = 48_000
 USER_CHARACTERS = 2_000
@@ -102,11 +102,14 @@ def build_dossiers(
     """Chunk a session's events into redacted dossiers; empty when nothing is worth learning.
 
     ``require_user`` is relaxed when continuing a session from a saved offset,
-    because a later stretch of a long session may hold only tool work.
+    because a later stretch of a long session may hold only tool work. A
+    task another agent handed the chat (a Codex desktop chat opened from
+    ChatGPT through Work Partners) starts it as the user's words would.
     """
 
     if not session.events or (require_user and
-            (len(session.events) < 2 or not any(event.kind == "user" for event in session.events))):
+            (len(session.events) < 2 or not any(event.kind == "user" or is_delegated_task(event)
+                                                for event in session.events))):
         return []
     project = identify(session.cwd) if session.cwd else None
     header = _header(session, project)
@@ -200,7 +203,9 @@ def _render(event: Event) -> tuple[str, str | None, str | None]:
     if event.kind == "assistant":
         return f"[assistant] {_excerpt(redact(event.text), ASSISTANT_CHARACTERS)}\n\n", None, None
     if event.kind == "agent_report":
-        return f"[helper agent report] {_excerpt(redact(event.text), AGENT_REPORT_CHARACTERS)}\n\n", None, None
+        label = ("task handed to this chat by another agent (not the user's own words)" if is_delegated_task(event)
+                 else "helper agent report")
+        return f"[{label}] {_excerpt(redact(event.text), AGENT_REPORT_CHARACTERS)}\n\n", None, None
     detail = _excerpt(redact(event.text), COMMAND_CHARACTERS)
     entry = f"[tool {event.tool}] {detail}\n"
     output = None

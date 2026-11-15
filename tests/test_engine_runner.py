@@ -384,14 +384,32 @@ class EngineDiscoveryTests(unittest.TestCase):
         from knowitall2 import doctor
 
         settings = mock.Mock(enabled=True, backend="claude-cli")
-        with mock.patch("knowitall2.learning.state.load_settings", return_value=settings):
+        with mock.patch("knowitall2.learning.state.load_settings", return_value=settings), \
+                mock.patch("knowitall2.learning.extractor.find_codex_cli", return_value=None):
             alone = doctor._engine_check()
             native = self.file(self.native / "claude.exe")
             both = doctor._engine_check()
         self.assertTrue(alone.ok)
         self.assertIn(str(self.claude_script).casefold(), alone.detail.casefold())
         self.assertIn("node", alone.detail)
-        self.assertEqual(f"Claude Code at {native}", both.detail)
+        self.assertEqual(f"Claude Code at {native}; Codex not found, so its chats are learned by Claude Code",
+                         both.detail)
+
+    def test_doctor_is_satisfied_by_either_engine(self) -> None:
+        from knowitall2 import doctor
+
+        settings = mock.Mock(enabled=True, backend="claude-cli")
+        with mock.patch("knowitall2.learning.state.load_settings", return_value=settings), \
+                mock.patch("knowitall2.learning.extractor.find_claude_cli", return_value=None), \
+                mock.patch("knowitall2.learning.extractor.find_codex_cli", return_value=self.codex_script):
+            only_codex = doctor._engine_check()
+        with mock.patch("knowitall2.learning.state.load_settings", return_value=settings), \
+                mock.patch("knowitall2.learning.extractor.find_claude_cli", return_value=None), \
+                mock.patch("knowitall2.learning.extractor.find_codex_cli", return_value=None):
+            neither = doctor._engine_check()
+        self.assertTrue(only_codex.ok)
+        self.assertIn("Claude Code not found, so its chats are learned by Codex", only_codex.detail)
+        self.assertFalse(neither.ok)
 
 
 if __name__ == "__main__":

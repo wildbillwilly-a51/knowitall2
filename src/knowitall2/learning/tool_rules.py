@@ -40,6 +40,8 @@ from typing import Any, Sequence
 from .. import commands, journal
 from ..memory import DISPUTED_TAG, PROVISIONAL_TAG, Memory, MemoryInputError
 from ..store import RecordRow, Store
+from . import ledger
+from .state import chargeable
 
 SCOPE_KEY = "tool-rules"
 RULES_AGENT = commands.RULES_AGENT
@@ -322,14 +324,17 @@ def _write_rules(store: Store, engine: Any, *, budget: int, now: str, state: Any
         rules = existing_rules(store)
         prompt, named = render(batch, rules)
         try:
-            answer = engine.run(prompt, schema=SCHEMA, system_prompt=SYSTEM_PROMPT)
+            with ledger.context(purpose="tool-rules", origin=origin):
+                answer = engine.run(prompt, schema=SCHEMA, system_prompt=SYSTEM_PROMPT)
         except Exception as exc:
-            if state is not None:
-                state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="failed", origin=origin)
+            charged = chargeable(exc)
+            if state is not None and charged:
+                state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="failed", origin=origin,
+                                  attempt=getattr(engine, "last_attempt", None))
             if getattr(exc, "blocking", True):
                 report.blocked = str(exc)[:300]   # the engine itself: nothing in this batch is marked looked at
                 break
-            report.calls += 1
+            report.calls += int(charged)
             report.refused += len(batch)
             with store.transaction():
                 for group in batch:
@@ -337,7 +342,8 @@ def _write_rules(store: Store, engine: Any, *, budget: int, now: str, state: Any
             continue
         report.calls += 1
         if state is not None:
-            state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="ok", origin=origin)
+            state.record_call(at=datetime.now(timezone.utc), session=SCOPE_KEY, outcome="ok", origin=origin,
+                              attempt=getattr(engine, "last_attempt", None))
         failed: set[str] = set()
         for item in answer.get("rules", []) if isinstance(answer, dict) else []:
             if not isinstance(item, dict) or str(item.get("group", "")).strip() not in named:

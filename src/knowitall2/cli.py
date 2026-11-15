@@ -181,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
              "else whichever is installed)",
     )
     learn.add_argument("--model", help="model used for extraction (default: sonnet for Claude Code; Codex's everyday model)")
+    learn.add_argument("--route-by-source", choices=("on", "off"),
+                       help="learn each chat on the engine that did the work (default: on); either engine takes "
+                            "over when the other is missing or paused")
+    learn.add_argument("--codex-model", help="the Codex model that learns Codex chats (default: gpt-6.1-sol)")
+    learn.add_argument("--codex-effort", choices=("low", "medium", "high"), help="its reasoning effort")
 
     maintain = commands.add_parser(
         "maintain", help="review existing memories for duplicates and outdated facts (also runs after learning)",
@@ -723,9 +728,28 @@ def _install_app_shortcut() -> list[str]:
         return [f"could not add the KnowItAll2 app shortcut ({exc}); add it with: knowitall2 app --shortcut"]
 
 
+def _ledger_lines(since: datetime) -> list[str]:
+    """Model calls in the call ledger since ``since``, by what they were for (the kinds overlap: a call can be
+    launched and failed)."""
+
+    from .learning import ledger
+
+    rows = ledger.summary(since)
+    if not rows:
+        return []
+    kinds = ("launched", "ok", "failed", "blocked", "uncertain", "deferred", "legacy",
+             "charged", "exempt", "charge missing", "charge unknown", "incomplete")
+    total = {kind: sum(row.get(kind, 0) for row in rows.values()) for kind in kinds}
+    lines = ["Model calls, last 7 days (call ledger): "
+             + ", ".join(f"{kind} {total[kind]}" for kind in kinds if total[kind] or kind in kinds[:6])]
+    for purpose, row in sorted(rows.items(), key=lambda item: -sum(item[1].values())):
+        lines.append(f"  {purpose}: " + ", ".join(f"{kind} {row[kind]}" for kind in kinds if row.get(kind)))
+    return lines
+
+
 def _format_stats(store: Store) -> str:
     from .learning.maintenance import REASON_PREFIX
-    from .learning.state import LearnerState
+    from .learning.state import CALL_HISTORY_DAYS, LearnerState
 
     stats = store.stats()
     now = datetime.now(timezone.utc)
@@ -752,10 +776,12 @@ def _format_stats(store: Store) -> str:
     ]
     for item in usage["top"]:
         lines.append(f"  used {item['count']}x: [{item['id']}] {' '.join(item['text'].split())[:90]}")
+    # The learner keeps its budget entries for CALL_HISTORY_DAYS (7): "30 days" here counted only 7.
     lines.append(
-        f"Learner: {learner.calls_since(now - timedelta(days=1))} calls in the last 24 hours, "
-        f"{learner.calls_since(now - timedelta(days=30))} in the last 30 days"
+        f"Learner: {learner.calls_since(now - timedelta(days=1))} calls charged in the last 24 hours, "
+        f"{learner.calls_since(now - timedelta(days=CALL_HISTORY_DAYS))} in the last {CALL_HISTORY_DAYS} days"
     )
+    lines.extend(_ledger_lines(now - timedelta(days=7)))
     last_review = store.last_maintenance()
     lines.append(
         f"Maintenance: {store.count_changed_by(REASON_PREFIX, since=month_ago)} memories merged or retired "

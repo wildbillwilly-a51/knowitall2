@@ -29,7 +29,8 @@ from ..memory import (
 )
 from ..store import RecordRow
 from .extractor import ClaudeCliExtractor, CodexCliExtractor, ExtractionError, payload_items
-from .state import MAX_FAILURES, LearnerState
+from . import ledger
+from .state import MAX_FAILURES, LearnerState, chargeable
 
 MAINTENANCE_AGENT = "maintenance"
 REASON_PREFIX = "maintenance: "
@@ -109,6 +110,10 @@ class EngineReviewer:
     @property
     def last_usage(self) -> dict[str, float] | None:
         return getattr(self.engine, "last_usage", None)
+
+    @property
+    def last_attempt(self) -> str | None:
+        return getattr(self.engine, "last_attempt", None)
 
     def review(self, text: str) -> list[dict[str, Any]]:
         payload = self.engine.run(text, schema=REVIEW_SCHEMA, system_prompt=REVIEW_PROMPT)
@@ -201,23 +206,26 @@ def maintain(
                 report.deferred += 1
                 continue
             try:
-                findings = reviewer.review(render_group(group))
+                with ledger.context(purpose="maintenance", origin=origin, run=run):
+                    findings = reviewer.review(render_group(group))
             except ExtractionError as exc:
                 report.usage.update(getattr(reviewer, "last_usage", None) or {})
                 if exc.blocking:
                     report.blocked = str(exc)
                     break
                 journal.problem("maintenance", f"a review call failed for {group.label}: {exc}")
+                if not chargeable(exc):
+                    continue   # refused before any call: nothing spent, the group waits for a later run
                 budget -= 1
                 report.calls += 1
                 report.failed += 1
-                _record_call(state, "failed", origin)
+                _record_call(state, "failed", origin, getattr(reviewer, "last_attempt", None))
                 store.record_review(group.fingerprint, scope_key=group.scope_key, outcome="failed", now=memory.now())
                 continue
             report.usage.update(getattr(reviewer, "last_usage", None) or {})
             budget -= 1
             report.calls += 1
-            _record_call(state, "ok", origin)
+            _record_call(state, "ok", origin, getattr(reviewer, "last_attempt", None))
             made: list[str] = []
             near: list[str] = []
             with store.transaction():
@@ -724,9 +732,10 @@ def _asked(added: bool) -> str:
     return "question" if added else "question already open"
 
 
-def _record_call(state: LearnerState | None, outcome: str, origin: str) -> None:
+def _record_call(state: LearnerState | None, outcome: str, origin: str, attempt: str | None = None) -> None:
     if state is not None:
-        state.record_call(at=datetime.now(timezone.utc), session="maintenance", outcome=outcome, origin=origin)
+        state.record_call(at=datetime.now(timezone.utc), session="maintenance", outcome=outcome, origin=origin,
+                          attempt=attempt)
 
 
 def _signature(record: RecordRow) -> set[str]:

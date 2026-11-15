@@ -96,13 +96,18 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
            on_call: Any = None, partial: bool = False, recovery: bool = False,
            review_start: tuple[int, int] | None = None, selected_ids: set[str] | None = None,
            extract_new: bool = True, before_apply: Any = None, after_apply: Any = None,
-           apply_lock: Any = None) -> Settled:
+           apply_lock: Any = None, hold_undecided: bool = False) -> Settled:
     """The final pass over ``parts``, the settled stretch of ``session``; see the module's description.
 
     ``on_call`` is told of each model call as it is made, for the budget. An ``ExtractionError`` stops the pass
     before anything is changed, so a retry starts over. ``partial``: the parts are only the first slice of the
     stretch (it needs more calls than a day allows), so a provisional memory no part bore on stays provisional
-    for the next slice, instead of standing.
+    for the next slice, instead of standing. ``hold_undecided``: earlier passes of this stretch already left
+    memories undecided repeatedly, so the provisional memories this pass leaves undecided are held for source
+    review (they stay provisional and listed) and the rest of the stretch settles, instead of the whole stretch
+    failing again (2026-11-13: one chat's final pass failed on every retry for two days). A pass that leaves
+    memories undecided raises an ``ExtractionError`` whose ``undecided`` names them, so the learner can tell
+    repeated indecision from other failures (review 2026-11-13).
     """
 
     from .learner import known_context
@@ -120,7 +125,7 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
     if selected_ids is not None:
         provisional = [record for record in provisional if record.id in selected_ids]
         if {record.id for record in provisional} != selected_ids:
-            raise ExtractionError("selected history records changed or are no longer provisional")
+            raise ExtractionError("selected history records changed or are no longer provisional", attempted=False)
     candidates = []
     legacy_cache: dict = {}
     for record in provisional:
@@ -128,7 +133,7 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         if source is None:
             provenance.hold(memory.store, record, "original source has not been located unambiguously")
             if selected_ids is not None or recovery:
-                raise ExtractionError(f"source review is pending for {record.id}")
+                raise ExtractionError(f"source review is pending for {record.id}", attempted=False)
             continue
         if review_start is not None and tuple(source["end"]) <= review_start and selected_ids is None:
             provenance.hold(memory.store, record, "original source precedes established final progress")
@@ -137,7 +142,7 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
             if provenance.intersects(source, parts):
                 provenance.hold(memory.store, record, "complete original source window needs a bounded review")
             if selected_ids is not None:
-                raise ExtractionError(f"selected record source is outside the approved snapshot: {record.id}")
+                raise ExtractionError(f"selected record source is outside the approved snapshot: {record.id}", attempted=False)
             continue
         candidate = _as_candidate(memory, record)
         candidate["_source"] = source
@@ -178,10 +183,18 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         for candidate in [item for item in memories if isinstance(item, dict)][:FINAL_CANDIDATES]:
             items.append(_Item(f"n{len(items) + 1}", candidate, status="added", part=number))
     undecided = [item for item in items if reviewing and item.status in ("pending", "deferred")]
+    held_back: list[_Item] = []
+    if undecided and hold_undecided and all(item.record is not None for item in undecided):
+        held_back, undecided = undecided, []
+        for item in held_back:
+            item.status = "held"
     if undecided:
         keys = ", ".join(f"{item.key} ({item.record.id if item.record else 'new'}, {item.status})"
                          for item in undecided[:10])
-        raise ExtractionError(f"the final pass left memories unreviewed: {keys}; its range remains pending", counted=True)
+        error = ExtractionError(f"the final pass left memories unreviewed: {keys}; its range remains pending",
+                                counted=True)
+        error.undecided = sorted(item.record.id for item in undecided if item.record is not None)
+        raise error
     kept = [item for item in items if item.status in ("confirmed", "corrected", "added")]
     decisions: dict[int, dict[str, Any]] = {}
     shown: dict[int, list[RecordRow]] = {}
@@ -196,6 +209,9 @@ def settle(memory: Memory, extractor: Any, parts: list[Dossier], *, session: Ses
         with memory.store.transaction():
             if before_apply is not None:
                 before_apply()
+            for item in held_back:
+                provenance.hold(memory.store, item.record, "the final pass deferred its decision repeatedly")
+                report.outcomes["held for source review"] += 1
             _apply(memory, items, kept, decisions, shown, parts, report, run)
             if after_apply is not None:
                 after_apply(report)

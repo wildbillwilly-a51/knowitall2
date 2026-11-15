@@ -179,14 +179,22 @@ class ClaudeCliExtractor:
     @guarded
     def _call(self, command: list[str], text: str, *, cwd: str, timeout: float) -> dict[str, Any]:
         self.last_usage = None
+        self.launch = "starting"
         try:
             completed = self._runner(command, input=text.encode("utf-8"), timeout=timeout, cwd=cwd,
                                      env=engine_environment())
         except subprocess.TimeoutExpired as exc:
+            self.launch = "confirmed"
             raise ExtractionError(f"the Claude CLI timed out after {timeout:.0f} seconds", blocking=True, category="timeout") from exc
         except OSError as exc:
-            raise ExtractionError(f"the Claude CLI could not start: {exc}", blocking=True) from exc
+            # Failing to create the process is no launch; failing after it started (``engine_launched``) is one.
+            started = bool(getattr(exc, "engine_launched", False))
+            self.launch = "confirmed" if started else "none"
+            raise ExtractionError(f"the Claude CLI {'failed while running' if started else 'could not start'}: {exc}",
+                                  blocking=True, attempted=started) from exc
+        self.launch = "confirmed"
         self.last_usage = claude_usage(completed.stdout)
+        self.resolved_model = claude_model(completed.stdout)
         return parse_cli_payload(completed.returncode, completed.stdout, completed.stderr)
 
 
@@ -222,7 +230,7 @@ class CodexCliExtractor:
 
     def __init__(
         self, executable: Path, *, model: str | None = None, timeout: float = 300.0, runner: Runner = run_bounded,
-        effort: str = CODEX_EFFORT,
+        effort: str = CODEX_EFFORT, lean: bool = True,
     ) -> None:
         self.executable = executable
         self.model = model
@@ -230,16 +238,29 @@ class CodexCliExtractor:
         self.timeout = timeout
         self._runner = runner
         self.last_usage: dict[str, float] | None = None
+        # The learning prompt as Codex's base instructions, in place of its coding-agent prompt, with the user's
+        # AGENTS.md, apps, plugins and skill descriptions left out: what a Claude learning call gets (``--system-
+        # prompt`` replaces Claude Code's). A trivial call carried about 16,400 tokens of Codex's own context
+        # before, about 4,100 with it (2026-11-14). For extraction only: exploring needs Codex's tool guidance.
+        # The default since the fairness re-test of 2026-11-14 (docs/research/2026-11-13-learning-joint-review/
+        # retest.md): it lifted gpt-6.1-sol's recall from about 69% to 80-89% of Sonnet's.
+        self.lean = lean
 
     def command(self, *, workspace: Path, schema_path: Path, answer_path: Path, system_prompt: str,
-                preamble: str = CODEX_PREAMBLE) -> list[str]:
+                preamble: str = CODEX_PREAMBLE, instructions_path: Path | None = None) -> list[str]:
+        lean = instructions_path is not None
+        developer = preamble if lean else preamble + "\n\n" + system_prompt
         command = [
             *engine_command(self.executable), "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
             "--skip-git-repo-check", "--sandbox", "read-only", "--disable", "hooks", "--disable", "multi_agent",
             "--color", "never", "-C", str(workspace), "--output-schema", str(schema_path), "-o", str(answer_path),
             "-c", 'approval_policy="never"', "-c", f'model_reasoning_effort="{self.effort}"',
-            "-c", "developer_instructions=" + json.dumps(preamble + "\n\n" + system_prompt, ensure_ascii=False),
+            "-c", "developer_instructions=" + json.dumps(developer, ensure_ascii=False),
         ]
+        if lean:
+            command += ["-c", "model_instructions_file=" + json.dumps(Path(instructions_path).as_posix()),
+                        "-c", "project_doc_max_bytes=0", "--disable", "apps", "--disable", "plugins",
+                        "--enable", "omit_skill_descriptions"]
         if self.model:
             command += ["-m", self.model]
         return command + ["-"]
@@ -253,7 +274,8 @@ class CodexCliExtractor:
             workspace = Path(folder) / "workspace"
             workspace.mkdir()
             return self._call(text, workspace=workspace, scratch=Path(folder), schema=schema,
-                              system_prompt=system_prompt, preamble=CODEX_PREAMBLE, timeout=self.timeout)
+                              system_prompt=system_prompt, preamble=CODEX_PREAMBLE, timeout=self.timeout,
+                              lean=self.lean)
 
     def explore(self, text: str, *, folder: Path, schema: dict[str, Any], system_prompt: str,
                 timeout: float = EXPLORE_TIMEOUT) -> dict[str, Any]:
@@ -265,22 +287,34 @@ class CodexCliExtractor:
 
     @guarded
     def _call(self, text: str, *, workspace: Path, scratch: Path, schema: dict[str, Any], system_prompt: str,
-              preamble: str, timeout: float) -> dict[str, Any]:
+              preamble: str, timeout: float, lean: bool = False) -> dict[str, Any]:
         schema_path = scratch / "schema.json"
         answer_path = scratch / "answer.json"
         schema_path.write_text(json.dumps(strict_schema(schema)), encoding="utf-8")
+        instructions_path = None
+        if lean:
+            instructions_path = scratch / "instructions.md"
+            instructions_path.write_text(system_prompt, encoding="utf-8")
         command = self.command(workspace=workspace, schema_path=schema_path, answer_path=answer_path,
-                               system_prompt=system_prompt, preamble=preamble)
+                               system_prompt=system_prompt, preamble=preamble, instructions_path=instructions_path)
         self.last_usage = None
+        self.launch = "starting"
         try:
             completed = self._runner(command, input=text.encode("utf-8"), timeout=timeout, cwd=str(workspace),
                                      env=codex_engine_environment())
         except subprocess.TimeoutExpired as exc:
+            self.launch = "confirmed"
             raise ExtractionError(f"the Codex CLI timed out after {timeout:.0f} seconds", blocking=True, category="timeout") from exc
         except OSError as exc:
-            raise ExtractionError(f"the Codex CLI could not start: {exc}", blocking=True) from exc
+            # Failing to create the process is no launch; failing after it started (``engine_launched``) is one.
+            started = bool(getattr(exc, "engine_launched", False))
+            self.launch = "confirmed" if started else "none"
+            raise ExtractionError(f"the Codex CLI {'failed while running' if started else 'could not start'}: {exc}",
+                                  blocking=True, attempted=started) from exc
+        self.launch = "confirmed"
         answer = answer_path.read_text(encoding="utf-8", errors="replace") if answer_path.is_file() else ""
         self.last_usage = codex_usage(completed.stderr, completed.stdout)
+        self.resolved_model = codex_model(completed.stderr)
         if completed.returncode != 0 or not answer.strip():
             detail = (_last_line(completed.stderr) or _last_line(completed.stdout)
                       or f"exit code {completed.returncode}")[:200]
@@ -342,9 +376,39 @@ def claude_usage(stdout: bytes) -> dict[str, float] | None:
         ),
         "output_tokens": _count(usage.get("output_tokens")),
     }
+    # The parts of the input, kept apart as well: cached input may count differently toward a plan's limits.
+    for name in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        if _count(usage.get(name)):
+            result[name] = _count(usage.get(name))
     if _count(envelope.get("total_cost_usd"), whole=False):
         result["cost_usd"] = float(envelope["total_cost_usd"])
     return result
+
+
+def claude_model(stdout: bytes) -> str | None:
+    """The model(s) that answered, as a headless Claude Code call names them (``modelUsage``), when it does.
+
+    The configured model may be an alias ("sonnet"); this is what it resolved to.
+    """
+
+    try:
+        envelope = json.loads(stdout.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    models = envelope.get("modelUsage") if isinstance(envelope, dict) else None
+    if not isinstance(models, dict) or not models:
+        return None
+    return ",".join(sorted(str(name)[:80] for name in models))[:200]
+
+
+_CODEX_MODEL = re.compile(rb"^model:\s*(\S+)", re.MULTILINE)
+
+
+def codex_model(stderr: bytes) -> str | None:
+    """The model ``codex exec`` reports in the header it prints, when it prints one."""
+
+    match = _CODEX_MODEL.search(stderr or b"")
+    return match.group(1).decode("utf-8", errors="replace")[:80] if match else None
 
 
 def _count(value: object, *, whole: bool = True) -> float:
@@ -591,14 +655,16 @@ _CODEX_EVERYDAY_WORDS = ("workhorse", "everyday")
 _CODEX_FAST_WORDS = ("affordable", "fast")
 
 
-def codex_default_model(executable: Path, *, runner: Runner = run_bounded) -> str | None:
-    """Codex's listed everyday model, read from its own catalog; None for Codex's default.
+def codex_default_model(executable: Path, *, runner: Runner = run_bounded,
+                        listed: list[dict] | None = None) -> str | None:
+    """Codex's listed everyday model, read from its own catalog (or ``listed``, already read); None for Codex's
+    default.
 
     In a benchmark of six real sessions (2026-09-29), Codex's everyday model at
     medium effort kept about twice what its fast model did, every one accurate.
     """
 
-    listed = codex_listed_models(executable, runner=runner) or []
+    listed = listed if listed is not None else (codex_listed_models(executable, runner=runner) or [])
     for words in (_CODEX_EVERYDAY_WORDS, _CODEX_FAST_WORDS):
         chosen = [model for model in listed if any(word in str(model.get("description", "")).casefold()
                                                    for word in words)]

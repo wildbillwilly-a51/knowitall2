@@ -7,6 +7,7 @@ unreviewed. Other logs can proceed. Only a successful review advances settlement
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -25,8 +26,9 @@ from ..quotes import short_quote_in, too_short, same_statement_text, complete_st
 from ..secrets import contains_secret, redact
 from ..store import RecordRow, StoreError
 from .dossier import Dossier, build_dossiers, file_by_work
+from . import ledger
 from .extractor import ExtractionError, Extractor
-from .state import MAX_FAILURES, LearnerSettings, LearnerState, day_ago
+from .state import MAX_FAILURES, LearnerSettings, LearnerState, chargeable, day_ago
 from .transcripts import line_boundary, read_session
 
 MIN_TEXT_CHARACTERS = 20
@@ -67,6 +69,18 @@ SETTLED_PRINT = "settled:"
 # Background learning sets aside a session quiet for this long, so a backlog cannot grow forever (about 100 sessions
 # waited on 2026-10-11); ``learn --catch-up`` still takes it.
 SET_ASIDE_DAYS = 14
+# A chat of the user's quiet this long and not yet learned is served before newer chats, oldest first, so a steady
+# stream of newer chats cannot hold it back until it is set aside (2026-11-12: Codex chats from November 5 still
+# waited behind newer work). doctor reports learning as behind past the same wait.
+WAITED_LONG_DAYS = 2
+# Marks a session the learner set aside on its own, apart from one the user skipped with --start-from-now.
+SET_ASIDE_AT = "set_aside_at"
+# After this many final passes in a row left the same provisional memories undecided, the next one holds them for
+# source review and the rest of the stretch settles; retrying the whole stretch gave the same answer every time.
+# Only that failure counts: a malformed answer or another error says nothing about those memories (review
+# 2026-11-13).
+HOLD_UNDECIDED_AFTER = 2
+UNDECIDED = "final_undecided"
 # A rule only when the user plainly made one. Anything else the user says about how they want things done is a
 # preference: kept with the work it was about, weighed like any memory, never a question; how often the user
 # says it again is what makes it a lasting preference (the user, 2026-10-11: a single statement in a chat must
@@ -273,6 +287,11 @@ class LearnReport:
     # Each candidate's outcome, with its text (redacted, and none for one that held a secret) and memory ids.
     results: list[dict[str, Any]] = field(default_factory=list)
     set_aside: int = 0
+    # Codex logs Codex compressed that cannot be read here now (no zstd decoder, or a damaged file); kept waiting.
+    unreadable: int = 0
+    # Model calls by the engine that made them, and engines found unusable during the run (routing, plan step 2).
+    engines: Counter = field(default_factory=Counter)
+    engine_blocks: dict[str, str] = field(default_factory=dict)
 
     def describe(self, *, dry_run: bool) -> str:
         lines = [
@@ -287,6 +306,11 @@ class LearnReport:
                          "`knowitall2 learn --catch-up` lists them.")
         if self.held:
             lines.append(f"Transcript checkpoint conflicts held for repair: {len(self.held)}. Other sessions can continue.")
+        if self.unreadable:
+            from .codex_store import DECODER_HINT
+
+            lines.append(f"Compressed Codex logs that cannot be read now: {self.unreadable}; they wait with their "
+                         f"progress kept ({DECODER_HINT}).")
         if dry_run:
             lines.append("Dry run: no model calls were made and nothing was saved.")
             return "\n".join(lines)
@@ -315,8 +339,17 @@ def learn(
     right_away: bool = False,
     quick: bool = False,
     stop_at: int | None = None,
+    origin: str | None = None,
+    engines: Any = None,
 ) -> LearnReport:
     """Learn from each log; ``run`` labels the journal entries of this run.
+
+    ``origin`` is what the calls are charged as: by default "work" for ``right_away`` and "learning" (the
+    background allowance) otherwise; a run the user forced past the daily limit passes "override", so it does
+    not use up the background allowance of the day after (joint review 2026-11-13).
+
+    ``engines`` (``engines.Engines``) chooses each chat's engine by its source (plan step 2); without it every chat
+    learns on ``extractor``. An engine found unusable stops only its own chats, while it is not the last one.
 
     Learning happens twice (the user's choice, 2026-10-13). ``quick`` is the
     quick pass, at a commit or when an agent or the user asks: it reads what
@@ -336,7 +369,7 @@ def learn(
     moment = now or datetime.now(timezone.utc)
     settled_since = moment - timedelta(minutes=settings.settle_minutes)
     calls_today = state.limited_calls_since(day_ago(moment))
-    origin = "work" if right_away else "learning"
+    origin = origin or ("work" if right_away else "learning")
     report = LearnReport(logs=len(logs))
     memory = None if dry_run or memory_factory is None else memory_factory()
     run_seen: set[str] = set()
@@ -344,16 +377,24 @@ def learn(
     def remaining() -> int:
         return min(settings.max_calls_per_run - report.calls, settings.max_calls_per_day - calls_today - report.calls)
 
+    from . import codex_store
+
     try:
         found = []
-        for log in unique_logs(logs):
+        # A Codex log is named by its plain spelling, the identity of its progress, wherever Codex keeps it now.
+        for log in unique_logs([codex_store.canonical(Path(log)) for log in logs]):
             try:
-                found.append((log, log.stat()))
+                found.append((log, codex_store.status(log)))
+            except codex_store.UnreadableLog:
+                report.unreadable += 1
+                continue
             except OSError:
                 continue
         if not right_away:
-            # The newest waiting sessions first; one quiet for weeks is set aside.
-            found.sort(key=lambda item: item[1].st_mtime, reverse=True)
+            # Sessions quiet for WAITED_LONG_DAYS first, longest-waiting first; then the newest. One quiet for
+            # weeks is set aside.
+            # With no budget left nothing is read (every log is deferred), so the order needs no activity read.
+            found.sort(key=_priority(state, moment, read_activity=dry_run or remaining() > 0))
         set_aside_before = moment - timedelta(days=SET_ASIDE_DAYS)
         for log, status in found:
             entry = state.entry(log)
@@ -369,7 +410,14 @@ def learn(
             start = quick_position[0] if quick else int(entry[SETTLED])
             if recovery:
                 from .recovery import prefix_hash
-                if prefix_hash(log, recovery["end"]) != recovery["sha256"]:
+                try:
+                    unchanged = prefix_hash(log, recovery["end"]) == recovery["sha256"]
+                except codex_store.UnreadableLog as exc:
+                    # Its recovery waits, as queued, until it can be read; the other logs go on (review 2026-11-13).
+                    report.unreadable += 1
+                    journal.problem("learning", f"a compressed Codex log could not be read: {exc}")
+                    continue
+                if not unchanged:
                     report.blocked = f"recovery transcript changed: {log}; prepare a new recovery plan"
                     break
                 start = int(recovery["cursor"])
@@ -388,11 +436,17 @@ def learn(
                 if quick or recovery or len(logs) != 1:
                     report.blocked = "a bounded endpoint requires one ordinary final-review source"
                     break
-                with log.open("rb") as boundary:
-                    boundary.seek(stop_at - 1)
-                    if boundary.read(1) != b"\n":
-                        report.blocked = "bounded review must stop on a complete transcript line"
-                        break
+                try:
+                    with codex_store.open_log(log) as boundary:
+                        boundary.seek(stop_at - 1)
+                        on_line = boundary.read(1) == b"\n"
+                except codex_store.UnreadableLog as exc:
+                    report.unreadable += 1
+                    report.blocked = f"the bounded review's transcript cannot be read now: {exc}"
+                    break
+                if not on_line:
+                    report.blocked = "bounded review must stop on a complete transcript line"
+                    break
             if status.st_size <= start:
                 continue
             if not dry_run and remaining() <= 0:
@@ -409,12 +463,20 @@ def learn(
             if not recovery and not right_away and active_at > settled_since:
                 report.active += 1
                 continue
+            # Set-aside is for a log never started; one learning already began resumes where it is, since setting it
+            # aside would lose its place and catching up would read it again from the start (review 2026-11-13).
             if (not recovery and not right_away and active_at < set_aside_before and not entry.get("caught_up_at")
-                    and _set_aside(entry, log, moment)):
+                    and not _started(entry) and _set_aside(entry, log, moment, missed=_missed(entry, active_at))):
                 report.set_aside += 1
                 continue
             # Catching up on a set-aside part reads only that part (``learn_to``); what came after was learned.
-            session, end = read_session(log, start=start, stop=recovery["end"] if recovery else stop_at or int(entry.get(LEARN_TO) or 0) or None)
+            try:
+                session, end = read_session(log, start=start, stop=recovery["end"] if recovery else stop_at or int(entry.get(LEARN_TO) or 0) or None)
+            except codex_store.UnreadableLog as exc:
+                # Kept as it is, never read as empty: it is learned once it can be read; doctor says what is missing.
+                report.unreadable += 1
+                journal.problem("learning", f"a compressed Codex log could not be read: {exc}")
+                continue
             event_index = int(recovery["cursor_event_index"] if recovery else quick_position[1] if quick else entry.get(SETTLED_EVENT_INDEX, 0))
             session.events = [event for event in session.events if event.start != start or event.index >= event_index]
             dossiers = build_dossiers(session, require_user=start == 0 and event_index == 0,
@@ -468,46 +530,74 @@ def learn(
                     continue
                 _finish(entry, session.session_id, end, moment, settled=not quick)
                 continue
-            if extractor is None:
+            if extractor is None and engines is None:
                 raise ExtractionError("no extractor is configured")
             assert memory is not None
+            # What the calls for this stretch are, in the call ledger: one unit of work, from the chat it reads.
+            work_context = {"purpose": f"transcript-{phase}", "origin": origin, "session": session.session_id,
+                            "source": session.agent, "run": run, "work": f"{session.session_id}@{start}"}
             if not quick and duplicates:
                 # The same stretch was settled already, from another copy of the log.
                 report.outcomes["duplicate dossier"] += len(dossiers)
                 _finish(entry, session.session_id, end, moment, settled=True,
                         event_index=dossiers[-1].end_event_index if dossiers else 0)
                 continue
+            route = engines.for_source(session.agent) if engines is not None else None
+            engine = route.engine if route is not None else extractor
+            if route is not None:
+                work_context.update(preferred_engine=route.preferred or "unresolved", route_reason=route.reason)
+                if engine is None:
+                    # Its engine cannot learn now (unusable in this run, or not installed): the chat waits with its
+                    # place kept, while chats on the other engine go on.
+                    with ledger.context(**work_context):
+                        ledger.deferred(reason=route.reason, category="engine unavailable")
+                    report.deferred += 1
+                    continue
+            if engine is None:
+                raise ExtractionError("no extractor is configured")
             if not quick:
                 if settings.max_calls_per_day - calls_today - report.calls < needed_calls(dossiers):
                     # A stretch is settled whole or not at all; it waits for the calls it needs.
                     report.deferred += 1
                     continue
-                made: list[int] = []
+                made: list[Any] = []   # each call's ledger id, in order
 
                 def counted() -> None:
-                    made.append(1)
-                    state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="ok", origin=origin)
+                    made.append(getattr(engine, "last_attempt", None))
+                    state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="ok",
+                                      origin=origin, attempt=made[-1])
 
                 try:
-                    settled = settle(memory, extractor, dossiers, session=session, run=run, on_call=counted,
-                                     partial=partial or bool(entry.get(LEARN_TO)), recovery=bool(recovery),
-                                     review_start=(start, event_index))
+                    with ledger.context(**work_context):
+                        settled = settle(memory, engine, dossiers, session=session, run=run, on_call=counted,
+                                         partial=partial or bool(entry.get(LEARN_TO)), recovery=bool(recovery),
+                                         review_start=(start, event_index),
+                                         hold_undecided=not recovery and _repeatedly_undecided(entry))
                 except ExtractionError as exc:
                     report.calls += len(made)
                     if exc.blocking:
                         # The backend itself is unusable: blame no session, stop the run.
                         _pending_review(entry, phase, start, event_index, end, dossiers[-1].end_event_index,
                                         session.session_id, moment, exc)
+                        if _engine_blocked(engines, engine, exc, report):
+                            continue
                         report.blocked = str(exc)
                         break
                     journal.problem("learning", f"a final pass failed for session {session.session_id}: {exc}")
-                    # Validation may fail after settle already counted the completed request.
-                    if not exc.counted:
+                    # Validation may fail after settle already counted the completed request. A refusal before any
+                    # call (a memory whose source review is pending) is no call at all (joint review 2026-11-13).
+                    if not exc.attempted:
+                        with ledger.context(**work_context):
+                            ledger.deferred(reason=str(exc), category="provenance")
+                    elif not exc.counted and chargeable(exc):
                         report.calls += 1
-                        state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="failed", origin=origin)
+                        state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="failed",
+                                          origin=origin, attempt=getattr(engine, "last_attempt", None))
                     entry[f"{phase}_failures"] = int(entry.get(f"{phase}_failures", 0)) + 1
                     entry["last_error"] = str(exc)[:300]
                     entry["updated_at"] = moment.isoformat()
+                    if not recovery and getattr(exc, "undecided", None):
+                        _note_undecided(entry, exc.undecided)
                     _pending_review(entry, phase, start, event_index, end, dossiers[-1].end_event_index,
                                     session.session_id, moment, exc)
                     entry["status"] = "failed"
@@ -519,8 +609,11 @@ def learn(
                     journal.problem("learning", f"learning stopped because the memory store failed: {exc}")
                     break
                 report.calls += settled.calls
+                report.engines[getattr(engine, "name", "engine")] += settled.calls
                 report.usage.update(settled.usage)
                 report.outcomes.update(settled.outcomes)
+                with ledger.context(**work_context):
+                    ledger.work_result(made, calls=settled.calls, outcomes=dict(settled.outcomes))
                 report.results.extend(settled.results)
                 for mark in prints:
                     state.mark_seen(mark)
@@ -547,17 +640,25 @@ def learn(
                     current = dossier
                     dossier.known = known_context(memory, dossier)
                     try:
-                        candidates = extractor.extract(dossier)
+                        with ledger.context(**work_context):
+                            candidates = engine.extract(dossier)
                     finally:
-                        report.usage.update(getattr(extractor, "last_usage", None) or {})
+                        report.usage.update(getattr(engine, "last_usage", None) or {})
+                    attempt = getattr(engine, "last_attempt", None)
                     budget -= 1
                     report.calls += 1
-                    state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="ok", origin=origin)
+                    report.engines[getattr(engine, "name", "engine")] += 1
+                    state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="ok",
+                                      origin=origin, attempt=attempt)
+                    published: Counter = Counter()
                     for candidate in candidates:
                         outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run, provisional=True)
                         report.outcomes[outcome] += 1
+                        published[outcome] += 1
                         report.results.append({"outcome": outcome, "ids": record_ids,
                                                "text": result_text(outcome, candidate)})
+                    with ledger.context(**work_context):
+                        ledger.result(attempt, candidates=len(candidates), outcomes=dict(published))
                     state.mark_seen(dossier.fingerprint)
                     run_seen.add(dossier.fingerprint)
                     progress = _checkpoint(dossier)
@@ -568,11 +669,15 @@ def learn(
                     # The backend itself is unusable: keep progress, blame no session, stop the run.
                     _pending_review(entry, phase, int(entry.get("offset", start)), int(entry.get("event_index", 0)),
                                     end, dossiers[-1].end_event_index, session.session_id, moment, exc)
+                    if _engine_blocked(engines, engine, exc, report):
+                        continue
                     report.blocked = str(exc)
                     break
                 journal.problem("learning", f"a learning call failed for session {session.session_id}: {exc}")
-                report.calls += 1
-                state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="failed", origin=origin)
+                if chargeable(exc):
+                    report.calls += 1
+                    state.record_call(at=datetime.now(timezone.utc), session=session.session_id, outcome="failed",
+                                      origin=origin, attempt=getattr(engine, "last_attempt", None))
                 # Only failures in a row count: a run that got further first starts the count again.
                 entry["failures"] = 1 if progress is not None else int(entry.get("failures", 0)) + 1
                 entry["last_error"] = str(exc)[:300]
@@ -604,6 +709,20 @@ def learn(
         if not dry_run:
             state.save()
     return report
+
+
+def _engine_blocked(engines: Any, engine: Any, error: ExtractionError, report: LearnReport) -> bool:
+    """Whether the run goes on without ``engine``, now unusable: True while another engine can still learn."""
+
+    if engines is None:
+        return False
+    name = getattr(engine, "name", "engine")
+    engines.block(name, str(error))
+    report.engine_blocks[name] = str(error)[:300]
+    if engines.all_blocked():
+        return False
+    report.deferred += 1   # this chat waits for its engine, with its place kept
+    return True
 
 
 def result_text(outcome: str, candidate: dict[str, Any]) -> str | None:
@@ -1378,9 +1497,90 @@ def _same_word(first: str, second: str) -> bool:
     return len(shorter) >= _WORD_PREFIX_MINIMUM and longer.startswith(shorter)
 
 
-def _set_aside(entry: dict[str, Any], log: Path, moment: datetime) -> bool:
+def _missed(entry: dict[str, Any], active_at: datetime) -> bool:
+    """Whether learning saw this log while it was recent enough to learn, so setting it aside means it missed it.
+
+    An entry from before ``seen_at`` was kept (0.12.10) was known to learning. One first seen when the log was
+    already SET_ASIDE_DAYS quiet is history from before KnowItAll2 looked (such as Codex logs compressed before it
+    was installed), however many runs since have deferred it for want of budget."""
+
+    from .state import SEEN_AT
+
+    seen = entry.get(SEEN_AT)
+    if not seen:
+        return True
+    try:
+        first = datetime.fromisoformat(seen)
+    except (TypeError, ValueError):
+        return True
+    first = first if first.tzinfo else first.replace(tzinfo=timezone.utc)
+    return first - active_at < timedelta(days=SET_ASIDE_DAYS)
+
+
+def _started(entry: dict[str, Any]) -> bool:
+    """Whether learning has begun on a log: some of it was read, or a review of it is pending."""
+
+    return bool(int(entry.get("offset", 0) or 0) or int(entry.get(SETTLED, 0) or 0) or entry.get("pending_reviews")
+                or int(entry.get("event_index", 0) or 0))
+
+
+def _note_undecided(entry: dict[str, Any], ids: list[str]) -> None:
+    """Count final passes of this stretch that left memories undecided, and every memory any of them left.
+
+    Which memories the model leaves undecided varies from pass to pass (2026-11-13, one chat: {p10}, then
+    {p10, p11, p12}, then {p7, p8, p10}), so requiring the same ones each time never held anything; repeated
+    indecision over the stretch is what counts. Other failures neither count nor reset (review 2026-11-13)."""
+
+    previous = entry.get(UNDECIDED) if isinstance(entry.get(UNDECIDED), dict) else {}
+    seen = sorted(set(previous.get("ids") or []) | set(ids))
+    entry[UNDECIDED] = {"ids": seen, "count": int(previous.get("count", 0)) + 1}
+
+
+def _repeatedly_undecided(entry: dict[str, Any]) -> bool:
+    """Whether this stretch's final pass may hold what it leaves undecided: it did so HOLD_UNDECIDED_AFTER times."""
+
+    noted = entry.get(UNDECIDED) if isinstance(entry.get(UNDECIDED), dict) else {}
+    return int(noted.get("count", 0)) >= HOLD_UNDECIDED_AFTER
+
+
+def _priority(state: LearnerState, moment: datetime, *,
+              read_activity: bool = True) -> Callable[[tuple[Path, os.stat_result]], tuple[int, float]]:
+    """The order background learning takes logs in: those quiet for WAITED_LONG_DAYS with work left, longest-quiet
+    first; then the rest, newest first.
+
+    Windows leaves an open log's mtime behind its activity, so an old-looking log with work left is placed by when
+    it was last written to (``session_activity``), or a chat used again lately would go ahead of one that has truly
+    waited (review 2026-11-12). Only logs with work left are read, and only a 64 KiB tail of each.
+    """
+
+    from .log_identity import path_key
+    from .transcripts import session_activity
+
+    waited_long = (moment - timedelta(days=WAITED_LONG_DAYS)).timestamp()
+    settled: dict[str, int] = {}
+    for name, entry in state.logs.items():
+        settled[path_key(name)] = int(entry.get(SETTLED, entry.get("offset", 0)) or 0)
+    for alias, canonical in state.log_aliases.items():
+        if canonical in state.logs:
+            settled[alias] = int(state.logs[canonical].get(SETTLED, state.logs[canonical].get("offset", 0)) or 0)
+
+    def key(item: tuple[Path, os.stat_result]) -> tuple[int, float]:
+        log, status = item
+        quiet = status.st_mtime
+        if read_activity and quiet < waited_long and status.st_size > settled.get(path_key(log), 0):
+            quiet = session_activity(log, modified=quiet, now=moment)
+        return (0, quiet) if quiet < waited_long else (1, -quiet)
+
+    return key
+
+
+def _set_aside(entry: dict[str, Any], log: Path, moment: datetime, *, missed: bool = True) -> bool:
     """Set aside what is waiting in ``log``, the way ``learn --start-from-now`` does, for catching up later; False
-    when no whole line waits."""
+    when no whole line waits.
+
+    ``missed``: learning knew the log before and did not get to it in time, so it is stamped and doctor reports
+    it. A log first seen already this old (history from before KnowItAll2, such as Codex logs compressed before it
+    was installed, found on 2026-11-13) is set aside as the history it is, without the stamp."""
 
     from .catchup import SET_ASIDE_TO, SKIPPED
 
@@ -1392,6 +1592,8 @@ def _set_aside(entry: dict[str, Any], log: Path, moment: datetime) -> bool:
         return False
     entry.update({"offset": end, "event_index": 0, SETTLED: end, SETTLED_EVENT_INDEX: 0, "status": SKIPPED, SET_ASIDE_TO: end, "failures": 0,
                   "updated_at": moment.isoformat()})
+    if missed:
+        entry[SET_ASIDE_AT] = moment.isoformat()
     return True
 
 
@@ -1408,6 +1610,13 @@ def _finish_recovery(entry, item, end, event_index):
     if end >= item["end"]:
         entry.setdefault("recovery_completed", []).append(item["id"])
         entry["recovery_ranges"].remove(item)
+        from .catchup import SET_ASIDE_TO
+
+        bound = int(entry.get(SET_ASIDE_TO) or 0)
+        if bound and int(item.get("start", 0)) == 0 and item["end"] >= bound and not entry.get("caught_up_at"):
+            # The set-aside part was reviewed from its start: it is caught up, as `learn --catch-up` would leave it,
+            # so doctor no longer counts it as set aside unlearned (2026-11-13: 18 recovered chats still were).
+            entry["caught_up_at"] = datetime.now(timezone.utc).isoformat()
 
 
 def _pending_review(entry, phase, start, event_index, end, end_index, session_id, moment, error):
@@ -1448,6 +1657,7 @@ def _finish(entry: dict[str, Any], session_id: str, end: int, moment: datetime, 
         previous = (int(entry.get("offset", 0)), int(entry.get("event_index", 0)))
         end, event_index = max((end, event_index), previous)
         entry["final_failures"] = 0
+        entry.pop(UNDECIDED, None)
         entry.pop("final_last_error", None)
         entry.pop("final_retry_at", None)
         entry.get("pending_reviews", {}).pop("final", None)

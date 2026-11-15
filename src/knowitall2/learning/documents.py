@@ -25,7 +25,8 @@ from ..identity import ProjectIdentity
 from ..secrets import redact
 from .dossier import MAX_DOSSIER_CHARACTERS, Dossier
 from .learner import LearnReport, ReadySession, known_context, publish_with_ids, result_text
-from .state import LearnerState
+from . import ledger
+from .state import LearnerState, chargeable
 from .transcripts import DOCUMENT_SUFFIXES
 
 AGENT = "documents"
@@ -158,10 +159,13 @@ def learn(memory, state: LearnerState, extractor, dossiers: list[Dossier], *, ma
                 continue
             dossier.known = known_context(memory, dossier)
             try:
-                candidates = extractor.extract(dossier)
+                with ledger.context(purpose="documents", origin="user", mode="user", session=dossier.session_id):
+                    candidates = extractor.extract(dossier)
             except ExtractionError as exc:
-                report.calls += 1
-                state.record_call(at=datetime.now(timezone.utc), session=dossier.session_id, outcome="failed", origin="user")
+                if chargeable(exc):
+                    report.calls += 1
+                    state.record_call(at=datetime.now(timezone.utc), session=dossier.session_id, outcome="failed",
+                                      origin="user", attempt=getattr(extractor, "last_attempt", None))
                 if exc.blocking:
                     report.blocked = str(exc)
                     break
@@ -170,7 +174,8 @@ def learn(memory, state: LearnerState, extractor, dossiers: list[Dossier], *, ma
             finally:
                 report.usage.update(getattr(extractor, "last_usage", None) or {})
             report.calls += 1
-            state.record_call(at=datetime.now(timezone.utc), session=dossier.session_id, outcome="ok", origin="user")
+            state.record_call(at=datetime.now(timezone.utc), session=dossier.session_id, outcome="ok", origin="user",
+                              attempt=getattr(extractor, "last_attempt", None))
             for candidate in candidates:
                 outcome, record_ids = publish_with_ids(memory, candidate, dossier, run=run)
                 report.outcomes[outcome] += 1

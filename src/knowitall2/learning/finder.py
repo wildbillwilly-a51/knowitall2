@@ -247,23 +247,28 @@ def _run(store: Store, system_id: str, engine: Any) -> dict[str, Any]:
                 "message": f"No project folder for {system['name']} is known on this computer, so agents working "
                            "with it will be asked instead."}
     if engine is None:
-        from .command import build_engine
+        from .command import primary_engine
         from .state import load_settings
 
         settings = load_settings()
-        engine = build_engine(settings.backend, settings.model)
+        engine = primary_engine(settings)
         if engine is None:
             return {"status": "failed", "folder": folder.name,
                     "message": "No Claude Code or Codex engine was found on this computer."}
-    from .state import record_other_call
+    from . import ledger
+    from .state import chargeable, record_other_call
 
     try:
-        payload = engine.explore(render(system, shown, items), folder=folder, schema=FIND_SCHEMA,
-                                 system_prompt=FIND_PROMPT)
+        with ledger.context(purpose="finder", origin="user", mode="user"):
+            payload = engine.explore(render(system, shown, items), folder=folder, schema=FIND_SCHEMA,
+                                     system_prompt=FIND_PROMPT)
     except ExtractionError as exc:
-        record_other_call("find out")
+        # Only a call the engine made and failed counts; a refusal before launch or an unavailable engine does not
+        # (it was counted as a completed call before; joint review 2026-11-13).
+        if chargeable(exc):
+            record_other_call("find out", outcome="failed", attempt=getattr(engine, "last_attempt", None))
         return {"status": "failed", "folder": folder.name, "message": f"The agent could not look: {exc}"}
-    record_other_call("find out")
+    record_other_call("find out", attempt=getattr(engine, "last_attempt", None))
     parts = {item["key"]: item for item in items}
     found, turned_down, filled = [], [], set()
     for answer in payload.get("found") or []:

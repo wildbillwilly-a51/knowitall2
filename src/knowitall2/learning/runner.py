@@ -139,12 +139,18 @@ def run_bounded(command: list[str], *, input: bytes | None = None, timeout: floa
         if input is not None:
             _feed(process, input)
         stdout, stderr = process.communicate(timeout=timeout)
-    except BaseException:  # the time limit, or an interruption
+    except BaseException as exc:  # the time limit, or an interruption
+        try:
+            exc.engine_launched = True   # the process had started: the call ledger must not record "never ran"
+        except AttributeError:
+            pass
         _stop_tree(process, job)
         try:
             process.communicate(timeout=STOP_WAIT)
-        except subprocess.TimeoutExpired:
-            pass  # something outside the tree still holds the output
+        except Exception:
+            # Something outside the tree still holds the output, or the pipe broke: the first error is the one
+            # raised, with its mark that the process had started.
+            pass
         raise
     finally:
         if job is not None:

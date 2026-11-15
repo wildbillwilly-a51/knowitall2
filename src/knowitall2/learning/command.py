@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import re
 import sqlite3
 import sys
@@ -19,7 +20,7 @@ from ..connected import maintenance_turn, renew_maintenance_turn, share_quietly
 from ..memory import Memory
 from ..paths import database_path
 from ..store import Store, StoreError
-from . import moments
+from . import ledger, moments
 from .dossier import build_dossiers
 from .extractor import (
     ClaudeCliExtractor,
@@ -37,7 +38,7 @@ from .tool_rules import GROUPS_PER_CALL as RULE_GROUPS, RuleReport, write_rules
 from .tool_rules import RULES_AGENT, retire_orphans
 from .tool_rules import waiting as rules_waiting
 from .cataloguer import plan as catalog_plan
-from .learner import LEARNER_AGENT, SET_ASIDE_DAYS, LearnReport, learn
+from .learner import LEARNER_AGENT, SET_ASIDE_DAYS, SETTLED, SETTLED_EVENT_INDEX, LearnReport, learn
 from .maintenance import MAINTENANCE_AGENT, EngineReviewer, MaintenanceReport, maintain, retire_old_status
 from .settle import confirm_stale
 from .state import (
@@ -65,6 +66,8 @@ def run_learn(arguments: argparse.Namespace) -> int:
     settings = load_settings()
     if arguments.enable or arguments.disable:
         return _set_learning(settings, arguments)
+    if any(getattr(arguments, name, None) is not None for name in _ROUTING_OPTIONS):
+        return _set_routing(settings, arguments)
     if arguments.status:
         print(_status(settings))
         return 0
@@ -92,23 +95,26 @@ def run_learn(arguments: argparse.Namespace) -> int:
             "`knowitall2 learn --show <session>`, then turn it on with `knowitall2 learn --enable`."
         )
         return 0
-    extractor = build_engine(settings.backend, arguments.model or settings.model)
+    extractor = primary_engine(settings, arguments.model)
     if extractor is None:
-        message = f"no {_engine_name(settings.backend)} engine was found, so nothing can be learned yet."
+        message = "neither Claude Code nor Codex was found, so nothing can be learned yet."
         journal.problem("learning", message)
-        _tell_waiting_requests(settings, f"no {_engine_name(settings.backend)} engine was found on this computer")
+        _tell_waiting_requests(settings, "neither Claude Code nor Codex was found on this computer")
         print(f"knowitall2: {message}", file=sys.stderr)
         return 1
     extractor.retry_backend_once = bool(getattr(arguments, "retry_backend", False))
-    if getattr(arguments, "ignore_daily_limit", False):
-        # The user chose to learn what is waiting now: one run without the daily limit.
+    override = bool(getattr(arguments, "ignore_daily_limit", False))
+    if override:
+        # The user chose to learn what is waiting now: one run without the daily limit. Its calls are charged as
+        # "override", not to the background allowance, which they used to fill for the next 24 hours (2026-11-13:
+        # background learning stopped for a day after a catch-up).
         settings = work_limits(settings)
     try:
         sweep = not getattr(arguments, "requests", False)
         for _ in range(_REQUEST_ROUNDS):
             with RunLock():
                 try:
-                    _learn_once(settings, extractor, sweep=sweep)
+                    _learn_once(settings, extractor, sweep=sweep, override=override)
                 finally:
                     moments.set_now(None)
             # A request that arrived while the lock was held is learned before stopping.
@@ -133,9 +139,21 @@ _REQUEST_ROUNDS = 20
 _REASON_ORDER = ("asked", "commit", "finished", "session end")
 
 
-def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
-    """Learn the requested sessions; then, for ``sweep``, finished sessions, maintenance, and the catalog."""
+def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool, override: bool = False) -> None:
+    """Learn the requested sessions; then, for ``sweep``, finished sessions, maintenance, and the catalog.
 
+    ``override``: the user forced this run past the daily limit; its sweep is charged as "override". Each chat
+    learns on the engine its source qualifies for (``engines``, plan step 2); upkeep stays on ``extractor``, the
+    primary engine.
+    """
+
+    from .engines import Engines
+
+    with ledger.context(mode="override" if override else "background"):
+        _learn_once_now(settings, extractor, sweep=sweep, override=override, engines=Engines(settings, extractor))
+
+
+def _learn_once_now(settings: LearnerSettings, extractor, *, sweep: bool, override: bool, engines=None) -> None:
     state = LearnerState()
     store = Store.open(database_path())
     try:
@@ -144,15 +162,18 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
             reset_reviews(store, state)
         # When connected to a server: learn knowing what other computers already learned.
         share_quietly(store)
-        requested = learn_requests(store, state, settings, extractor)
+        requested = learn_requests(store, state, settings, extractor, engines=engines)
         if not sweep or requested.blocked:
             if requested.saved and not requested.blocked:
-                # File what was just learned, so "What it knows" shows it: part of the work, not of upkeep.
+                # File what was just learned, so "What it knows" shows it: part of the work, not of upkeep, and on
+                # the engine that learned it (the plan's attached upkeep; the primary when several engines did).
                 moments.set_now({"since": moments.now_iso(), "doing": "filing what it learned"})
                 run = new_run_id()
-                filing = run_catalog(memory=Memory(store, agent=CATALOG_AGENT), engine=extractor, state=state,
-                                     run=run, budget=min(2, _remaining_budget(work_limits(settings), state, used=0)),
-                                     origin="work")
+                filer = _attached_engine(engines, requested.engines) or _upkeep_engine(engines, extractor)
+                with ledger.context(mode="work-request", trigger="filing after work"):
+                    filing = run_catalog(memory=Memory(store, agent=CATALOG_AGENT), engine=filer, state=state,
+                                         run=run, budget=min(2, _remaining_budget(work_limits(settings), state, used=0)),
+                                         origin="work")
                 if filing.calls:
                     journal.record(store, "catalog", filing.describe(), outcome="stopped" if filing.blocked else "ok",
                                    agent=CATALOG_AGENT, run=run, details=filing.details())
@@ -164,12 +185,14 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
         started = time.monotonic()
         moments.set_now({"since": moments.now_iso(), "doing": "learning from sessions that ended without being learned",
                          "reason": "catch-up"})
-        report = learn(
-            logs=list(dict.fromkeys([*session_logs(), *(Path(entry.get("log_path", path)) for path, entry in state.logs.items()
-                                                       if entry.get("recovery_ranges"))])), state=state, settings=settings,
-            memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
-            extractor=extractor, dry_run=False, run=run,
-        )
+        with ledger.context(trigger="sweep"):
+            report = learn(
+                logs=list(dict.fromkeys([*session_logs(), *(Path(entry.get("log_path", path)) for path, entry in state.logs.items()
+                                                           if entry.get("recovery_ranges"))])), state=state, settings=settings,
+                memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
+                extractor=extractor, dry_run=False, run=run, origin="override" if override else None,
+                engines=engines,
+            )
         print(report.describe(dry_run=False))
         if report.calls or report.blocked or report.held:
             moments.add_news(news_entry(report, settings, reason="catch-up", run=run, requests=[]))
@@ -180,7 +203,9 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
                       exclude_sessions=pending_sessions)
         retire_old_status(Memory(store, agent=MAINTENANCE_AGENT))
         upkeep = filing = None
-        if not report.blocked:
+        # Upkeep runs on the primary engine, or on the other one when the primary cannot run now.
+        worker = _upkeep_engine(engines, extractor)
+        if not report.blocked and worker is not None:
             share_quietly(store)
             with maintenance_turn() as ours:
                 if ours:
@@ -189,7 +214,7 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
                     # (2026-10-11).
                     moments.set_now({"since": moments.now_iso(), "doing": "tidying up memories"})
                     upkeep = maintain(
-                        memory=Memory(store, agent=MAINTENANCE_AGENT), reviewer=EngineReviewer(extractor),
+                        memory=Memory(store, agent=MAINTENANCE_AGENT), reviewer=EngineReviewer(worker),
                         state=state, budget=_upkeep_budget(settings, state, "maintenance"), dry_run=False, run=run,
                     )
                     print(upkeep.describe(dry_run=False))
@@ -197,16 +222,16 @@ def _learn_once(settings: LearnerSettings, extractor, *, sweep: bool) -> None:
                     if not upkeep.blocked and renew_maintenance_turn():
                         moments.set_now({"since": moments.now_iso(), "doing": "filing memories under systems"})
                         filing = run_catalog(
-                            memory=Memory(store, agent=CATALOG_AGENT), engine=extractor, state=state, run=run,
+                            memory=Memory(store, agent=CATALOG_AGENT), engine=worker, state=state, run=run,
                             budget=_upkeep_budget(settings, state, "catalog"),
                         )
                         print(filing.describe())
                         if not filing.blocked:
-                            tagging = tag_waiting_commands(store, extractor, state=state, run=run, budget=min(
+                            tagging = tag_waiting_commands(store, worker, state=state, run=run, budget=min(
                                 COMMAND_CALLS_PER_RUN, _upkeep_budget(settings, state, "commands")))
                             # Then the rules, from the lessons just tagged, under the same calls a day.
                             if not tagging.blocked:
-                                write_waiting_rules(store, extractor, state=state, run=run, budget=min(
+                                write_waiting_rules(store, worker, state=state, run=run, budget=min(
                                     RULE_CALLS_PER_RUN, _upkeep_budget(settings, state, "commands")))
                 else:
                     print("Another computer sharing this memory is tidying it up, or the server cannot be "
@@ -253,7 +278,8 @@ def tag_waiting_commands(store: Store, engine: Any, *, state: LearnerState, run:
     if budget <= 0:
         return TagReport()
     moments.set_now({"since": moments.now_iso(), "doing": "noting which commands lessons are about"})
-    report = tag_commands(store, engine, budget=budget, now=journal.utc_now(), state=state, origin=origin)
+    with ledger.context(run=run):
+        report = tag_commands(store, engine, budget=budget, now=journal.utc_now(), state=state, origin=origin)
     print(report.describe())
     if report.calls or report.blocked:
         journal.record(store, "catalog", report.describe(), outcome="stopped" if report.blocked else "ok",
@@ -276,7 +302,8 @@ def write_waiting_rules(store: Store, engine: Any, *, state: LearnerState, run: 
     if budget <= 0:
         return RuleReport(retired=len(retired))
     moments.set_now({"since": moments.now_iso(), "doing": "writing tool rules from lessons learned in several chats"})
-    report = write_rules(store, engine, budget=budget, now=journal.utc_now(), state=state, origin=origin)
+    with ledger.context(run=run):
+        report = write_rules(store, engine, budget=budget, now=journal.utc_now(), state=state, origin=origin)
     print(report.describe())
     if report.calls or report.blocked:
         journal.record(store, "catalog", report.describe(), outcome="stopped" if report.blocked else "ok",
@@ -324,9 +351,21 @@ class RequestsReport:
         self.calls = 0
         self.saved = 0
         self.blocked: str | None = None
+        self.engines: Counter = Counter()   # model calls by engine, for filing on the engine that learned
 
 
-def learn_requests(store, state: LearnerState, settings: LearnerSettings, extractor) -> RequestsReport:
+def _attached_engine(engines, used: Counter):
+    """The one engine the requests learned on, when it can file now; None otherwise (the primary files)."""
+
+    if engines is None or len(used) != 1:
+        return None
+    [name] = used
+    if name in engines.blocked:
+        return None
+    return engines.primary if getattr(engines.primary, "name", None) == name else engines.built(name)
+
+
+def learn_requests(store, state: LearnerState, settings: LearnerSettings, extractor, *, engines=None) -> RequestsReport:
     """Learn each requested session right away, and write news of each for the user.
 
     When the engine itself is unusable, every waiting request gets news of
@@ -360,11 +399,12 @@ def learn_requests(store, state: LearnerState, settings: LearnerSettings, extrac
         quick = not any(item.get("reason") == "session end" for item in group)
         moments.set_now({"since": moments.now_iso(), "doing": "learning from a session", "reason": chosen["reason"],
                          "detail": detail, "folder": chosen.get("cwd") or "", "agent": chosen.get("agent") or ""})
-        report = learn(
-            logs=[Path(chosen["transcript"])], state=state, settings=limits,
-            memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
-            extractor=extractor, dry_run=False, run=run, right_away=True, quick=quick,
-        )
+        with ledger.context(mode="work-request", trigger=chosen.get("reason")):
+            report = learn(
+                logs=[Path(chosen["transcript"])], state=state, settings=limits,
+                memory_factory=lambda: Memory(store, agent=LEARNER_AGENT, record_events=False),
+                extractor=extractor, dry_run=False, run=run, right_away=True, quick=quick, engines=engines,
+            )
         print(report.describe(dry_run=False))
         entry = moments.add_news(news_entry(report, settings, reason=chosen["reason"], detail=detail, run=run,
                                             requests=group))
@@ -372,6 +412,7 @@ def learn_requests(store, state: LearnerState, settings: LearnerSettings, extrac
                             trigger={"reason": chosen["reason"], "detail": detail, "news": entry["id"]})
         moments.done_with(group)
         summary.calls += report.calls
+        summary.engines.update({name: count for name, count in report.engines.items() if count})
         summary.saved += len(entry["saved"]) + len(entry["updated"])
         summary.blocked = report.blocked
     return summary
@@ -395,7 +436,7 @@ def news_entry(report: LearnReport, settings: LearnerSettings, *, reason: str, r
             known += 1
         elif outcome.startswith("rejected"):
             turned_down.append({"text": item["text"], "reason": outcome[len("rejected ("):-1]})
-    if report.blocked:
+    if report.blocked or (report.engine_blocks and not report.calls):
         status = "stopped"
     elif not report.calls and report.deferred:
         status = "limit"
@@ -426,6 +467,9 @@ def news_entry(report: LearnReport, settings: LearnerSettings, *, reason: str, r
     }
     if report.blocked:
         entry["problem"] = report.blocked
+    elif report.engine_blocks:
+        # One engine was unusable: its chats wait for a later run while the other engine's went on.
+        entry["problem"] = "; ".join(f"{name}: {reason}" for name, reason in report.engine_blocks.items())[:300]
     elif report.failed or report.skipped:
         entry["problem"] = "a learning call failed; it will be tried again"
     return entry
@@ -476,6 +520,10 @@ def record_learning_run(store, run: str, report: LearnReport, upkeep: Maintenanc
         "blocked": report.blocked, "held": report.held, "engine": engine.name, "model": getattr(engine, "model", None) or "",
         "seconds": round(seconds, 1), "usage": dict(report.usage), "set_aside": report.set_aside,
     }
+    if report.engines:
+        details["engines"] = dict(report.engines)   # model calls by the engine that made them (routing, step 2)
+    if report.engine_blocks:
+        details["engine_blocks"] = dict(report.engine_blocks)
     if trigger is not None:
         details["trigger"] = trigger
     if upkeep is not None:
@@ -526,13 +574,13 @@ def run_catalog_command(arguments: argparse.Namespace) -> int:
         print("Learning is off, and the catalog uses the same model calls. Preview it with "
               "`knowitall2 catalog --dry-run`, or turn learning on with `knowitall2 learn --enable`.")
         return 0
-    engine = build_engine(settings.backend, settings.model)
+    engine = primary_engine(settings)
     if engine is None:
-        print(f"knowitall2: no {_engine_name(settings.backend)} engine was found.", file=sys.stderr)
+        print("knowitall2: neither Claude Code nor Codex was found.", file=sys.stderr)
         return 1
     run = new_run_id()
     try:
-        with maintenance_turn() as ours:
+        with maintenance_turn() as ours, ledger.context(mode="user", trigger="catalog command"):
             if not ours:
                 print("Another computer sharing this memory is tidying it up, or the server cannot be reached; "
                       "try again later.")
@@ -594,10 +642,9 @@ def run_maintain(arguments: argparse.Namespace) -> int:
             "`knowitall2 maintain --dry-run`, or turn learning on with `knowitall2 learn --enable`."
         )
         return 0
-    engine = None if arguments.dry_run else build_engine(settings.backend, arguments.model or settings.model)
+    engine = None if arguments.dry_run else primary_engine(settings, arguments.model)
     if not arguments.dry_run and engine is None:
-        print(f"knowitall2: no {_engine_name(settings.backend)} engine was found, so no review can run yet.",
-              file=sys.stderr)
+        print("knowitall2: neither Claude Code nor Codex was found, so no review can run yet.", file=sys.stderr)
         return 1
     try:
         if arguments.dry_run:
@@ -611,6 +658,28 @@ def run_maintain(arguments: argparse.Namespace) -> int:
         journal.problem("maintenance", f"maintenance stopped: {exc}")
         print(f"knowitall2: maintenance stopped: {exc}", file=sys.stderr)
         return 1
+
+
+def primary_engine(settings: LearnerSettings, model: str | None = None):
+    """The primary engine: the configured one, or, when it is not installed, the other engine at its learning
+    model, so a computer with only Claude Code or only Codex learns all the same (the user, 2026-11-15)."""
+
+    engine = build_engine(settings.backend, model or settings.model)
+    if engine is not None:
+        return engine
+    other = "codex-cli" if settings.backend == "claude-cli" else "claude-cli"
+    engine = build_engine(other, (settings.codex_model if other == "codex-cli" else settings.claude_model) or None)
+    if engine is not None and other == "codex-cli":
+        engine.effort = settings.codex_effort or engine.effort
+    return engine
+
+
+def _upkeep_engine(engines, extractor):
+    """Upkeep's engine: the primary, or the other engine when the primary is paused or unusable now."""
+
+    if engines is None:
+        return extractor
+    return engines.upkeep()
 
 
 def build_engine(backend: str, model: str | None) -> ClaudeCliExtractor | CodexCliExtractor | None:
@@ -667,7 +736,7 @@ def _listed_codex_model(executable, model: str | None) -> str | None:
     listed = codex_listed_models(executable)
     if listed is None or any(item["slug"] == model for item in listed):
         return model
-    replacement = codex_default_model(executable)
+    replacement = codex_default_model(executable, listed=listed)   # the catalog is read once
     settings = load_settings()
     if settings.backend == "codex-cli" and settings.model == model:
         settings.model = replacement or ""
@@ -694,6 +763,34 @@ def _set_learning(settings: LearnerSettings, arguments: argparse.Namespace) -> i
     else:
         print(f"Warning: no {_engine_name(settings.backend)} engine was found on this machine.")
     return 0
+
+
+_ROUTING_OPTIONS = ("route_by_source", "codex_model", "codex_effort")
+
+
+def _set_routing(settings: LearnerSettings, arguments: argparse.Namespace) -> int:
+    """Which engine learns which chats (plan step 2): saved as the user set it, and journaled."""
+
+    if arguments.route_by_source is not None:
+        settings.route_by_source = arguments.route_by_source == "on"
+    for name in ("codex_model", "codex_effort"):
+        value = getattr(arguments, name, None)
+        if value is not None:
+            setattr(settings, name, value.strip())
+    save_settings(settings)
+    line = _routing_line(settings)
+    journal.record_standalone("settings", line, outcome="limits", agent="cli")
+    print(line)
+    return 0
+
+
+def _routing_line(settings: LearnerSettings) -> str:
+    codex = f"{settings.codex_model or 'its everyday model'} at {settings.codex_effort} effort"
+    if not settings.route_by_source:
+        return (f"Routing: off; every chat learns on {_engine_name(settings.backend)}, or on the other engine when "
+                f"it cannot run.")
+    return (f"Routing: on; Claude Code chats learn on Claude ({settings.claude_model}), Codex chats on Codex "
+            f"({codex}); either engine takes over when the other is missing or paused.")
 
 
 def configure_learning(
@@ -764,10 +861,11 @@ def _maintain_now(reviewer, state, settings: LearnerSettings, *, dry_run: bool) 
         # The user asked for it now: held back neither by the daily limit nor by upkeep's own calls.
         budget = 0 if state is None else settings.max_calls_per_run
         run = None if dry_run else new_run_id()
-        report = maintain(
-            memory=Memory(store, agent=MAINTENANCE_AGENT), reviewer=reviewer, state=state, budget=budget,
-            dry_run=dry_run, run=run, origin="user",
-        )
+        with ledger.context(mode="user", trigger="maintain command"):
+            report = maintain(
+                memory=Memory(store, agent=MAINTENANCE_AGENT), reviewer=reviewer, state=state, budget=budget,
+                dry_run=dry_run, run=run, origin="user",
+            )
         if run is not None:
             changed = sum(report.changes.get(name, 0) for name in ("merged duplicate", "replaced outdated",
                                                                     "retired snapshot"))
@@ -806,7 +904,7 @@ def _start_from_now(agent: str) -> int:
     another system. A log that grows later is learned from this point on.
     """
 
-    logs = codex_logs() if agent == "codex" else claude_code_logs()
+    logs = codex_logs(stored=True) if agent == "codex" else claude_code_logs()
     moment = datetime.now(timezone.utc).isoformat()
     marked = 0
     try:
@@ -819,8 +917,16 @@ def _start_from_now(agent: str) -> int:
                     continue
                 entry = state.entry(log)
                 if not source_held(entry) and int(entry.get("offset", 0)) < boundary:
+                    # The final pass reads from the settled cursor, so it moves too; otherwise the final pass would
+                    # read what the user chose to skip (review 2026-11-12). A quick-read stretch still waiting for
+                    # its final review keeps its cursor, so what the quick pass saved is still decided.
+                    # Whole positions, as learn() compares them: one record can hold several events.
+                    quick = (int(entry.get("offset", 0) or 0), int(entry.get("event_index", 0) or 0))
+                    settled = (int(entry.get(SETTLED, quick[0]) or 0), int(entry.get(SETTLED_EVENT_INDEX, 0) or 0))
+                    unsettled = quick > settled
                     entry.update({"offset": boundary, "event_index": 0, "status": "baseline", "baseline_to": boundary,
-                                  "updated_at": moment})
+                                  "updated_at": moment,
+                                  **({} if unsettled else {SETTLED: boundary, SETTLED_EVENT_INDEX: 0})})
                     marked += 1
             state.save()
     except LockBusy:
@@ -896,9 +1002,9 @@ def _documents(arguments: argparse.Namespace, settings: LearnerSettings) -> int:
         if not settings.enabled:
             print("Learning is off; turn it on with `knowitall2 learn --enable`.")
             return 0
-        extractor = build_engine(settings.backend, arguments.model or settings.model)
+        extractor = primary_engine(settings, arguments.model)
         if extractor is None:
-            print(f"knowitall2: no {_engine_name(settings.backend)} engine was found.", file=sys.stderr)
+            print("knowitall2: neither Claude Code nor Codex was found.", file=sys.stderr)
             return 1
         limit = arguments.max_calls or WORK_CALLS_PER_RUN
         total = 0
@@ -984,13 +1090,16 @@ def _status(settings) -> str:
         source_pending = "unavailable"
     since = day_ago(datetime.now(timezone.utc))
     recent, limited = state.calls_since(since), state.limited_calls_since(since)
+    override = state.calls_since(since, origins=("override",))
     paused = active(settings.backend)
     return "\n".join([
         f"Learning: {'on' if settings.enabled else 'off'} "
         f"(backend {settings.backend}, model {settings.model or 'the engine default'})",
         f"Background budget: {settings.max_calls_per_run} calls per run, {settings.max_calls_per_day} per day "
         f"(learning from your work has no daily limit); "
-        f"{recent} calls in the last 24 hours, {limited} of them toward the daily limit",
+        f"{recent} calls in the last 24 hours, {limited} of them toward the daily limit"
+        + (f", {override} from runs past the daily limit (learn --ignore-daily-limit)" if override else ""),
+        _routing_line(settings),
         f"Upkeep's own calls a day: maintenance {settings.maintenance_calls_per_day}, catalog "
         f"{settings.catalog_calls_per_day}, noting commands {settings.command_calls_per_day}",
         f"Sessions: {progress}",

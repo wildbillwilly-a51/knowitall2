@@ -600,7 +600,7 @@ class RequestLearningTests(MomentTestCase):
             self.assertEqual(1, main(["learn", "--requests"]))
         [entry] = moments.news()
         self.assertEqual("stopped", entry["status"])
-        self.assertIn("could not learn from this session: no Claude Code engine was found", self.stop()["systemMessage"])
+        self.assertIn("could not learn from this session: neither Claude Code nor Codex was found", self.stop()["systemMessage"])
 
 
 class NewsEntryTests(unittest.TestCase):

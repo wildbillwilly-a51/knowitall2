@@ -724,7 +724,7 @@ class UpkeepShareTests(CommandTestCase):
                                  maintenance_turn=ours,
                                  renew_maintenance_turn=lambda: True, share_quietly=lambda store: None,
                                  record_learning_run=lambda *a, **k: None, session_logs=lambda: [],
-                                 learn_requests=lambda *a: SimpleNamespace(blocked=None, saved=[])), \
+                                 learn_requests=lambda *a, **k: SimpleNamespace(blocked=None, saved=[], engines={})), \
                 mock.patch("sys.stdout"):
             command._learn_once(settings, object(), sweep=True)
         # Tool rules follow the tagging, from the same allowance for commands (2 a day), one call a run.

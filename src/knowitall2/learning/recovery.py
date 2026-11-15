@@ -23,8 +23,10 @@ from .log_identity import same_log, unique_logs
 
 
 def prefix_hash(path: Path, end: int) -> str:
+    from .codex_store import open_log
+
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with open_log(path) as stream:   # a Codex log Codex compressed or archived hashes as its transcript bytes
         left = end
         while left:
             data = stream.read(min(left, 1024 * 1024))
@@ -58,7 +60,9 @@ def plan(connection, state: LearnerState, *, since: str = "") -> dict:
             if entry.get("identity_conflicts"):
                 unresolved.append({"session": session, "reason": "conflicting transcript aliases require history repair"})
                 continue
-            if not path.is_file():
+            from .codex_store import exists
+
+            if not exists(path):
                 continue
             end = line_boundary(path)
             parsed, _ = read_session(path, stop=end)
@@ -111,7 +115,9 @@ def validate(item: dict) -> None:
         raise ValueError("recovery transcript must use its exact absolute path")
     if prefix_hash(path, item["end"]) != item["sha256"]:
         raise ValueError("recovery transcript changed; prepare a new plan")
-    with path.open("rb") as source:
+    from .codex_store import open_log
+
+    with open_log(path) as source:
         for boundary in (item["start"], item["end"]):
             if boundary:
                 source.seek(boundary - 1)

@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.12.12 (2026-11-15)
+
+- **Learning works with Claude Code, Codex, or both.** Each chat is learned
+  by the app it came from: Claude Code chats by Claude (Sonnet), and Codex
+  chats by Codex (gpt-6.1-sol at medium effort). If one app is not installed,
+  is signed out, or has reached its usage limit, the other takes over.
+  A computer with only one of them learns everything with that one. To learn
+  every chat with one app instead, use `learn --route-by-source off`.
+- **Every model call is accounted for.** KnowItAll2 now keeps one record of
+  each model call it makes: what it was for, which chat it read, whether the
+  engine actually ran, and what came of the answer. `knowitall2 stats` shows
+  the last seven days of calls by purpose. Calls that never reached a model
+  (a paused engine, a memory waiting for source review) are no longer counted
+  as calls.
+- **A catch-up no longer stops the next day's learning.** Calls made by
+  `learn --ignore-daily-limit` are counted on their own, so they no longer use
+  up the daily allowance that background learning needs.
+- **The catalog's work is measured.** Each catalog call records how much it
+  filed or described and how long memories waited to be filed.
+
+## 0.12.11 (2026-11-13)
+
+- **Repeated indecision is recognized even when it varies.** The final review
+  of a chat sometimes leaves different memories undecided each time. After it
+  has done so twice, the next review sets aside whatever it leaves undecided
+  and learns the rest of the chat.
+
+## 0.12.10 (2026-11-13)
+
+- **Codex chats are learned after Codex compresses or archives them.** Codex
+  compresses a chat's file about a week after it goes quiet, and moves chats
+  you archive to another folder; KnowItAll2 used to lose track of them, so a
+  chat not yet learned by then was never learned. It now follows each chat
+  wherever Codex keeps it and resumes where learning left off. Reading
+  compressed chats needs a zstd decoder: Python 3.14 or later, the zstandard
+  package, the zstd program, or Node.js 22.15 or later. Without one the health
+  check says so and the chats wait, with nothing lost.
+- **Old history stays history.** Chats that were already old when KnowItAll2
+  first saw them are set aside quietly; only chats it knew and did not learn
+  in time are reported as missed.
+
+## 0.12.9 (2026-11-13)
+
+- **One undecided memory no longer blocks a whole chat.** When the final
+  review keeps leaving the same few memories undecided, it now sets those aside
+  for later review and learns the rest of the chat, instead of retrying the
+  whole chat indefinitely.
+
+## 0.12.8 (2026-11-13)
+
+- **Your own chats are learned first.** Headless Claude Code runs that other
+  tools start (`claude -p` and the Agent SDK) are no longer learned as if they
+  were your chats, matching how Codex `exec` runs were already treated. On a
+  busy workstation they had taken most of the daily learning budget, so real
+  Codex chats waited days and later chats asked again for what those had
+  settled.
+- **Codex chats opened from ChatGPT are learned.** A Codex desktop chat started
+  through Work Partners gets its task from another agent, not as a typed
+  message. It is now learned, with that task marked as not the user's own words.
+- **Chats that waited go first.** Background learning still takes the newest
+  chats first, except that one waiting two days or more goes ahead of them,
+  longest-waiting first, so newer work can no longer hold it back until it
+  is set aside.
+- **The health check says when learning falls behind.** A new "learning
+  backlog" line counts your chats still waiting to be learned, including
+  queued recoveries and chats set aside unlearned, and needs attention once
+  one has waited more than two days.
+
 ## 0.12.7 (2026-11-09)
 
 - **Checkpoint conflicts hold only the affected transcript.** Other chats can

@@ -26,7 +26,7 @@ def run_checks(*, agents: Iterable[str] | None = None, user_home: Path | None = 
 
     launch = server_launch()
     checks = [_python_check(), _fts5_check(), _location_check(), *_store_checks(), _sharing_check(),
-              _engine_check(), _learning_progress_check(), _maintenance_check(), _known_files_check(), *_refused_folder_checks(),
+              _engine_check(), _learning_progress_check(), _learning_backlog_check(), _maintenance_check(), _known_files_check(), *_refused_folder_checks(),
               *_cloud_folder_checks(),
               probe_server(launch)]
     for name in agents or AGENT_NAMES:
@@ -53,21 +53,26 @@ def _app_check() -> Check:
 
 
 def _engine_check() -> Check:
-    """Whether learning, when it is on, can find the engine it runs on."""
+    """Whether learning, when it is on, can find an engine: either one will do (the user, 2026-11-15)."""
 
     from .learning.extractor import find_claude_cli, find_codex_cli
     from .learning.runner import describe_engine
     from .learning.state import load_settings
 
     settings = load_settings()
-    name = {"claude-cli": "Claude Code", "codex-cli": "Codex"}.get(settings.backend, settings.backend)
     if not settings.enabled:
         return Check("learning engine", True, "learning is off")
-    found = find_codex_cli() if settings.backend == "codex-cli" else find_claude_cli()
-    if found is None:
-        return Check("learning engine", False, f"learning is on, but {name} was not found on this computer, so "
-                     "nothing new is learned", f"Make sure {name} is installed and opens, then run doctor again.")
-    return Check("learning engine", True, f"{name} at {describe_engine(found)}")
+    found = {"Claude Code": find_claude_cli(), "Codex": find_codex_cli()}
+    present = {name: path for name, path in found.items() if path is not None}
+    if not present:
+        return Check("learning engine", False, "learning is on, but neither Claude Code nor Codex was found on this "
+                     "computer, so nothing new is learned",
+                     "Make sure Claude Code or Codex is installed and opens, then run doctor again.")
+    detail = "; ".join(f"{name} at {describe_engine(path)}" for name, path in present.items())
+    missing = [name for name in found if name not in present]
+    if missing:
+        detail += f"; {missing[0]} not found, so its chats are learned by {next(iter(present))}"
+    return Check("learning engine", True, detail)
 
 
 def _learning_progress_check() -> Check:
@@ -78,6 +83,64 @@ def _learning_progress_check() -> Check:
         return Check("learning progress", False, f"{conflicts} transcript checkpoint conflict(s) held for review.",
                      "Preserve the checkpoints and prepare an alias recovery plan.")
     return Check("learning progress", True, "no recorded transcript checkpoint conflicts")
+
+
+def _learning_backlog_check() -> Check:
+    """Whether learning keeps up with the user's chats.
+
+    On 2026-11-12 Codex chats from November 5 had still not been learned, crowded out of the daily budget by
+    headless runs, and chats then asked the user again for what those chats had settled, while doctor called
+    KnowItAll2 healthy.
+    """
+
+    import time
+    from datetime import datetime, timezone
+
+    from .learning.learner import SET_ASIDE_DAYS
+    from .learning.learner import WAITED_LONG_DAYS as LEARNING_BEHIND_DAYS  # from then on it is served first
+    from .learning.state import LearnerState, load_settings
+
+    name = "learning backlog"
+    settings = load_settings()
+    if not settings.enabled:
+        return Check(name, True, "learning is off")
+    now = time.time()
+    found = LearnerState().backlog(quiet_before=now - settings.settle_minutes * 60)
+    count, oldest, set_aside, held = found["waiting"], found["oldest"], found["set_aside"], found["held"]
+    unreadable = found.get("unreadable", 0)
+    parts = []
+    if count and oldest is not None:
+        since = datetime.fromtimestamp(oldest, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        parts.append(f"{count} chat(s) wait for learning; the longest-waiting has been quiet since {since}")
+    if set_aside:
+        parts.append(f"{set_aside} chat(s) were set aside without being learned after waiting {SET_ASIDE_DAYS} days")
+    if held:
+        parts.append(f"{held} chat(s) are held for a history repair")
+    if unreadable:
+        parts.append(f"{unreadable} chat(s) Codex compressed cannot be read")
+    if not parts:
+        return Check(name, True, "every quiet chat has been learned")
+    detail = "; ".join(parts)
+    behind = count and oldest is not None and now - oldest >= LEARNING_BEHIND_DAYS * 86400
+    if not behind and not set_aside and not held and not unreadable:
+        return Check(name, True, detail)
+    fixes = []
+    if behind:
+        fixes.append(f"Run: {cli_command('learn', '--ignore-daily-limit')} to learn them now (it uses the learning "
+                     "engine's usage; each run takes a share, so run it again until this line clears), or check "
+                     "the learning engine and the daily limit in the app's Learning page.")
+    if set_aside:
+        fixes.append(f"Run: {cli_command('learn', '--catch-up')} to list the set-aside chats by folder, then the "
+                     "same command with a folder after --catch-up to learn them.")
+    if held:
+        fixes.append("Held chats wait for their history repair, not for learning runs: finish or prepare the repair "
+                     "(learn --history-plan, then --repair-history; see the testing guide).")
+    if unreadable:
+        from .learning.codex_store import DECODER_HINT
+
+        fixes.append(f"Compressed chats wait, with their progress kept, until they can be read: {DECODER_HINT}.")
+    return Check(name, False, f"learning is behind: {detail}, so new chats cannot use what those settled",
+                 " ".join(fixes))
 
 
 def _maintenance_check() -> Check:

@@ -141,6 +141,55 @@ class CodexReaderTests(CodexTestCase):
                 self.assertEqual([], session.events)
                 self.assertEqual(log.stat().st_size, offset)
 
+    def test_a_chat_opened_by_another_agent_is_learned_without_taking_its_task_as_the_users_words(self) -> None:
+        # A Codex desktop chat ChatGPT opened through Work Partners (codex_app.create_thread) starts with the
+        # task as a function call's output and may never get a user message (2026-11-10, a StoryGen chat).
+        task = ("<codex_delegation>\n  <source_thread_id>abc</source_thread_id>\n  <input>Resume the Chapter 5 "
+                "ablation; the masked review goes to Claude.</input>\n</codex_delegation>")
+        log = (RolloutBuilder(self.project)
+               .item({"type": "FunctionCallOutput", "name": "create_thread", "namespace": "codex_app", "output": task})
+               .item({"type": "FunctionCallOutput", "name": "list_threads", "namespace": "codex_app",
+                      "output": "thread list"})
+               .command("Get-ChildItem runs", "chapter-05-a.md")
+               .agent("Recovered the four replies; the review is with Claude.")
+               .write(self.log_path))
+        session, _ = read_codex_session(log)
+        self.assertEqual([("agent_report", None), ("tool", "shell"), ("assistant", None)],
+                         [(event.kind, event.tool) for event in session.events])
+        [dossier] = build_dossiers(session)
+        self.assertEqual([], dossier.user_texts)
+        self.assertIn("[task handed to this chat by another agent (not the user's own words)]", dossier.text)
+        self.assertNotIn("thread list", dossier.text)
+
+    def test_a_chat_used_lately_does_not_jump_ahead_of_one_that_truly_waited(self) -> None:
+        # Review 2026-11-12: Windows leaves an open Codex log's mtime behind, so ordering by mtime alone put a chat
+        # used five hours ago ahead of one quiet for nine days. It takes its place among the newer chats instead.
+        from datetime import datetime, timedelta, timezone
+
+        from knowitall2.learning.learner import _priority
+
+        now = datetime.now(timezone.utc)
+        builder = RolloutBuilder(self.project).user("check the router").agent("done")
+        for record in builder.records:
+            record["timestamp"] = (now - timedelta(hours=5)).isoformat().replace("+00:00", "Z")
+        used_lately = builder.write(self.log_path)
+        stale = time.time() - 10 * 86400
+        os.utime(used_lately, (stale, stale))
+        waited = RolloutBuilder(self.project).user("check the switch").agent("done").write(
+            self.log_path.with_name("rollout-2026-09-28T09-00-00-01a0e45f-3ee3-7951-b9e3-6691dd0f0a63.jsonl"))
+        nine_days = time.time() - 9 * 86400
+        os.utime(waited, (nine_days, nine_days))
+        newest = RolloutBuilder(self.project).user("check the NAS").agent("done").write(
+            self.log_path.with_name("rollout-2026-09-28T08-00-00-01a0e45f-3ee3-7951-b9e3-6691dd0f0a64.jsonl"))
+        found = [(log, log.stat()) for log in (used_lately, newest, waited)]
+        ordered = [log for log, _ in sorted(found, key=_priority(LearnerState(self.root / "state.json"), now))]
+        self.assertEqual([waited, newest, used_lately], ordered)
+
+    def test_a_chat_with_neither_user_words_nor_a_handed_task_yields_no_dossier(self) -> None:
+        log = RolloutBuilder(self.project).command("Get-ChildItem", "a.txt").agent("Listed the files.").write(self.log_path)
+        session, _ = read_codex_session(log)
+        self.assertEqual([], build_dossiers(session))
+
     def test_resumes_from_an_offset_and_leaves_a_partial_line(self) -> None:
         builder = RolloutBuilder(self.project).user("first message").agent("first answer")
         log = builder.write(self.log_path, partial_tail='{"type": "event_msg", "pay')

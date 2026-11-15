@@ -175,6 +175,32 @@ class TranscriptTests(LearningTestCase):
         said = [event.text for event in session.events if event.kind == "user"]
         self.assertEqual(["please summarize what I pasted"], said)
 
+    def test_headless_runs_other_programs_started_yield_nothing(self) -> None:
+        # Work Partners consults, blind reviews and probes run `claude -p` ("sdk-cli"); like Codex exec runs they
+        # are an agent's brief, not the user's chat (2026-11-12: 281 of 317 chats waiting to be learned).
+        from knowitall2.learning.transcripts import session_folder
+        for entrypoint in ("sdk-cli", "sdk-ts", "sdk-py"):
+            with self.subTest(entrypoint=entrypoint):
+                builder = (LogBuilder(self.project).user("Review the attached draft and reply in one line.")
+                           .assistant(text("The draft reads well.")))
+                for record in builder.records:
+                    record["entrypoint"] = entrypoint
+                log = builder.write(self.log_path)
+                session, offset = read_claude_code_session(log)
+                self.assertEqual([], session.events)
+                self.assertEqual(log.stat().st_size, offset)
+                self.assertIsNone(session_folder(log, interactive_only=True))
+                self.assertEqual(str(self.project), session_folder(log))
+        for entrypoint in ("claude-desktop", "cli", "claude-vscode"):
+            with self.subTest(entrypoint=entrypoint):
+                builder = LogBuilder(self.project).user("Keep router backups in /srv/backups.").assistant(text("Will do."))
+                for record in builder.records:
+                    record["entrypoint"] = entrypoint
+                log = builder.write(self.log_path)
+                session, _ = read_claude_code_session(log)
+                self.assertEqual(["user", "assistant"], [event.kind for event in session.events])
+                self.assertEqual(str(self.project), session_folder(log, interactive_only=True))
+
     def test_resumes_from_an_offset_and_leaves_a_partial_line(self) -> None:
         builder = LogBuilder(self.project).user("first message").assistant(text("first answer"))
         log = builder.write(self.log_path, partial_tail='{"type": "user", "mess')
@@ -828,13 +854,29 @@ class LearnerTests(LearningTestCase):
         return path
 
     def test_background_learning_takes_the_newest_waiting_sessions_first(self) -> None:
-        older = self.waiting_log("older-session", days=3)
+        older = self.waiting_log("older-session", days=1)
         self.sample_log().write(self.log_path)
         self.settings.max_calls_per_run = 1
         report = self.run_learner(FakeExtractor([[]]), logs=[older, self.log_path])
         self.assertEqual((1, 1), (report.calls, report.deferred))
         self.assertEqual("done", self.state.entry(self.log_path)["status"])
         self.assertEqual(0, self.state.entry(older).get("offset", 0))
+
+    def test_a_session_that_waited_two_days_goes_before_newer_ones_longest_waiting_first(self) -> None:
+        # Review 2026-11-12: newest-first under a daily limit let a steady stream of newer chats hold an older one
+        # back until it was set aside unlearned.
+        oldest = self.waiting_log("oldest-session", days=9)
+        older = self.waiting_log("older-session", days=3)
+        newer = self.waiting_log("newer-session", days=1)
+        self.sample_log().write(self.log_path)
+        self.settings.max_calls_per_run = 1
+        logs = [newer, older, self.log_path, oldest]
+        for expected in (oldest, older, self.log_path):
+            with self.subTest(expected=expected.name):
+                report = self.run_learner(FakeExtractor([[]]), logs=logs)
+                self.assertEqual(1, report.calls)
+                self.assertEqual("done", self.state.entry(expected)["status"])
+        self.assertEqual(0, self.state.entry(newer).get("offset", 0))
 
     def test_sessions_waiting_over_14_days_are_set_aside_and_catching_up_takes_them(self) -> None:
         # 2026-10-11: about 100 sessions waited for the daily limit, and the backlog only grew.
@@ -1624,6 +1666,76 @@ class TwoPassTests(LearningTestCase):
         from knowitall2.learning.maintenance import plan
 
         self.assertEqual({"unchanged"}, {status for _, status in plan(self.memory) if status != "too small"})
+
+    def test_a_memory_left_undecided_again_and_again_is_held_and_the_rest_of_the_chat_settles(self) -> None:
+        # 2026-11-13: one chat's final pass failed on every retry for two days because the model kept answering
+        # not_here for the same provisional memories, so nothing else in the chat settled either.
+        from knowitall2.learning import provenance
+
+        self.sample_log().write(self.log_path, idle=False)
+        self.learn(FakeEngine([[self.ROUTER, self.DNSMASQ]]), quick=True)
+        router, dnsmasq = self.provisional()
+        quiet_longer(self.log_path)
+        stubborn = {"reviews": [review("p1", "not_here"), review("p2", "confirm")], "memories": []}
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                report = self.learn(FakeEngine(finals=[stubborn]))
+                self.assertEqual([f"{SESSION}"], report.failed)
+                entry = self.state.entry(self.log_path)
+                self.assertEqual((attempt, 0), (entry["final_failures"], entry["settled"]))
+                self.assertIn("provisional", self.store.get(dnsmasq.id).tags)
+                entry.pop("final_retry_at", None)
+        report = self.learn(FakeEngine(finals=[stubborn]))
+        self.assertEqual([], report.failed)
+        self.assertEqual(1, report.outcomes["held for source review"])
+        entry = self.state.entry(self.log_path)
+        self.assertEqual(entry["offset"], entry["settled"])
+        self.assertNotIn("provisional", self.store.get(dnsmasq.id).tags)
+        held = self.store.get(router.id)
+        self.assertEqual("active", held.status)
+        self.assertIn("provisional", held.tags)
+        self.assertEqual([router.id], [item["id"] for item in provenance.waiting(self.store)])
+        self.assertNotIn("final_undecided", entry)
+
+    def test_indecision_over_different_memories_each_time_still_counts(self) -> None:
+        # 2026-11-13: one chat's passes left {p10}, then {p10, p11, p12}, then {p7, p8, p10} undecided, so counting
+        # only the same memories never held anything.
+        from knowitall2.learning import provenance
+
+        self.sample_log().write(self.log_path, idle=False)
+        self.learn(FakeEngine([[self.ROUTER, self.DNSMASQ]]), quick=True)
+        router, dnsmasq = self.provisional()
+        quiet_longer(self.log_path)
+        first = {"reviews": [review("p1", "not_here"), review("p2", "confirm")], "memories": []}
+        second = {"reviews": [review("p1", "confirm"), review("p2", "not_here")], "memories": []}
+        for answer in (first, second):
+            self.assertEqual([SESSION], self.learn(FakeEngine(finals=[answer])).failed)
+            self.state.entry(self.log_path).pop("final_retry_at", None)
+        self.assertEqual({"ids": sorted([router.id, dnsmasq.id]), "count": 2},
+                         self.state.entry(self.log_path)["final_undecided"])
+        report = self.learn(FakeEngine(finals=[first]))
+        self.assertEqual([], report.failed)
+        self.assertEqual([router.id], [item["id"] for item in provenance.waiting(self.store)])
+        self.assertNotIn("provisional", self.store.get(dnsmasq.id).tags)
+
+    def test_other_final_pass_failures_never_count_toward_holding_a_memory(self) -> None:
+        # Review 2026-11-13: counting every failure would hold a memory after two malformed answers and a
+        # single not_here.
+        self.sample_log().write(self.log_path, idle=False)
+        self.learn(FakeEngine([[self.ROUTER, self.DNSMASQ]]), quick=True)
+        router, _ = self.provisional()
+        quiet_longer(self.log_path)
+        malformed = {"reviews": "not a list", "memories": []}
+        stubborn = {"reviews": [review("p1", "not_here"), review("p2", "confirm")], "memories": []}
+        for answer in (malformed, malformed, stubborn):
+            report = self.learn(FakeEngine(finals=[answer]))
+            self.assertEqual([SESSION], report.failed)
+            self.state.entry(self.log_path).pop("final_retry_at", None)
+        entry = self.state.entry(self.log_path)
+        self.assertEqual(3, entry["final_failures"])
+        self.assertEqual({"ids": [router.id], "count": 1}, entry["final_undecided"])
+        self.assertEqual(0, entry["settled"])
+        self.assertIn("provisional", self.store.get(router.id).tags)
 
     def test_a_repeat_that_adds_detail_is_merged_and_a_tool_quirk_is_never_dropped_as_not_lasting(self) -> None:
         self.sample_log().write(self.log_path, idle=False)

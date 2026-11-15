@@ -79,7 +79,9 @@ def _snapshot(path: Path, target: Path, end: int) -> str:
         return expected
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + "." + uuid.uuid4().hex[:8] + ".partial")
-    with path.open("rb") as source, partial.open("xb") as output:
+    from .codex_store import open_log
+
+    with open_log(path) as source, partial.open("xb") as output:
         left = end
         while left:
             block = source.read(min(left, 1024 * 1024))
@@ -232,7 +234,9 @@ def prepare_alias_conflicts(store, state, *, session_id, output, transcript=None
     end = line_boundary(path)
     if not 0 < end <= max_bytes:
         raise ValueError("transcript is empty or exceeds the approved snapshot byte cap")
-    with path.open("rb") as source:
+    from .codex_store import open_log
+
+    with open_log(path) as source:
         for name, entry in entries.items():
             pending = entry.get("pending_reviews", {})
             phases = {"quick", "final"} if transcript is not None else {"quick"}
@@ -391,7 +395,7 @@ class CachedEngine:
     def __init__(self, engine, path, manifest, state):
         self.engine, self.path, self.manifest, self.state = engine, path, manifest, state
         self.name, self.model = engine.name, getattr(engine, "model", "default")
-        self.last_usage = {}
+        self.last_usage, self.last_attempt = {}, None
         self.data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
             "manifest": manifest["id"], "calls": 0, "responses": {}}
         if self.data.get("manifest") != manifest["id"]:
@@ -400,31 +404,49 @@ class CachedEngine:
     def run(self, text, *, schema, system_prompt):
         key = digest({"text": text, "schema": schema, "prompt": system_prompt, "backend": self.name, "model": self.model})
         if key in self.data["responses"]:
-            self.last_usage = {}
+            # A completed step resumed from the checkpoint: no call made, none charged.
+            self.last_usage, self.last_attempt = {}, None
             return self.data["responses"][key]
+        # Nothing of the previous step may be reported as this one's.
+        self.last_attempt, self.last_usage = None, {}
         if self.data["calls"] >= self.manifest["max_calls"]:
-            raise ExtractionError("history repair reached its approved model-call cap")
+            raise ExtractionError("history repair reached its approved model-call cap", attempted=False)
         # Reserve before launch, including failed attempts; interruption cannot
         # silently reset the repair's usage limit.
         self.data["calls"] += 1
         self._save()
+        from . import ledger
+        from .state import chargeable
         try:
-            result = self.engine.run(text, schema=schema, system_prompt=system_prompt)
+            with ledger.context(purpose="history-repair", origin="user", mode="user", session=self.manifest["session"],
+                                work=self.manifest["id"]):
+                result = self.engine.run(text, schema=schema, system_prompt=system_prompt)
         except ExtractionError as exc:
+            self.last_attempt = getattr(self.engine, "last_attempt", None)
+            self.last_usage = getattr(self.engine, "last_usage", None) or {}
             if not exc.attempted:
                 self.data["calls"] -= 1
                 self._save()
+            elif chargeable(exc):
+                # A call the engine made and failed counts like any consumer's (joint review 2026-11-13).
+                self._charge("failed")
             raise
+        self.last_attempt = getattr(self.engine, "last_attempt", None)
         self.last_usage = getattr(self.engine, "last_usage", None) or {}
+        # Charged before the answer is cached: a stop between the two makes the call again and charges it again,
+        # as it ran twice, instead of resuming from the cache with the first call never charged.
+        self._charge("ok")
         if contains_secret(json.dumps(result)):
-            raise ExtractionError("history model response contained a secret; no response was cached")
+            raise ExtractionError("history model response contained a secret; no response was cached", counted=True)
         self.data["responses"][key] = result
         self._save()
-        self.state.record_call(at=datetime.now(timezone.utc), session=self.manifest["session"],
-                               outcome="ok", origin="user")
-        self.state.save()
         print(f"History model call {self.data['calls']} of {self.manifest['max_calls']} completed.", flush=True)
         return result
+
+    def _charge(self, outcome: str) -> None:
+        self.state.record_call(at=datetime.now(timezone.utc), session=self.manifest["session"],
+                               outcome=outcome, origin="user", attempt=self.last_attempt)
+        self.state.save()
 
     def _save(self):
         write_text_atomic(self.path, json.dumps(self.data, indent=2) + "\n")
@@ -630,7 +652,7 @@ def execute(store, state, manifest, engine, *, checkpoint: Path) -> dict:
 
 
 def run(arguments):
-    from .command import build_engine
+    from .command import primary_engine
     try:
         if arguments.history_plan:
             options = {"session_id": arguments.session, "output": arguments.history_plan,
@@ -648,9 +670,9 @@ def run(arguments):
             return 0
         manifest = json.loads(arguments.repair_history.read_text(encoding="utf-8"))
         settings = load_settings()
-        engine = build_engine(settings.backend, settings.model)
+        engine = primary_engine(settings)
         if engine is None:
-            raise ValueError("the selected learning backend is unavailable")
+            raise ValueError("neither Claude Code nor Codex is available")
         with RunLock():
             store = Store.open(database_path())
             try:

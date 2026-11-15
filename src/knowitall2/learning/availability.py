@@ -118,14 +118,29 @@ def clear(backend: str, *, started: datetime | None = None) -> None:
 
 
 def guarded(call):
-    """All production model calls pass here, including exploration and upkeep."""
+    """All production model calls pass here, including exploration and upkeep; each is written to the call
+    ledger (``ledger``), and its id left on the engine as ``last_attempt`` for the caller's budget entry.
+
+    The engine says how far a call got in ``launch``: None until it starts its process, "starting" just before,
+    "confirmed" once the process ran (answered or timed out), "none" when it could not start.
+    """
     @wraps(call)
     def invoke(extractor, *args, **kwargs):
+        from . import ledger
         from .extractor import ExtractionError, run_bounded
         # Injected runners are isolated simulations, unless a test explicitly enables the gate.
         enabled = getattr(extractor, "check_availability", extractor._runner is run_bounded)
+        # Nothing of an earlier call may be taken for this one's (a refused call reports no usage).
+        extractor.last_usage, extractor.launch, extractor.last_attempt = None, None, None
+        extractor.resolved_model = None
         if enabled:
-            before_call(extractor)
+            try:
+                before_call(extractor)
+            except ExtractionError as exc:
+                extractor.last_attempt = ledger.deferred(reason=str(exc), category=exc.category,
+                                                         backend=extractor.name)
+                raise
+            extractor.last_attempt = ledger.start(extractor)
         started = datetime.now(timezone.utc)
         try:
             result = call(extractor, *args, **kwargs)
@@ -137,35 +152,29 @@ def guarded(call):
                     from .. import journal
                     journal.problem("availability", "could not save the backend pause; work remains pending")
             if enabled:
-                record_attempt(extractor, started, category=exc.category, outcome="blocked" if exc.blocking else "failed")
+                ledger.end(extractor.last_attempt, extractor, outcome="blocked" if exc.blocking else "failed",
+                           category=exc.category, launch=launch_state(extractor))
+            raise
+        except BaseException as exc:
+            if enabled:
+                ledger.end(extractor.last_attempt, extractor, outcome="error", category=type(exc).__name__,
+                           launch=launch_state(extractor))
             raise
         if enabled:
             try:
                 clear(extractor.name, started=started)
             except (OSError, LockBusy, ValueError, TypeError, KeyError):
                 pass  # a valid model result must survive bookkeeping contention
-            record_attempt(extractor, started, category="ok", outcome="ok")
+            ledger.end(extractor.last_attempt, extractor, outcome="ok", category="ok", launch=launch_state(extractor))
         return result
     return invoke
 
 
-def record_attempt(extractor, started: datetime, *, category: str, outcome: str) -> None:
-    """Include rejected attempts without charging them as completed learning calls."""
-    path = _path().with_name("backend-attempts.jsonl")
-    now = datetime.now(timezone.utc)
-    entry = {"backend": extractor.name, "model": extractor.model, "started_at": started.isoformat(),
-             "completed_at": now.isoformat(), "outcome": outcome, "category": category,
-             "usage": getattr(extractor, "last_usage", None)}
-    try:
-        with waiting_lock(path.with_suffix(".lock")):
-            old = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-            cutoff = now - timedelta(days=7)
-            kept = []
-            for line in old:
-                item = json.loads(line)
-                if datetime.fromisoformat(item["completed_at"]) >= cutoff:
-                    kept.append(line)
-            write_text_atomic(path, "\n".join([*kept, json.dumps(entry)]) + "\n")
-    except (OSError, ValueError, KeyError, TypeError, LockBusy):
-        from .. import journal
-        journal.problem("availability", "could not record a backend attempt")
+def launch_state(extractor) -> str:
+    """Whether the engine's process ran: confirmed, none (never started), or unknown (it may have)."""
+    state = getattr(extractor, "launch", None)
+    if state == "confirmed":
+        return "confirmed"
+    if state == "starting":
+        return "unknown"
+    return "none"
