@@ -98,6 +98,7 @@ def run_learn(arguments: argparse.Namespace) -> int:
     extractor = primary_engine(settings, arguments.model)
     if extractor is None:
         message = "neither Claude Code nor Codex was found, so nothing can be learned yet."
+        reconcile_questions()
         journal.problem("learning", message)
         _tell_waiting_requests(settings, "neither Claude Code nor Codex was found on this computer")
         print(f"knowitall2: {message}", file=sys.stderr)
@@ -162,6 +163,7 @@ def _learn_once_now(settings: LearnerSettings, extractor, *, sweep: bool, overri
             reset_reviews(store, state)
         # When connected to a server: learn knowing what other computers already learned.
         share_quietly(store)
+        reconcile_questions(store)   # before learning, which can stop early (Codex review 2026-11-15)
         requested = learn_requests(store, state, settings, extractor, engines=engines)
         if not sweep or requested.blocked:
             if requested.saved and not requested.blocked:
@@ -202,6 +204,7 @@ def _learn_once_now(settings: LearnerSettings, extractor, *, sweep: bool, overri
         confirm_stale(Memory(store, agent=LEARNER_AGENT, record_events=False), now=datetime.now(timezone.utc),
                       exclude_sessions=pending_sessions)
         retire_old_status(Memory(store, agent=MAINTENANCE_AGENT))
+        reconcile_questions(store)
         upkeep = filing = None
         # Upkeep runs on the primary engine, or on the other one when the primary cannot run now.
         worker = _upkeep_engine(engines, extractor)
@@ -264,6 +267,27 @@ def let_provisional_stand() -> None:
         journal.problem("learning", f"provisional memories were not let stand: {exc}")
     finally:
         store.close()
+    reconcile_questions()
+
+
+def reconcile_questions(store: Store | None = None) -> None:
+    """Close the questions whose memories changed, and take back from the user questions only about facts
+    (``review.reconcile``): needs no model, so it runs even when learning cannot (Codex review 2026-11-15). Never
+    in the way of what called it."""
+
+    from .. import review
+
+    try:
+        opened = store or Store.open(database_path())
+    except (StoreError, sqlite3.Error, OSError):
+        return
+    try:
+        review.reconcile(Memory(opened, agent=MAINTENANCE_AGENT))
+    except (StoreError, sqlite3.Error, OSError) as exc:
+        journal.problem("learning", f"questions about changed memories were not closed: {exc}")
+    finally:
+        if store is None:
+            opened.close()
 
 
 # One call looks at 50 memories: enough for what a day's learning adds. Catching up on older memories is

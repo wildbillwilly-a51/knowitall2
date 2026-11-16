@@ -65,7 +65,7 @@ class EvidenceTests(ReviewTestCase):
         self.assertEqual((False, True), ("disputed" in self.store.get(older.id).tags,
                                          "disputed" in self.store.get(newer.id).tags))
         found = self.memory.recall("CI runner", project_path=self.project)
-        self.assertIn("another memory disagrees; being checked", found)
+        self.assertIn("another memory disagrees; not settled yet", found)
         self.assertLess(found.index(older.id), found.index(newer.id))
 
     def test_a_check_no_agent_took_in_a_week_is_settled_by_the_evidence(self) -> None:
@@ -89,13 +89,111 @@ class EvidenceTests(ReviewTestCase):
                                                  self.store.get(second.id).status))
 
     def test_a_dispute_ends_with_its_question_however_it_closes(self) -> None:
-        # Candidate review, C-M3: a question closed unanswered after 30 days left its memory "disputed" for good.
-        older, newer, question, _task = self.disagree()
-        self.clock.value = "2026-11-05T12:00:00Z"
-        self.store.connection.execute("UPDATE agent_tasks SET status = 'given_up'")
-        review.expire_unanswered(self.memory)
-        self.assertNotEqual("open", self.store.question(question["id"])["status"])
+        # Candidate review, C-M3: a closed question left its memory "disputed" for good.
+        older, newer, question, task = self.disagree()
+        self.store.retire(older.id, reason="maintenance: temporary status", now=self.clock())
+        self.assertEqual(1, review.close_stale(self.memory))
+        self.assertEqual(("answered", "memories had already changed"),
+                         (self.store.question(question["id"])["status"], self.store.question(question["id"])["answer"]))
+        self.assertEqual("done", self.store.task(task)["status"])
         self.assertNotIn("disputed", self.store.get(newer.id).tags)
+        self.assertEqual(0, review.close_stale(self.memory))
+
+    def test_a_check_whose_memory_changed_is_closed_not_handed_to_the_user(self) -> None:
+        # 2026-11-15: six of the seven questions waiting for the user had lost a memory to maintenance or a
+        # correction before their check ran out, and the expiry handed each to the user anyway.
+        older, newer, question, task = self.disagree(older_source="user", newer_source="observed")
+        self.clock.value = "2026-10-03T00:00:00Z"
+        self.store.retire(newer.id, reason="maintenance: temporary status, kept 7 days", now=self.clock())
+        self.assertEqual({"escalated": 0, "given up": 0, "no longer needed": 1},
+                         review.expire_tasks(self.memory, now=review._parse("2026-10-10T00:00:00Z")))
+        self.assertEqual("memories had already changed", self.store.question(question["id"])["answer"])
+        self.assertEqual(("done", []), (self.store.task(task)["status"], review.for_user(self.store)))
+        # Read before any upkeep comes: a question whose memory changed is never shown or offered.
+        again_older = self.save("The CI runner is ci03.", source="user")
+        again_newer = self.save("The CI runner is ci04.", source="observed")
+        review.ask_conflict(self.memory, again_older, again_newer)
+        [open_question] = self.store.open_questions(limit=5)
+        review.escalate(self.memory, open_question["id"], finding="test")
+        self.store.retire(again_newer.id, reason="replaced", now=self.clock())
+        self.assertEqual([], review.for_user(self.store))
+        self.assertEqual([], review.in_progress(self.store))
+
+    def test_two_guesses_no_one_checked_stay_unresolved_and_hold_their_memories(self) -> None:
+        # Codex review 2026-11-15: choosing the newer of two guesses is a coin toss, not a check; nor is a fact
+        # about a system the user's to judge.
+        older, newer, question, task = self.disagree(older_source="inferred", newer_source="inferred")
+        counts = review.expire_tasks(self.memory, now=review._parse("2026-10-10T00:00:00Z"))
+        self.assertEqual(1, counts["unresolved"])
+        self.assertEqual(("open", "unresolved"), (self.store.question(question["id"])["status"],
+                                                   review.stage(self.store, question["id"])))
+        self.assertEqual(("active", "active"), (self.store.get(older.id).status, self.store.get(newer.id).status))
+        self.assertEqual([], review.for_user(self.store, now=review._parse("2027-01-01T00:00:00Z")))
+        self.assertEqual([question["id"]], [item["id"] for item in review.in_progress(self.store)])
+        # Upkeep leaves them alone: a merge or a partial correction would carry the disagreement into a copy.
+        self.assertEqual({older.id, newer.id}, self.store.open_question_record_ids())
+        self.assertEqual(0, review.expire_unanswered(self.memory))
+        self.store.supersede(older.id, newer.id, now=self.clock(), reason="maintenance: duplicate")
+        self.assertEqual(1, review.close_stale(self.memory))
+
+    def test_observations_an_agent_could_not_tell_apart_stay_unresolved(self) -> None:
+        older, newer, question, task = self.disagree(older_source="observed", newer_source="observed")
+        reply = review.settle_task(Memory(self.store, agent="codex", clock=self.clock), task, choice="keep_both",
+                                   found="Both hosts answer.", certain=False)
+        self.assertIn("the check stays open", reply)
+        review.expire_tasks(self.memory, now=review._parse("2026-10-10T00:00:00Z"))
+        self.assertEqual("unresolved", review.stage(self.store, question["id"]))
+        self.assertEqual(("active", "active"), (self.store.get(older.id).status, self.store.get(newer.id).status))
+
+    def test_an_agent_that_could_not_tell_stops_the_evidence_ranking_too(self) -> None:
+        # Codex review 2026-11-15: observed against a guess was still settled by rank after an agent said it
+        # could not tell.
+        older, newer, question, task = self.disagree(older_source="observed", newer_source="inferred")
+        review.settle_task(Memory(self.store, agent="codex", clock=self.clock), task, choice="keep_mine",
+                           found="Cannot reach the runner.", certain=False)
+        review.expire_tasks(self.memory, now=review._parse("2026-10-10T00:00:00Z"))
+        self.assertEqual("unresolved", review.stage(self.store, question["id"]))
+        self.assertEqual(("active", "active"), (self.store.get(older.id).status, self.store.get(newer.id).status))
+
+    def test_a_question_about_facts_handed_to_the_user_before_is_taken_back(self) -> None:
+        # Before 2026-11-15 a check no agent did went to the user, about a system or not.
+        older, newer, question, _task = self.disagree()
+        self.store.set_question_stage(question["id"], stage="ask_user", now=self.clock())
+        self.assertEqual([], review.for_user(self.store))
+        self.assertEqual({"unresolved": 1}, review.reconcile(self.memory))
+        self.assertEqual("unresolved", review.stage(self.store, question["id"]))
+        said = self.save("The build server is build01.", source="user")
+        review.ask_conflict(self.memory, said, self.save("The build server is build02.", source="observed"))
+        said_question = next(item["id"] for item in self.store.open_questions(limit=5)
+                             if item["record_ids"][0] == said.id)
+        review.escalate(self.memory, said_question, finding="test")
+        self.assertEqual({}, review.reconcile(self.memory))
+        self.assertEqual([said_question], [item["id"] for item in review.for_user(self.store)])
+
+    def test_two_things_the_user_said_go_to_the_user_when_no_one_settles_them(self) -> None:
+        older, newer, question, task = self.disagree(older_source="user", newer_source="user")
+        counts = review.expire_tasks(self.memory, now=review._parse("2026-10-10T00:00:00Z"))
+        self.assertEqual(1, counts["escalated"])
+        self.assertEqual([question["id"]], [item["id"] for item in review.for_user(self.store)])
+
+    def test_checks_take_turns_in_briefings(self) -> None:
+        # Checks end only by age now, so always offering the oldest would hide every other one for a week.
+        first, _newer, _question, first_task = self.disagree()
+        other = self.save("The deploy host is deploy01.", source="observed")
+        review.ask_conflict(self.memory, other, self.save("The deploy host is deploy02."))
+        second = next(item for item in self.store.open_questions(limit=5) if item["record_ids"][0] == other.id)
+        second_task = review.start_check(self.memory, second, [], plain=None, labels=None, reason=None)
+        project = self.memory.project_for(self.project).id
+        shown = [review.offer_tasks(self.store, project_id=project, now=self.clock())[0]["id"] for _ in range(4)]
+        self.assertEqual({first_task, second_task}, set(shown[:2]))
+        self.assertEqual(shown[:2], shown[2:])
+
+    def test_questions_about_changed_memories_close_without_learning(self) -> None:
+        from knowitall2.learning import command
+        older, newer, question, _task = self.disagree()
+        self.store.retire(newer.id, reason="replaced", now=self.clock())
+        command.reconcile_questions(self.store)
+        self.assertEqual("answered", self.store.question(question["id"])["status"])
 
     def test_a_memory_two_questions_check_stays_disputed_until_both_close(self) -> None:
         # Second candidate review, D-L7.
@@ -330,9 +428,23 @@ class ConcurrentWriteTests(unittest.TestCase):
 
 
 class StuckCheckTests(ReviewTestCase):
-    def test_a_check_no_agent_did_reaches_the_user_without_a_learning_run(self) -> None:
-        # Review 2026-10-04, U-M2: only a learning run moved a stale check to the user.
+    def test_a_check_of_two_guesses_no_agent_did_never_becomes_the_users(self) -> None:
         older = self.save("The wiki runs on host wiki01.")
+        newer = self.save("The wiki moved to host wiki02.")
+        review.ask_conflict(self.memory, older, newer)
+        [question] = self.store.open_questions(limit=5)
+        review.start_check(self.memory, question, [older, newer], plain=None, labels=None, reason=None)
+        later = "2026-10-27T12:00:00Z"
+        self.assertEqual([], review.for_user(self.store, now=review._parse(later)))
+        self.clock.value = later
+        self.assertNotIn("for the user", self.memory.briefing(project_path=self.project))
+        self.assertEqual([question["id"]], [item["id"] for item in review.in_progress(self.store,
+                                                                                     now=review._parse(later))])
+
+    def test_a_check_no_agent_did_reaches_the_user_without_a_learning_run(self) -> None:
+        # Review 2026-10-04, U-M2: only a learning run moved a stale check to the user. Only a question about what
+        # the user said goes to the user (2026-11-15).
+        older = self.save("The wiki runs on host wiki01.", source="user")
         newer = self.save("The wiki moved to host wiki02.")
         review.ask_conflict(self.memory, older, newer)
         [question] = self.store.open_questions(limit=5)
@@ -382,13 +494,15 @@ class NoticeTests(ReviewTestCase):
         self.assertIn("no questions about this project's memories",
                       review.list_questions(self.memory, chat_project=None, in_chat=True))
 
-    def test_a_question_no_one_answers_closes_after_a_month_and_changes_nothing(self) -> None:
+    def test_a_question_no_one_answers_stays_open_and_changes_nothing(self) -> None:
+        # 2026-11-15: a question no one answered was closed after 30 days as if answered, and lost its warning.
         stated, newer, question_id = self.conflict()
         self.assertEqual(0, review.expire_unanswered(self.memory))
-        self.clock.value = "2026-10-28T12:00:00Z"
-        self.assertEqual(1, review.expire_unanswered(self.memory))
-        self.assertNotEqual("open", self.store.question(question_id)["status"])
+        self.clock.value = "2027-01-28T12:00:00Z"
+        self.assertEqual(0, review.expire_unanswered(self.memory))
+        self.assertEqual("open", self.store.question(question_id)["status"])
         self.assertEqual(("active", "active"), (self.store.get(stated.id).status, self.store.get(newer.id).status))
+        self.assertIn("disputed", self.store.get(newer.id).tags)
 
     def test_a_rule_question_left_from_before_0_10_5_is_settled_as_a_note(self) -> None:
         # Review 2026-10-11, D-M2: 0.10.5 stopped asking "Should it be a rule?", but a question asked before it

@@ -1033,7 +1033,7 @@ function questionsPage(data) {
         <ul class="list">${data.in_progress.map((item) => html`
           <li class="event">${timeTag(item.created_at, 'time')}
             <div class="body"><div class="summary">${item.plain}</div>
-              <div class="meta"><span class="chip accent">${stageWords(item)}</span></div></div></li>`)}</ul>
+              <div class="meta"><span class="chip accent">${stageWords(item)}</span>${item.stage === 'unresolved' ? html`<span class="faint small">Nothing shows yet which is right, so both are kept and marked as disputed.</span>` : ''}</div></div></li>`)}</ul>
       </section>` : ''}
     ${data.answered.length ? html`
       <section class="card mt-16">
@@ -1047,6 +1047,7 @@ function questionsPage(data) {
 
 function stageWords(item) {
   if (item.stage === 'checking') return 'Waiting for an agent to check it';
+  if (item.stage === 'unresolved') return 'Not settled yet';
   return 'KnowItAll2 will look at it in its next background run';
 }
 

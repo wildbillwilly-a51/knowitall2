@@ -382,9 +382,24 @@ class QuestionFlowTests(CatalogTestCase):
         self.assertEqual(0, self.store.count_open_questions())
         self.assertEqual("done", self.store.task(task["id"])["status"])
 
-    def test_an_agent_that_cannot_tell_hands_it_to_the_user_in_plain_words(self) -> None:
+    def test_an_agent_that_cannot_tell_keeps_a_check_of_facts_open_with_its_note(self) -> None:
+        # 2026-11-15: an unsure report handed a question about a system to the user, who cannot check it either.
         older, newer, question = self.conflict()
         self.run_catalog(FakeEngine(review=[self.decide(question, "unsure", certain=False)]))
+        [task] = self.store.tasks(kind="check")
+        reply = review.settle_task(Memory(self.store, agent="claude-code", clock=self.clock), task["id"],
+                                   choice="keep_both", found="The logs from that test are gone.", certain=False)
+        self.assertIn("the check stays open", reply)
+        self.assertEqual(("checking", "open"), (review.stage(self.store, question["id"]),
+                                                self.store.task(task["id"])["status"]))
+        self.assertEqual([], review.for_user(self.store, now=self.now))
+        [looking] = review.in_progress(self.store, now=self.now)
+        self.assertIn("claude-code could not tell: The logs from that test are gone.", looking["findings"])
+        self.assertNotIn("for the user", self.memory.briefing(project_path=self.project))
+
+    def test_an_agent_that_cannot_tell_hands_the_users_word_to_the_user_in_plain_words(self) -> None:
+        older, newer, question = self.conflict(older_source="user")
+        self.run_catalog(FakeEngine(review=[self.decide(question, "use_new", certain=True)]))
         [task] = self.store.tasks(kind="check")
         review.settle_task(Memory(self.store, agent="claude-code", clock=self.clock), task["id"], choice="keep_both",
                            found="The logs from that test are gone.", certain=False)
@@ -433,16 +448,22 @@ class QuestionFlowTests(CatalogTestCase):
         # evidence settles (observed against unverified) no longer waits for anyone.
         older, newer, question = self.conflict()
         self.run_catalog(FakeEngine(review=[self.decide(question, "unsure", certain=False)]))
-        for _ in range(review.CHECK_OFFERS):
+        for _ in range(10):   # one chat's searches no longer use a check up (2026-11-15): only its age ends it
             self.memory.briefing(project_path=self.project)
+        self.run_catalog(FakeEngine())
+        self.assertEqual("open", self.store.question(question["id"])["status"])
+        self.clock.value = "2026-10-06T12:00:00Z"
         self.run_catalog(FakeEngine())
         self.assertEqual("answered", self.store.question(question["id"])["status"])
         self.assertEqual(("active", "retired"), (self.store.get(older.id).status, self.store.get(newer.id).status))
-        stale = self.save("Backups run nightly at 02:00.")
-        other = self.save("Backups run nightly at 04:00.")
-        review.ask_conflict(self.memory, stale, other)
-        later = datetime(2026, 10, 5, tzinfo=timezone.utc)
-        self.assertEqual(1, len(review.for_user(self.store, now=later)))
+        # Old and never reviewed: what the user said reaches the user; two guesses about a system wait for evidence.
+        said = self.save("Backups run nightly at 02:00.", source="user")
+        review.ask_conflict(self.memory, said, self.save("Backups run nightly at 04:00."))
+        guessed = self.save("The NAS keeps 30 snapshots.")
+        review.ask_conflict(self.memory, guessed, self.save("The NAS keeps 14 snapshots."))
+        later = datetime(2026, 10, 15, tzinfo=timezone.utc)
+        self.assertEqual([[said.id]], [item["record_ids"][:1] for item in review.for_user(self.store, now=later)])
+        self.assertIn([guessed.id], [item["record_ids"][:1] for item in review.in_progress(self.store, now=later)])
 
     def test_questions_are_reviewed_even_when_filing_always_has_work(self) -> None:
         # From 2026-09-28 to 10-08 every run spent its two calls filing and describing, and the review never ran.
@@ -460,28 +481,44 @@ class QuestionFlowTests(CatalogTestCase):
         self.run_catalog(engine, budget=1)
         self.assertEqual(["file"], [step for step, _ in engine.inputs])
 
-    def test_a_question_the_model_refuses_or_leaves_out_twice_goes_to_the_user(self) -> None:
+    def test_a_question_the_model_refuses_or_leaves_out_twice_goes_to_an_agent_or_the_user(self) -> None:
+        # About a system it goes to an agent's check, as an unsure answer would; about what the user wants, to the
+        # user (2026-11-15: before, both went to the user).
         older, newer, question = self.conflict()
         refusal = ExtractionError("the model declined to answer")
         engine = FakeEngine(review=[refusal, refusal])
         for _ in range(2):
             self.assertEqual("review", review.stage(self.store, question["id"]))
             self.run_catalog(engine, budget=3)
-        self.assertEqual("ask_user", review.stage(self.store, question["id"]))
+        self.assertEqual("checking", review.stage(self.store, question["id"]))
+        self.assertEqual(1, len(self.store.tasks(question_id=question["id"])))
         self.assertEqual(["review", "file", "review", "file"], [step for step, _ in engine.inputs][:4])
-        early = self.save("The NAS backup runs at 02:00 every night.")
-        review.ask_conflict(self.memory, early, self.save("The NAS backup runs at 04:00 every night."))
-        about = next(item for item in self.store.open_questions(limit=5) if item["record_ids"][0] == early.id)
+        wanted = self.save("Run NAS backups only at night.", kind="note", source="user", tags=["preference"])
+        review.ask_conflict(self.memory, wanted, self.save("NAS backups can run at any time.", kind="note"))
+        about = next(item for item in self.store.open_questions(limit=5) if item["record_ids"][0] == wanted.id)
         for _ in range(2):
             self.assertEqual("review", review.stage(self.store, about["id"]))
             self.run_catalog(FakeEngine(review=[{"questions": []}]), budget=3)
         self.assertEqual("ask_user", review.stage(self.store, about["id"]))
-        self.assertEqual("active", self.store.get(early.id).status)
+        self.assertEqual("active", self.store.get(wanted.id).status)
+
+    def test_a_memory_retired_while_the_model_looks_closes_the_question(self) -> None:
+        # Codex review 2026-11-15: the review kept the memories it read before the call, and an unsure answer then
+        # sent a question that no longer applied on to an agent or the user.
+        older, newer, question = self.conflict()
+        retire = lambda: self.store.retire(newer.id, reason="maintenance: temporary status", now=self.clock())
+        engine = FakeEngine(review=[self.decide(question, "unsure", certain=False)], during={"review": retire})
+        report = self.run_catalog(engine)
+        self.assertEqual(("answered", "memories had already changed"),
+                         (self.store.question(question["id"])["status"], self.store.question(question["id"])["answer"]))
+        self.assertEqual([], self.store.tasks(question_id=question["id"]))
+        self.assertEqual(1, report.questions["no longer needed"])
+        self.assertNotIn("disputed", self.store.get(older.id).tags)
 
     def test_listed_questions_say_what_was_found_and_which_were_never_looked_into(self) -> None:
         older, newer, question = self.conflict(older_source="user", older_kind="note")
         self.run_catalog(FakeEngine(review=[self.decide(question, "use_new", certain=True)]))
-        stale = self.save("Backups run nightly at 02:00.")
+        stale = self.save("Backups run nightly at 02:00.", source="user")
         review.ask_conflict(self.memory, stale, self.save("Backups run nightly at 04:00."))
         self.clock.value = "2026-10-05T12:00:00Z"
         listed = review.list_questions(self.memory)
@@ -490,10 +527,14 @@ class QuestionFlowTests(CatalogTestCase):
         self.assertIn("look into each question yourself", listed)
         self.assertIn("recommend", listed)
 
-    def test_without_learning_questions_go_straight_to_the_user(self) -> None:
+    def test_without_learning_only_questions_about_the_users_word_go_straight_to_the_user(self) -> None:
         save_settings(LearnerSettings(enabled=False))
-        _, _, question = self.conflict()
-        self.assertEqual("ask_user", review.stage(self.store, question["id"]))
+        _, _, about_facts = self.conflict()
+        self.assertEqual("unresolved", review.stage(self.store, about_facts["id"]))
+        said = self.save("The NAS is at 10.0.0.5.", source="user")
+        review.ask_conflict(self.memory, said, self.save("The NAS is at 10.0.0.6."))
+        about_word = next(item for item in self.store.open_questions(limit=5) if item["record_ids"][0] == said.id)
+        self.assertEqual("ask_user", review.stage(self.store, about_word["id"]))
 
 
 class FindOutTests(CatalogTestCase):

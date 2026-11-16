@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.12.13 (2026-11-16)
+
+- **Questions that no longer apply are closed.** When one of the memories a
+  question is about has been retired or replaced, the question closes, at
+  whatever point it had reached. Before, such questions could still be handed
+  to you, and their memories stayed marked as disputed.
+- **You are asked only about what you said.** A disagreement between two
+  agents' findings about a system is no longer handed to you because no agent
+  checked it: you usually cannot check a system either. If the evidence does
+  not settle it, it stays open as "Not settled yet", with both memories kept and
+  marked as disputed, and it is listed in the app with what is being looked
+  into. Questions about your own rules, preferences, decisions, and statements
+  still come to you.
+- **No more coin tosses.** A week-old disagreement is settled automatically only
+  by stronger evidence or the later of two observations: never between two
+  guesses, nor after an agent looked and could not tell.
+- **Unanswered questions stay open.** They used to close after 30 days as if
+  answered, which also removed their warning.
+- **Requests to agents take turns.** A check or a request now ends only with
+  age, not with how many times a briefing or search showed it, and the
+  relevant requests are shown in turn.
+
 ## 0.12.12 (2026-11-15)
 
 - **Learning works with Claude Code, Codex, or both.** Each chat is learned

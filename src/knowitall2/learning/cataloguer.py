@@ -270,6 +270,9 @@ def _run(memory: Memory, engine: Any, budget: int, run: str | None, report: Cata
             state.record_call(at=datetime.now(timezone.utc), session="catalog", outcome=outcome, origin=origin,
                               attempt=getattr(engine, "last_attempt", None))
 
+    # A question whose memories changed is closed first, so no step below hands it on (2026-11-15: six of the
+    # seven questions waiting for the user were like that).
+    report.questions.update(review.reconcile(memory))
     report.questions.update({name: count for name, count in review.expire_tasks(memory).items() if count})
     unanswered = review.expire_unanswered(memory)
     if unanswered:
@@ -618,7 +621,7 @@ def _kept_as_it_is(memory: Memory, system_id: str, fingerprint: str, now: str) -
 
 
 def _questions_to_review(memory: Memory) -> list[dict[str, Any]]:
-    return [question for question in memory.store.open_questions(limit=500)
+    return [question for question in memory.store.open_questions(limit=review.OPEN_LIMIT)
             if review.stage(memory.store, question["id"]) == "review"]
 
 
@@ -669,14 +672,14 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
                 # Settled now, or meanwhile by someone else (already answered, memories changed): done either way.
                 report.questions["settled" if "nothing was changed" not in outcome else "settled meanwhile"] += 1
                 continue
+        # The memories are read again before the question moves on: one may have been retired during the call.
         if question["kind"] == "conflict" and not _user_must_decide(records, decision):
-            review.start_check(memory, question, records, plain=plain, labels=labels, reason=reason)
-            report.questions["sent to an agent"] += 1
+            sent = review.start_check(memory, question, records, plain=plain, labels=labels, reason=reason)
+            report.questions["sent to an agent" if sent else "no longer needed"] += 1
         else:
-            memory.store.set_question_stage(question_id, stage="ask_user", plain=plain, labels=labels, reason=reason,
-                                            finding=f"KnowItAll2 looked: {reason}" if reason else None,
-                                            now=memory.now())
-            report.questions["for you"] += 1
+            asked = review.escalate(memory, question_id, finding=f"KnowItAll2 looked: {reason}" if reason else None,
+                                    reason=reason, plain=plain, labels=labels)
+            report.questions["for you" if asked else "no longer needed"] += 1
     # A question the model skipped is looked at again in a later run, and handed to the user after another.
     with store.transaction():
         skips = _skips(memory)
@@ -691,10 +694,21 @@ def _review_step(memory: Memory, report: CatalogReport, *, peek: bool = False, e
 
 
 def _for_the_user(memory: Memory, question_id: str, report: CatalogReport) -> Callable[[], None]:
+    """What happens to a question the review skipped twice: a disagreement an agent can check goes to one, as it
+    would after an unsure answer; the rest go to the user. One that no longer applies is closed."""
+
     def give_up() -> None:
-        memory.store.set_question_stage(question_id, stage="ask_user", now=memory.now(),
-                                        finding="KnowItAll2 tried to look into this twice and got no answer.")
-        report.questions["for you"] += 1
+        question = memory.store.question(question_id)
+        records = [memory.store.get(record_id) for record_id in question["record_ids"]] if question else []
+        if (question is not None and question["kind"] == "conflict" and records
+                and all(record is not None and record.status == "active" for record in records)
+                and not _user_must_decide(records, None)):
+            sent = review.start_check(memory, question, records, plain=None, labels=None, reason=None)
+            report.questions["sent to an agent" if sent else "no longer needed"] += 1
+            return
+        asked = review.escalate(memory, question_id,
+                                finding="KnowItAll2 tried to look into this twice and got no answer.")
+        report.questions["for you" if asked else "no longer needed"] += 1
 
     return give_up
 

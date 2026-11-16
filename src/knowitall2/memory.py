@@ -1629,7 +1629,7 @@ def _briefing_provenance(row: RecordRow) -> str:
 PROVISIONAL_LABEL = "from a chat still in progress; may change"
 
 
-DISPUTED_LABEL = "another memory disagrees; being checked"
+DISPUTED_LABEL = "another memory disagrees; not settled yet"
 
 
 def _provisional(row: RecordRow) -> str:

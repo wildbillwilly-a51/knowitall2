@@ -1126,7 +1126,7 @@ class Store:
             return False
         # "disputed" (``memory.DISPUTED_TAG``) means a question is checking the memory: no question, no dispute.
         row = self._connection.execute("SELECT record_ids FROM questions WHERE id = ?", (question_id,)).fetchone()
-        still_open = {record_id for question in self.open_questions(limit=1000) for record_id in question["record_ids"]}
+        still_open = {record_id for question in self.open_questions(limit=-1) for record_id in question["record_ids"]}
         for record_id in json.loads(row["record_ids"] or "[]") if row else []:
             record = self.get(record_id)
             if record is not None and DISPUTED in record.tags and record_id not in still_open:
@@ -1532,6 +1532,10 @@ class Store:
         )
 
     def open_question_record_ids(self) -> set[str]:
+        """The memories an open question is about, which maintenance and corrections leave alone. An unresolved
+        disagreement holds its memories too: a merge or a partial correction would replace one with a copy that
+        still disagrees, while the question about the original closed (Codex review 2026-11-15)."""
+
         ids: set[str] = set()
         for row in self._connection.execute("SELECT record_ids FROM questions WHERE status = 'open'").fetchall():
             ids.update(json.loads(row[0]))

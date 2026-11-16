@@ -12,13 +12,22 @@ Each question moves through stages:
 2. ``checking``: otherwise the next agent working on that project, or looking
    up one of those memories, is asked to check. The check is optional, quick,
    and look-only; an agent reports what it saw with the ``settle`` tool.
-3. ``ask_user``: only if it is still unclear does the user get it, in plain
-   English, with the details on request and a "Not sure" choice.
+3. ``ask_user``: only a question about what the user said goes to the user, in
+   plain English, with the details on request and a "Not sure" choice.
+4. ``unresolved``: a disagreement about facts that no evidence settles stays
+   open and disputed, but is not the user's to judge (the user is not the one
+   who can check a system): nothing is changed, it is listed with what is being
+   looked into, and it ends when either memory is retired or replaced.
 
 Rules and statements the user made go straight to the user: nothing but the
 user's own word may change them; making something a rule is always the
 user's. An answer from the user carries full authority. Agents are also asked to find missing information about a system
 (``find_out`` tasks), reported the same way.
+
+A question is about its memories as they are: once one of them is retired or replaced, the question no longer
+applies and is closed (``close_stale``), wherever it had got to. Silence is never an answer: a question no one
+answers stays open (2026-11-15: six of seven questions waiting for the user had already been settled by other
+means, and questions no one answered were closed as answered after 30 days).
 """
 
 from __future__ import annotations
@@ -38,18 +47,21 @@ from .question_schema import check_question
 
 UNCONFIRMED_RULE_PREFIX = "Possible rule, not confirmed by the user: "
 LIST_LIMIT = 5
-STAGES = ("review", "checking", "ask_user")
+STAGES = ("review", "checking", "ask_user", "unresolved")
+# Every open question is read: unanswered questions stay open, so a fixed window could hide newer ones.
+OPEN_LIMIT = 1_000_000
+STALE_ANSWER = "memories had already changed"
+# How an agent's report that it could not tell is recorded; such a report means the evidence does not settle it.
+COULD_NOT_TELL = "could not tell"
 # A question reaches a chat only when it is about that chat's project: at most this many at once, and in at most
 # this many chats; the rest wait in the app (the user, 2026-10-11: "a question or two, if they are relevant to that
 # chat", never in every chat).
 CHAT_QUESTIONS = 2
 QUESTION_CHAT_OFFERS = 2
 _OFFERED = "question_offered:"
-# A question no one answered within this time closes with nothing changed: both memories are kept.
-QUESTION_EXPIRE_DAYS = 30
-CHECK_OFFERS = 6
+# Checks and requests end by age only: an offer is counted each time a briefing or search shows one, not each time
+# an agent looks, so one chat's searches could use up a check's offers within minutes.
 CHECK_DAYS = QUESTION_CHECK_DAYS
-FIND_OUT_OFFERS = 12
 FIND_OUT_DAYS = 30
 # A question KnowItAll2 has not reviewed within this time (learning off, no engine) goes to the user.
 REVIEW_DAYS = QUESTION_REVIEW_DAYS
@@ -144,8 +156,79 @@ def open_question(store: Store, kind: str, record_ids: Sequence[str]) -> dict[st
     """The open question of this kind about exactly these memories, if there is one."""
 
     wanted = sorted(record_ids)
-    return next((question for question in store.open_questions(limit=500)
+    return next((question for question in store.open_questions(limit=OPEN_LIMIT)
                  if question["kind"] == kind and sorted(question["record_ids"]) == wanted), None)
+
+
+def is_stale(store: Store, question: dict[str, Any]) -> bool:
+    """Whether a question no longer applies: one of its memories is gone, retired, or replaced."""
+
+    return any(record is None or record.status != "active"
+               for record in (store.get(record_id) for record_id in question["record_ids"]))
+
+
+def needs_user(store: Store, question: dict[str, Any]) -> bool:
+    """Whether only the user can settle a question: one about something the user said.
+
+    A rule or "still true?" question is always about the user's own words. A disagreement is the user's when
+    either side is what the user said; a disagreement between agents' findings is about a system, which an agent
+    can check and the user usually cannot, so it never becomes the user's because no one checked it.
+    """
+
+    if question["kind"] != "conflict":
+        return True
+    records = [store.get(record_id) for record_id in question["record_ids"]]
+    return any(record is not None and record.verification == "user_stated" for record in records)
+
+
+def close_stale(memory: Memory) -> int:
+    """Close every open question whose memories changed, and every check whose question is closed; how many
+    questions. Needs no model, so it runs whether or not learning can."""
+
+    store = memory.store
+    closed = 0
+    for question in store.open_questions(limit=OPEN_LIMIT):
+        if not is_stale(store, question):
+            continue
+        with store.transaction():
+            if _live(memory, question["id"]) is None:
+                closed += 1
+    for task in store.tasks(status="open", kind="check"):
+        question = store.question(task["question_id"] or "")
+        if question is None or question["status"] != "open":
+            store.update_task(task["id"], status="done", now=memory.now())
+    return closed
+
+
+def reconcile(memory: Memory) -> dict[str, int]:
+    """Bring every open question in line with what it is about, with no model: closed when its memories changed;
+    unresolved when it was handed to the user although it is about facts only (as before 2026-11-15)."""
+
+    counts = {"no longer needed": close_stale(memory), "unresolved": 0}
+    store = memory.store
+    for question in store.open_questions(limit=OPEN_LIMIT):
+        if stage(store, question["id"]) == "ask_user" and not needs_user(store, question):
+            if leave_unresolved(memory, question["id"],
+                                finding="About a system, not about what you said: left for evidence."):
+                counts["unresolved"] += 1
+    return {name: count for name, count in counts.items() if count}
+
+
+def _live(memory: Memory, question_id: str) -> tuple[dict[str, Any], list[RecordRow]] | None:
+    """The open question and its memories as they are now, read inside the caller's transaction; None, with the
+    question and its checks closed, when it was answered meanwhile or its memories changed (a model's answer can
+    arrive after a memory was retired: Codex review 2026-11-15)."""
+
+    question = memory.store.question(question_id)
+    if question is None or question["status"] != "open":
+        _close_tasks(memory, question_id, "done")
+        return None
+    records = [memory.store.get(record_id) for record_id in question["record_ids"]]
+    if any(record is None or record.status != "active" for record in records):
+        memory.store.close_question(question_id, answer=STALE_ANSWER, now=memory.now())
+        _close_tasks(memory, question_id, "done")
+        return None
+    return question, records  # type: ignore[return-value]
 
 
 def stage(store: Store, question_id: str) -> str:
@@ -158,15 +241,18 @@ def for_user(store: Store, *, limit: int = 100, now: datetime | None = None) -> 
 
     moment = now or datetime.now(timezone.utc)
     waiting = []
-    for question in store.open_questions(limit=500):
+    for question in store.open_questions(limit=OPEN_LIMIT):
         row = store.question_stage(question["id"])
         current = row["stage"] if row else "review"
+        if current not in ("review", "checking", "ask_user") or is_stale(store, question):
+            continue
         created = _parse(question["created_at"])
-        # A question no review settled in a few days, or no agent checked within a week after that, is the
-        # user's, whether or not a learning run comes to hand it over.
+        # A question about what the user said that no review settled in a few days, or no agent checked within a
+        # week after that, is the user's, whether or not a learning run comes to hand it over. A disagreement about
+        # facts waits for evidence instead: the user cannot check a system for an agent.
         overdue = (current == "review" and created < moment - timedelta(days=REVIEW_DAYS)) or (
             current == "checking" and created < moment - timedelta(days=REVIEW_DAYS + CHECK_DAYS))
-        if current == "ask_user" or overdue:
+        if (current == "ask_user" or overdue) and needs_user(store, question):
             waiting.append({**with_plain(question, row, store), "stage": current})
     return waiting[:limit]
 
@@ -208,22 +294,15 @@ def offer_in_chat(store: Store, questions: Sequence[dict[str, Any]]) -> None:
 
 
 def expire_unanswered(memory: Memory) -> int:
-    """Close the questions no one answered within ``QUESTION_EXPIRE_DAYS``, changing nothing, and any "Should it
-    be a rule?" question asked before 0.10.5, settled as a note; how many."""
+    """Settle any "Should it be a rule?" question asked before 0.10.5 as a note; how many.
 
-    moment = _parse(memory.now())
+    Other questions no one answered stay open: until 2026-11-15 they were closed after 30 days as if answered, which
+    also took away the warning that their memories disagree, though nothing had been settled."""
+
     closed = 0
-    for question in memory.store.open_questions(limit=500):
+    for question in memory.store.open_questions(limit=OPEN_LIMIT):
         if question["kind"] == "confirm_rule":
             closed += _keep_as_note(memory, question)
-            continue
-        if _parse(question["created_at"]) >= moment - timedelta(days=QUESTION_EXPIRE_DAYS):
-            continue
-        with memory.store.transaction():
-            if memory.store.close_question(question["id"], answer=f"no answer in {QUESTION_EXPIRE_DAYS} days; "
-                                           "nothing was changed", now=memory.now()):
-                _close_tasks(memory, question["id"], "done")
-                closed += 1
     return closed
 
 
@@ -252,8 +331,8 @@ def in_progress(store: Store, *, now: datetime | None = None) -> list[dict[str, 
 
     user = {item["id"] for item in for_user(store, now=now)}
     found = []
-    for question in store.open_questions(limit=500):
-        if question["id"] in user:
+    for question in store.open_questions(limit=OPEN_LIMIT):
+        if question["id"] in user or is_stale(store, question):
             continue
         row = store.question_stage(question["id"])
         item = with_plain(question, row, store)
@@ -507,20 +586,26 @@ def _close(memory: Memory, question_id: str, answer: str) -> None:
 
 
 def start_check(memory: Memory, question: dict[str, Any], records: list[RecordRow], *, plain: str | None,
-                labels: dict[str, str] | None, reason: str | None) -> str:
-    """Ask the next relevant agent to check a conflict; returns the task id."""
+                labels: dict[str, str] | None, reason: str | None) -> str | None:
+    """Ask the next relevant agent to check a conflict; returns the task id, or None when the question no longer
+    applies (closed). ``records`` are the memories as the caller saw them; they are read again, since a model's
+    answer can arrive after one was retired."""
 
-    older, newer = records
     task_id = "t-" + uuid.uuid4().hex[:8]
-    prompt = (
-        f'Two memories disagree. [{older.id}] says: "{_short(older.text, 200)}" [{newer.id}] says: '
-        f'"{_short(newer.text, 200)}" If this session\'s work, or one quick look-only check, shows which is right, '
-        f"call settle with task {task_id}, choice use_new (the second is right), keep_mine (the first is right), or "
-        "keep_both (both hold), and what you saw. Otherwise ignore this; never change anything to find out."
-    )
-    project = older.project_id or newer.project_id or _learned_in(memory.store, [older.id, newer.id])
     now = memory.now()
     with memory.store.transaction():
+        live = _live(memory, question["id"])
+        if live is None:
+            return None
+        older, newer = live[1]
+        prompt = (
+            f'Two memories disagree. [{older.id}] says: "{_short(older.text, 200)}" [{newer.id}] says: '
+            f'"{_short(newer.text, 200)}" If this session\'s work, or one quick look-only check, shows which is '
+            f"right, call settle with task {task_id}, choice use_new (the second is right), keep_mine (the first is "
+            "right), or keep_both (both hold), and what you saw. Otherwise ignore this; never change anything to "
+            "find out."
+        )
+        project = older.project_id or newer.project_id or _learned_in(memory.store, [older.id, newer.id])
         memory.store.add_task(task_id=task_id, kind="check", question_id=question["id"], project_id=project,
                               prompt=prompt, now=now)
         memory.store.set_question_stage(question["id"], stage="checking", plain=plain, labels=labels, reason=reason,
@@ -551,13 +636,39 @@ def ask_to_find_out(memory: Memory, system: dict[str, Any], facet: str, label: s
     return task_id
 
 
-def escalate(memory: Memory, question_id: str, *, finding: str | None, reason: str | None = None) -> None:
-    """Hand a question to the user, with what was found so far."""
+def escalate(memory: Memory, question_id: str, *, finding: str | None, reason: str | None = None,
+             plain: str | None = None, labels: dict[str, str] | None = None) -> bool:
+    """Hand a question to the user, with what was found so far; False when it no longer applies (closed)."""
 
-    now = memory.now()
     with memory.store.transaction():
-        memory.store.set_question_stage(question_id, stage="ask_user", finding=finding, reason=reason, now=now)
+        if _live(memory, question_id) is None:
+            return False
+        memory.store.set_question_stage(question_id, stage="ask_user", finding=finding, reason=reason, plain=plain,
+                                        labels=labels, now=memory.now())
         _close_tasks(memory, question_id, "escalated")
+    return True
+
+
+def leave_unresolved(memory: Memory, question_id: str, *, finding: str | None) -> bool:
+    """Keep a disagreement about facts open, with nothing changed, when no evidence settles it and it is not the
+    user's to judge; False when it no longer applies (closed). Its memories stay disputed until either changes."""
+
+    with memory.store.transaction():
+        if _live(memory, question_id) is None:
+            return False
+        memory.store.set_question_stage(question_id, stage="unresolved", finding=finding, now=memory.now())
+        _close_tasks(memory, question_id, "unresolved")
+    return True
+
+
+def _not_settled(memory: Memory, question: dict[str, Any], *, finding: str | None,
+                 reason: str | None = None) -> str:
+    """Route a question that nothing settled: to the user when it is about their words, else left unresolved.
+    Which one, or "closed" when it no longer applies."""
+
+    if needs_user(memory.store, question):
+        return "escalated" if escalate(memory, question["id"], finding=finding, reason=reason) else "closed"
+    return "unresolved" if leave_unresolved(memory, question["id"], finding=finding) else "closed"
 
 
 def settle_task(memory: Memory, task_id: str, *, choice: str, found: str, certain: bool) -> str:
@@ -577,20 +688,33 @@ def settle_task(memory: Memory, task_id: str, *, choice: str, found: str, certai
     if question is None or question["status"] != "open":
         memory.store.update_task(task["id"], status="done", now=memory.now())
         return "That question was already settled. Thanks."
-    records = [memory.store.get(record_id) for record_id in question["record_ids"]]
-    if any(record is None or record.status != "active" for record in records):
-        memory.store.close_question(question["id"], answer="memories had already changed", now=memory.now())
-        memory.store.update_task(task["id"], status="done", now=memory.now())
+    with memory.store.transaction():
+        live = _live(memory, question["id"])
+    if live is None:
         return "Those memories already changed, so nothing was needed. Thanks."
     if certain and found:
         outcome = settle(memory, question, choice, by=who, evidence=found)
         if outcome:
             return f"Settled: {outcome}"
-        escalate(memory, question["id"], finding=f"{who} checked: {found}",
-                 reason="Only you can change something you said yourself.")
-        return "Thanks. This one involves the user's own words, so the user decides, with your finding."
-    escalate(memory, question["id"], finding=f"{who} could not tell: {found}" if found else f"{who} could not tell.")
-    return "Thanks. The user will be asked, with your note."
+        routed = _not_settled(memory, question, finding=f"{who} checked: {found}",
+                              reason="Only you can change something you said yourself.")
+        if routed == "escalated":
+            return "Thanks. This one involves the user's own words, so the user decides, with your finding."
+        if routed == "unresolved":
+            return "Thanks. That could not be applied, so both memories stay as they are, with your finding."
+        return "Those memories already changed, so nothing was needed. Thanks."
+    unsure = f"{who} {COULD_NOT_TELL}: {found}" if found else f"{who} {COULD_NOT_TELL}."
+    if needs_user(memory.store, question):
+        if escalate(memory, question["id"], finding=unsure):
+            return "Thanks. The user will be asked, with your note."
+        return "Those memories already changed, so nothing was needed. Thanks."
+    # A disagreement about facts is not the user's to judge: the note is kept and the check stays open for an
+    # agent whose work shows the answer.
+    with memory.store.transaction():
+        if _live(memory, question["id"]) is None:
+            return "Those memories already changed, so nothing was needed. Thanks."
+        memory.store.set_question_stage(question["id"], stage="checking", finding=unsure, now=memory.now())
+    return "Thanks. Your note is kept; the check stays open for a session whose work shows the answer."
 
 
 def offer_tasks(store: Store, *, project_id: str | None, record_ids: list[str] | tuple = (), limit: int = 1,
@@ -600,18 +724,21 @@ def offer_tasks(store: Store, *, project_id: str | None, record_ids: list[str] |
 
     wanted = set(record_ids)
     systems = {note["system_id"] for note in store.notes_for(list(wanted)).values() if note.get("system_id")}
-    chosen = []
+    relevant_tasks = []
     for task in store.tasks(status="open"):
         relevant = project_id is not None and task["project_id"] == project_id
+        question = store.question(task["question_id"] or "") if task["kind"] == "check" else None
+        if task["kind"] == "check" and (question is None or question["status"] != "open" or is_stale(store, question)):
+            continue   # closed, or no longer applies: the next upkeep closes it
         if task["kind"] == "check" and not relevant and wanted:
-            question = store.question(task["question_id"] or "")
-            relevant = question is not None and bool(wanted.intersection(question["record_ids"]))
+            relevant = bool(wanted.intersection(question["record_ids"]))
         if task["kind"] == "find_out" and not relevant:
             relevant = task["system_id"] in systems
         if relevant:
-            chosen.append(task)
-        if len(chosen) >= limit:
-            break
+            relevant_tasks.append(task)
+    # The least-shown first, then the oldest: checks end by age now, so the oldest one would otherwise be the only
+    # one any chat ever saw (Codex review 2026-11-15).
+    chosen = sorted(relevant_tasks, key=lambda task: (task["offered"], task["created_at"], task["id"]))[:limit]
     if count:
         count_offers(store, chosen, now=now)
     return chosen
@@ -623,29 +750,41 @@ def count_offers(store: Store, tasks: Sequence[dict[str, Any]], *, now: str) -> 
 
 
 def expire_tasks(memory: Memory, *, now: datetime | None = None) -> dict[str, int]:
-    """Checks no agent could do go to the user; requests no agent could fill are given up."""
+    """A week-old check that no agent's report settled is settled by the evidence where the evidence does, goes to
+    the user when it is about what the user said, and otherwise stays unresolved; a month-old request no agent
+    filled is given up. Offers do not end either: they count what was shown, not what an agent looked at."""
 
     moment = now or _parse(memory.now())
     counts = {"escalated": 0, "given up": 0}
     for task in memory.store.tasks(status="open"):
         age = moment - _parse(task["created_at"])
-        if task["kind"] == "check" and (task["offered"] >= CHECK_OFFERS or age > timedelta(days=CHECK_DAYS)):
+        if task["kind"] == "check" and age > timedelta(days=CHECK_DAYS):
+            question = memory.store.question(task["question_id"] or "")
+            if question is None or question["status"] != "open" or is_stale(memory.store, question):
+                with memory.store.transaction():
+                    _live(memory, task["question_id"] or "")
+                    memory.store.update_task(task["id"], status="done", now=memory.now())
+                counts["no longer needed"] = counts.get("no longer needed", 0) + 1
+                continue
             if _settled_by_evidence(memory, task["question_id"]):
                 counts["settled by evidence"] = counts.get("settled by evidence", 0) + 1
                 continue
-            finding = (f"Agents were asked {task['offered']} times, but none could tell." if task["offered"]
-                       else "No agent worked on it within a week.")
-            escalate(memory, task["question_id"], finding=finding)
-            counts["escalated"] += 1
-        elif task["kind"] == "find_out" and (task["offered"] >= FIND_OUT_OFFERS or age > timedelta(days=FIND_OUT_DAYS)):
+            finding = (f"Shown to agents {task['offered']} times; none reported what settles it."
+                       if task["offered"] else "No agent worked on it within a week.")
+            routed = _not_settled(memory, question, finding=finding)
+            key = routed if routed in ("escalated", "unresolved") else "no longer needed"
+            counts[key] = counts.get(key, 0) + 1
+        elif task["kind"] == "find_out" and age > timedelta(days=FIND_OUT_DAYS):
             memory.store.update_task(task["id"], status="given_up", now=memory.now())
             counts["given up"] += 1
     return counts
 
 
 def _settled_by_evidence(memory: Memory, question_id: str) -> bool:
-    """Settle a disagreement no agent checked by the evidence, quietly, unless it involves the user's own choice,
-    which goes to the user. Whether it was settled."""
+    """Settle a disagreement no agent's report settled where the evidence does, quietly: the better-verified
+    memory, or, of two observations, the later one. Not two guesses, nor a pair an agent looked at and could not
+    tell apart: choosing between those would be a coin toss called a check (Codex review 2026-11-15). Never the
+    user's own choice. Whether it was settled."""
 
     question = memory.store.question(question_id)
     if question is None or question["status"] != "open" or question["kind"] != "conflict":
@@ -656,9 +795,14 @@ def _settled_by_evidence(memory: Memory, question_id: str) -> bool:
     older, newer = records
     if is_users_choice(older) or is_users_choice(newer):
         return False
+    row = memory.store.question_stage(question_id) or {}
+    if any(COULD_NOT_TELL in finding for finding in row.get("findings") or []):
+        return False   # an agent looked and could not tell: the ranking must not overrule what it saw
+    if older.verification == newer.verification == "unverified":
+        return False
     choice = _evidence_choice(older, newer)
-    why = ("no agent checked within a week; the better-verified memory stands" if choice == "keep_mine" else
-           "no agent checked within a week; the newer memory, verified at least as well, stands")
+    why = ("no agent's report settled it within a week; the better-verified memory stands" if choice == "keep_mine"
+           else "no agent's report settled it within a week; the newer memory, verified at least as well, stands")
     done = settle(memory, question, choice, by="KnowItAll2", evidence=why)
     if done is None:
         return False
@@ -764,8 +908,13 @@ def _ask(memory: Memory, kind: str, prompt: str, record_ids: list[str], *, reaso
         options=OPTIONS[kind], now=memory.now(),
     )
     if added:
-        # Without learning there is no background review, so the user is asked directly.
-        first = "review" if load_settings().enabled else "ask_user"
+        # Without learning there is no background review: a question about what the user said goes to the user
+        # directly; a disagreement about facts stays unresolved, since the user cannot check a system for us.
+        if load_settings().enabled:
+            first = "review"
+        else:
+            question = {"kind": kind, "record_ids": record_ids}
+            first = "ask_user" if needs_user(memory.store, question) else "unresolved"
         memory.store.set_question_stage(question_id, stage=first, reason=reason, now=memory.now())
         # Asked on the learner's or maintenance's behalf too, so this is always recorded.
         journal.record(

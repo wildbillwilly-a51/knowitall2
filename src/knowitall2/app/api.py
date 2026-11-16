@@ -115,7 +115,7 @@ def overview(query, body, match) -> dict[str, Any]:
         last_runs = store.events(kinds=["learning"], limit=1)
         recent = store.events(kinds=ACTIVITY_GROUPS["all"], limit=RECENT_EVENTS)
         questions = len(review.for_user(store))
-        looking = store.count_open_questions() - questions
+        looking = len(review.in_progress(store))
         daily = _daily(store, now=now, shift=shift)
         filed = store.count_unnoted()
         systems = len([count for key, count in store.system_memory_counts().items() if key and count])
@@ -241,7 +241,8 @@ def memory_detail(query, body, match) -> dict[str, Any]:
         if details is None:
             raise NotFound(f"There is no memory [{record_id}].")
         replacement = store.get(details["superseded_by"]) if details["superseded_by"] else None
-        questions = [item for item in store.open_questions(limit=500) if record_id in item["record_ids"]]
+        questions = [item for item in store.open_questions(limit=review.OPEN_LIMIT)
+                     if record_id in item["record_ids"] and not review.is_stale(store, item)]
         events = store.events(kinds=_CHANGE_KINDS, record_id=record_id, limit=40)
         _add_notes(store, [details])
     return {

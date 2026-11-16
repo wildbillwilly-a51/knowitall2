@@ -768,7 +768,7 @@ def _format_stats(store: Store) -> str:
         f"By kind: {kinds}",
         f"By source: {sources}",
         f"Projects seen: {stats['projects']}",
-        f"Open questions for you: {store.count_open_questions()}",
+        f"Open questions for you: {len(review.for_user(store))}",
         "Usefulness, last 30 days:",
         f"  recalls: {recalls['count']}, found something: {recalls['with_results']}{rate}",
         f"  briefings: {briefings['count']}",
